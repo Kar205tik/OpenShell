@@ -9040,15 +9040,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "z3-src"
-version = "501.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b72734fb46b47cd6c5a9a1dab4ca1c3c060822d3f34cdcac5d6ae570408b47a"
-dependencies = [
- "cmake",
-]
-
-[[package]]
 name = "z3-sys"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9057,7 +9048,6 @@ dependencies = [
  "pkg-config",
  "reqwest 0.12.28",
  "serde_json",
- "z3-src",
  "zip",
 ]
 
