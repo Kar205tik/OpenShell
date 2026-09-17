@@ -359,6 +359,14 @@ unit's `gateway.env` hook. Ordinary package installations continue to use the
 gateway's built-in runtime-image defaults unless the operator configures an
 override.
 
+`nix run .#build-artifacts-snap` runs the shared binary artifact builder and
+packages its native-architecture Linux outputs with the digest-pinned Canonical
+Snapcraft `core24` container. The container builds in a temporary Docker volume
+because Snapcraft records extended attributes that macOS bind mounts do not
+support. The task copies the resulting package to `artifacts/snap/` and removes
+the temporary volume. The aggregate `build-artifacts` app includes this Snap
+package.
+
 ## Python Wheel Packaging
 
 The generated protobuf/gRPC stubs under `python/openshell/_proto/` are gitignored
