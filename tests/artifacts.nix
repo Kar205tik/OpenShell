@@ -240,13 +240,13 @@ let
       install -m 0755 snap/hooks/post-refresh "$build_dir/input/snap/hooks/post-refresh"
       install -m 0755 snap/hooks/connect-plug-docker "$build_dir/input/snap/hooks/connect-plug-docker"
       install -m 0755 \
-        "target/${muslToolchain.target}/debug/openshell" \
+        "artifacts/binaries/${muslToolchain.target}/openshell" \
         "$prebuilt_dir/openshell"
       install -m 0755 \
-        "target/${gnuToolchain.target}/debug/openshell-gateway" \
+        "artifacts/binaries/${gnuToolchain.target}/openshell-gateway" \
         "$prebuilt_dir/openshell-gateway"
       install -m 0755 \
-        "target/${muslToolchain.target}/debug/openshell-sandbox" \
+        "artifacts/binaries/${muslToolchain.target}/openshell-sandbox" \
         "$prebuilt_dir/openshell-sandbox"
       install -m 0755 \
         tasks/scripts/snap-gateway-wrapper.sh \
@@ -306,6 +306,10 @@ let
         install -m 0644 "$artifact" artifacts/snap/
         echo "Created Snap artifact: artifacts/snap/$(basename "$artifact")"
       done
+      ln -f \
+        "artifacts/snap/$(basename "''${snap_files[0]}")" \
+        artifacts/snap/openshell.snap
+      echo "Created stable Snap artifact: artifacts/snap/openshell.snap"
     '';
   };
 in
