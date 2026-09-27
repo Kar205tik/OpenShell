@@ -23,7 +23,15 @@ or backend-admin authority.
 
 The compute driver provisions separate protected configurations and one
 mutually authenticated gRPC connection over a private Unix socket, Kubernetes
-TCP Service, or VM vsock channel. Independent bidirectional `Exchange` RPCs
+TCP Service, or VM vsock channel. The sandbox listener presents a server
+certificate only; the supervisor authenticates every RPC with an EdDSA session
+bearer bound to the sandbox, runtime generation, and credential epoch. The
+Unix socket is reachable by same-UID workload processes because Landlock does
+not govern `connect()` on a filesystem socket, so the sandbox rejects peers
+inside its own PID namespace that are not the sandbox or one of its ancestors
+before TLS, charges a bounded control-connection slot only after the first
+accepted bearer, and closes connections that present no valid bearer within a
+short deadline. Independent bidirectional `Exchange` RPCs
 carry lifecycle, exec, TCP, and forwarding traffic, while one persistent
 bidirectional `Mediate` RPC carries multiplexed DNS traffic. General application
 UDP is unsupported; UDP DNS remains mediated by the supervisor.

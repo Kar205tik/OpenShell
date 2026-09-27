@@ -80,6 +80,12 @@ mod linux {
     const FORCE_KILL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
     const MAX_PENDING_HANDSHAKES: usize = 32;
     const MAX_CONTROL_CONNECTIONS: usize = 128;
+    /// A completed TLS handshake proves nothing about the peer because the
+    /// listener requires no client certificate. A connection that has not
+    /// presented a valid bearer holds no control slot and closes at this
+    /// deadline, so a same-UID workload that reaches the Unix socket cannot
+    /// pin the resources the supervisor needs to reconnect.
+    const CONTROL_UNAUTHENTICATED_DEADLINE: Duration = Duration::from_secs(10);
     const MAX_REPLAY_LEDGER_ENTRIES: usize = 4096;
     const MAX_RETAINED_EXEC_PROCESSES: usize = 64;
 
@@ -533,6 +539,7 @@ mod linux {
                                 runtime,
                                 pending,
                                 active_connections,
+                                CONTROL_UNAUTHENTICATED_DEADLINE,
                             )
                             .await
                             {
@@ -564,26 +571,36 @@ mod linux {
         runtime: Arc<BoundaryRuntime>,
         pending: tokio::sync::OwnedSemaphorePermit,
         active_connections: Arc<AtomicUsize>,
+        unauthenticated_deadline: Duration,
     ) -> Result<(), String> {
         let stream = stream
             .establish_async(&runtime.process_runtime)
             .await
-            .map_err(|error| format!("authenticate boundary transport: {error}"))?;
+            .map_err(|error| format!("establish boundary transport: {error}"))?;
         drop(pending);
-        let Some(_slot) = acquire_control_connection_slot(&active_connections) else {
-            return Err("authenticated control connection limit reached".to_string());
-        };
-        serve_grpc(stream.into_tokio()?, runtime, SandboxConnectionId::new()).await
+        // TLS completion is not authentication. The control slot is acquired
+        // only after an RPC on this connection presents a valid bearer.
+        serve_grpc(
+            stream.into_tokio()?,
+            runtime,
+            SandboxConnectionId::new(),
+            active_connections,
+            unauthenticated_deadline,
+        )
+        .await
     }
 
     async fn serve_grpc(
         stream: openshell_isolation_interface::contract::BoundaryDuplexStream,
         runtime: Arc<BoundaryRuntime>,
         connection_id: SandboxConnectionId,
+        active_connections: Arc<AtomicUsize>,
+        unauthenticated_deadline: Duration,
     ) -> Result<(), String> {
         let (connection_shutdown, connection_closed) = tokio::sync::watch::channel(());
         runtime.register_connection(connection_id, connection_shutdown.clone());
         let connection_expiry = Arc::new(ConnectionExpiry::new(connection_shutdown.clone()));
+        connection_expiry.update_deadline(tokio::time::Instant::now() + unauthenticated_deadline);
         let incoming = tokio_stream::StreamExt::chain(
             tokio_stream::iter([Ok::<_, io::Error>(GrpcServerIo {
                 stream,
@@ -592,6 +609,13 @@ mod linux {
                     runtime: Arc::downgrade(&runtime),
                     connection_id,
                 },
+                closed: Box::pin({
+                    let mut closed = connection_closed.clone();
+                    async move {
+                        let _ = closed.changed().await;
+                    }
+                }),
+                is_closed: false,
             })]),
             tokio_stream::pending(),
         );
@@ -608,6 +632,8 @@ mod linux {
                     connection_id,
                     connection_expiry,
                     connection_closed,
+                    active_connections,
+                    control_slot: Arc::new(Mutex::new(None)),
                 })
                 .max_decoding_message_size(64 * 1024)
                 .max_encoding_message_size(64 * 1024),
@@ -626,6 +652,21 @@ mod linux {
         // bridges, including on keepalive failure or task cancellation.
         _connection_alive: tokio::sync::watch::Sender<()>,
         _disconnect: TransportDisconnectGuard,
+        /// Resolves once the connection deadline or an explicit shutdown
+        /// fires. Graceful HTTP/2 shutdown alone does not tear down a peer
+        /// that completed TLS but never sent a preface, so the transport
+        /// reports EOF itself.
+        closed: Pin<Box<dyn Future<Output = ()> + Send>>,
+        is_closed: bool,
+    }
+
+    impl GrpcServerIo {
+        fn poll_closed(&mut self, context: &mut Context<'_>) -> bool {
+            if !self.is_closed && self.closed.as_mut().poll(context).is_ready() {
+                self.is_closed = true;
+            }
+            self.is_closed
+        }
     }
 
     struct TransportDisconnectGuard {
@@ -647,6 +688,9 @@ mod linux {
             context: &mut Context<'_>,
             buffer: &mut tokio::io::ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
+            if self.poll_closed(context) {
+                return Poll::Ready(Ok(()));
+            }
             Pin::new(&mut self.stream).poll_read(context, buffer)
         }
     }
@@ -657,6 +701,12 @@ mod linux {
             context: &mut Context<'_>,
             buffer: &[u8],
         ) -> Poll<io::Result<usize>> {
+            if self.poll_closed(context) {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "boundary control connection closed",
+                )));
+            }
             Pin::new(&mut self.stream).poll_write(context, buffer)
         }
 
@@ -684,6 +734,45 @@ mod linux {
         connection_id: SandboxConnectionId,
         connection_expiry: Arc<ConnectionExpiry>,
         connection_closed: tokio::sync::watch::Receiver<()>,
+        active_connections: Arc<AtomicUsize>,
+        /// Held from the first authenticated RPC until the connection ends.
+        /// Shared across tonic's per-request service clones.
+        control_slot: Arc<Mutex<Option<ControlConnectionSlot>>>,
+    }
+
+    impl GrpcBoundaryService {
+        /// Authenticate one RPC and, on the first success for this
+        /// connection, charge it against the bounded control slots.
+        ///
+        /// Unauthenticated connections never hold a slot, so a peer that can
+        /// only complete TLS cannot exhaust the supervisor's reconnect
+        /// capacity. The unauthenticated deadline stays armed until a bearer
+        /// is accepted here.
+        fn authenticate_and_admit(
+            &self,
+            metadata: &tonic::metadata::MetadataMap,
+        ) -> Result<SandboxProtocolPrincipal, tonic::Status> {
+            let principal = self
+                .runtime
+                .authenticate_request(self.connection_id, metadata)?;
+            {
+                let mut slot = lock(&self.control_slot);
+                if slot.is_none() {
+                    *slot = Some(
+                        acquire_control_connection_slot(&self.active_connections).ok_or_else(
+                            || {
+                                tonic::Status::resource_exhausted(
+                                    "authenticated control connection limit reached",
+                                )
+                            },
+                        )?,
+                    );
+                }
+            }
+            self.connection_expiry
+                .update(principal.session().expires_at);
+            Ok(principal)
+        }
     }
 
     struct ConnectionExpiry {
@@ -772,11 +861,7 @@ mod linux {
             &self,
             request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
         ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
-            let principal = self
-                .runtime
-                .authenticate_request(self.connection_id, request.metadata())?;
-            self.connection_expiry
-                .update(principal.session().expires_at);
+            let principal = self.authenticate_and_admit(request.metadata())?;
             let (stream, response) =
                 bridge_grpc_server_stream(request.into_inner(), self.connection_closed.clone());
             let runtime = self.runtime.clone();
@@ -796,11 +881,7 @@ mod linux {
             &self,
             request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
         ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
-            let principal = self
-                .runtime
-                .authenticate_request(self.connection_id, request.metadata())?;
-            self.connection_expiry
-                .update(principal.session().expires_at);
+            let principal = self.authenticate_and_admit(request.metadata())?;
             let (stream, response) =
                 bridge_grpc_server_stream(request.into_inner(), self.connection_closed.clone());
             let runtime = self.runtime.clone();
@@ -3150,8 +3231,14 @@ mod linux {
                 BoundaryListenerConfig::Unix { socket_path, tls } => {
                     remove_owned_stale_control_socket(socket_path)?;
                     let listener = std::os::unix::net::UnixListener::bind(socket_path)?;
-                    // Mutual TLS makes a same-UID pathname replacement a
-                    // detectable denial of service rather than impersonation.
+                    // The workload shares this UID and Landlock does not
+                    // govern connect() on a filesystem socket, so any workload
+                    // process can reach this listener. The listener presents
+                    // a server certificate only; peers prove themselves with
+                    // the EdDSA session bearer on each RPC, and the peer
+                    // credential check in accept() rejects workload processes
+                    // before TLS. A same-UID pathname replacement is therefore
+                    // a detectable denial of service, not impersonation.
                     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o666))?;
                     listener.set_nonblocking(true)?;
                     let server_config = Arc::new(load_tls_server_config(tls)?);
@@ -3300,11 +3387,17 @@ mod linux {
         }
         let peer = u32::try_from(credentials.pid)
             .map_err(|_| io::Error::from_raw_os_error(libc::EACCES))?;
-        // Linux reports PID zero for a peer outside our PID namespace. Such a
-        // peer still must authenticate with the per-sandbox mTLS certificate.
+        // Linux reports PID zero for a peer outside our PID namespace, which
+        // is where every driver places the supervisor. Such a peer still must
+        // present the EdDSA session bearer on each RPC. Inside our namespace,
+        // only this process and its ancestors are trusted: workload processes
+        // are descendants, and an orphan that double-forked away from the
+        // sandbox reparents to PID 1 or a subreaper, which is never an
+        // ancestor of the sandbox unless the sandbox is PID 1 itself. Read
+        // only kernel-owned ancestry, never workload-supplied data.
         if peer != 0
             && peer != std::process::id()
-            && is_process_descendant(peer, std::process::id())
+            && !is_process_descendant(std::process::id(), peer)
                 .map_err(|_| io::Error::from_raw_os_error(libc::EACCES))?
         {
             return Err(io::Error::from_raw_os_error(libc::EACCES));
@@ -3313,10 +3406,7 @@ mod linux {
     }
 
     fn is_process_descendant(mut process: u32, ancestor: u32) -> io::Result<bool> {
-        // Drivers run the sandbox as workload PID 1, so orphaned descendants
-        // reparent to it and cannot escape this check by double-forking.
-        // Read kernel-owned ancestry, never workload-supplied paths or UIDs.
-        // If a peer exits during inspection, fail closed for that connection.
+        // If a process exits during inspection, fail closed for that connection.
         for _ in 0..1024 {
             if process == ancestor {
                 return Ok(true);
@@ -3956,8 +4046,8 @@ mod linux {
             drop(stream);
             assert!(child.wait().unwrap().success());
             assert!(!is_process_descendant(std::process::id(), child.id()).unwrap());
-            // Trusted same-process connections and external ancestors remain
-            // eligible for mTLS; we do not equate same UID with workload trust.
+            // Same-process connections and ancestors of the sandbox remain
+            // eligible to present a bearer; same UID alone is not workload trust.
             let client = std::os::unix::net::UnixStream::connect(&path).unwrap();
             let (stream, _) = listener.accept().unwrap();
             reject_workload_unix_peer(&stream).unwrap();
@@ -4068,6 +4158,7 @@ mod linux {
                     runtime.clone(),
                     permit,
                     active.clone(),
+                    CONTROL_UNAUTHENTICATED_DEADLINE,
                 ));
             }
             assert!(pending.clone().try_acquire_owned().is_err());
@@ -4082,6 +4173,186 @@ mod linux {
             assert_eq!(pending.available_permits(), MAX_PENDING_HANDSHAKES);
             assert_eq!(active.load(Ordering::Acquire), 0);
             drop(clients);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn unauthenticated_tls_connection_holds_no_slot_and_closes_at_deadline() {
+            let directory = tempfile::tempdir().unwrap();
+            let (server_tls, client_tls) = stage_test_tls(directory.path(), "unauthenticated");
+            let server_config = Arc::new(load_tls_server_config(&server_tls).unwrap());
+            let (runtime, _) = availability_test_runtime();
+            let active = Arc::new(AtomicUsize::new(0));
+            let pending = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
+            let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+            client.set_nonblocking(true).unwrap();
+            let client = tokio::net::UnixStream::from_std(client).unwrap();
+            let permit = pending.clone().try_acquire_owned().unwrap();
+            let deadline = Duration::from_secs(2);
+            let started = std::time::Instant::now();
+            let server = tokio::spawn(serve_control_connection(
+                ControlStream::PendingTls {
+                    stream: PlainControlStream::Unix(server),
+                    server_config,
+                },
+                runtime,
+                permit,
+                active.clone(),
+                deadline,
+            ));
+
+            // A same-UID workload peer can complete TLS: the listener asks
+            // for no client certificate and never sees a bearer here.
+            let client_config = test_client_config(&client_tls);
+            let server_name = rustls::pki_types::ServerName::try_from(client_tls.server_name)
+                .expect("valid server name");
+            let mut stream = tokio_rustls::TlsConnector::from(Arc::new(client_config))
+                .connect(server_name, client)
+                .await
+                .expect("TLS completes without any bearer");
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while pending.available_permits() != MAX_PENDING_HANDSHAKES {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("handshake permit is released once TLS completes");
+            assert_eq!(
+                active.load(Ordering::Acquire),
+                0,
+                "TLS completion must not consume a control slot"
+            );
+
+            // The server speaks HTTP/2 first (SETTINGS), so drain until the
+            // peer closes rather than treating the first bytes as the end.
+            tokio::time::timeout(deadline + Duration::from_secs(3), async {
+                let mut buffer = [0_u8; 256];
+                loop {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            })
+            .await
+            .expect("server must close the idle unauthenticated connection at the deadline");
+            assert!(
+                started.elapsed() >= deadline,
+                "connection must survive until the unauthenticated deadline"
+            );
+            assert_eq!(active.load(Ordering::Acquire), 0);
+            let _ = tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .expect("server task must finish after the deadline");
+            assert_eq!(active.load(Ordering::Acquire), 0);
+        }
+
+        fn discover_policy_stream() -> tokio_stream::Iter<std::array::IntoIter<BoundaryChunk, 1>> {
+            let request =
+                RequestEnvelope::new(Request::DiscoverPolicy).expect("encode discover request");
+            tokio_stream::iter([BoundaryChunk {
+                data: encode_frame(&request).expect("encode logical request"),
+            }])
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn control_slot_is_charged_only_after_a_valid_bearer() {
+            let (runtime, token) = availability_test_runtime();
+            let active = Arc::new(AtomicUsize::new(0));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server_active = active.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_grpc(
+                    Box::new(stream),
+                    runtime,
+                    SandboxConnectionId::new(),
+                    server_active,
+                    Duration::from_secs(30),
+                )
+                .await
+            });
+            let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let mut client = IsolationBoundaryClient::new(channel);
+
+            let status = client
+                .exchange(tonic::Request::new(discover_policy_stream()))
+                .await
+                .expect_err("missing bearer must be rejected");
+            assert_eq!(status.code(), tonic::Code::Unauthenticated);
+            assert_eq!(active.load(Ordering::Acquire), 0);
+
+            let status = client
+                .exchange(bearer_request(
+                    discover_policy_stream(),
+                    "not-a-session-token",
+                ))
+                .await
+                .expect_err("malformed bearer must be rejected");
+            assert_eq!(status.code(), tonic::Code::Unauthenticated);
+            assert_eq!(active.load(Ordering::Acquire), 0);
+
+            for _ in 0..2 {
+                let mut body = client
+                    .exchange(bearer_request(discover_policy_stream(), &token))
+                    .await
+                    .expect("valid bearer is admitted")
+                    .into_inner();
+                while body.message().await.unwrap().is_some() {}
+                assert_eq!(
+                    active.load(Ordering::Acquire),
+                    1,
+                    "one authenticated connection charges exactly one slot"
+                );
+            }
+
+            drop(client);
+            let _ = tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .expect("server ends when the authenticated client disconnects");
+            assert_eq!(
+                active.load(Ordering::Acquire),
+                0,
+                "the slot is released with the connection"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn authenticated_rpc_is_refused_when_control_slots_are_exhausted() {
+            let (runtime, token) = availability_test_runtime();
+            let active = Arc::new(AtomicUsize::new(MAX_CONTROL_CONNECTIONS));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server_active = active.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_grpc(
+                    Box::new(stream),
+                    runtime,
+                    SandboxConnectionId::new(),
+                    server_active,
+                    Duration::from_secs(30),
+                )
+                .await
+            });
+            let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let mut client = IsolationBoundaryClient::new(channel);
+            let status = client
+                .exchange(bearer_request(discover_policy_stream(), &token))
+                .await
+                .expect_err("exhausted slots must refuse even a valid bearer");
+            assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+            assert_eq!(active.load(Ordering::Acquire), MAX_CONTROL_CONNECTIONS);
+            drop(client);
+            server.abort();
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -4238,7 +4509,14 @@ mod linux {
             let server_runtime = runtime.clone();
             let server = tokio::spawn(async move {
                 let (stream, _) = server_listener.accept().await.unwrap();
-                serve_grpc(Box::new(stream), server_runtime, connection_id).await
+                serve_grpc(
+                    Box::new(stream),
+                    server_runtime,
+                    connection_id,
+                    Arc::new(AtomicUsize::new(0)),
+                    CONTROL_UNAUTHENTICATED_DEADLINE,
+                )
+                .await
             });
             let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let proxy_address = proxy_listener.local_addr().unwrap();
@@ -4673,7 +4951,14 @@ mod linux {
             let address = listener.local_addr().expect("gRPC test address");
             let server = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.expect("accept gRPC client");
-                serve_grpc(Box::new(stream), boundary, SandboxConnectionId::new()).await
+                serve_grpc(
+                    Box::new(stream),
+                    boundary,
+                    SandboxConnectionId::new(),
+                    Arc::new(AtomicUsize::new(0)),
+                    CONTROL_UNAUTHENTICATED_DEADLINE,
+                )
+                .await
             });
             let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
                 .expect("valid gRPC endpoint")

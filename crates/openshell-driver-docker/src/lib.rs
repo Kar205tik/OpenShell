@@ -4389,8 +4389,11 @@ fn docker_sandbox_bundle_archive(
         ".openshell/channel/sandbox",
         // The sandbox owns this directory so it can consume bootstrap files
         // and create the control socket. The separate non-root supervisor
-        // needs execute-only traversal to that known socket path; mutual TLS
-        // authenticates the endpoint and the files beneath remain 0600.
+        // needs execute-only traversal to that known socket path. The socket
+        // presents a server certificate only; the supervisor proves itself
+        // with the EdDSA session bearer on each RPC, and the sandbox rejects
+        // same-namespace workload peers before TLS. Files beneath stay 0600
+        // and are consumed at startup.
         0o711,
         identity.uid,
         identity.gid,
