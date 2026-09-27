@@ -13,6 +13,7 @@ use std::path::Path;
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::collections::VecDeque;
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::mem::size_of;
@@ -80,6 +81,7 @@ mod linux {
     const FORCE_KILL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
     const MAX_PENDING_HANDSHAKES: usize = 32;
     const MAX_CONTROL_CONNECTIONS: usize = 128;
+    const MAX_UNAUTHENTICATED_CONTROL_CONNECTIONS: usize = 128;
     /// A completed TLS handshake proves nothing about the peer because the
     /// listener requires no client certificate. A connection that has not
     /// presented a valid bearer holds no control slot and closes at this
@@ -190,6 +192,53 @@ mod linux {
             .ok()
             .map(|_| ControlConnectionSlot(active.clone()))
     }
+
+    struct UnauthenticatedControlConnections {
+        capacity: usize,
+        entries: Mutex<VecDeque<(SandboxConnectionId, tokio::sync::watch::Sender<()>)>>,
+    }
+
+    impl UnauthenticatedControlConnections {
+        fn new(capacity: usize) -> Self {
+            assert!(capacity > 0);
+            Self {
+                capacity,
+                entries: Mutex::new(VecDeque::new()),
+            }
+        }
+
+        fn register(
+            &self,
+            connection_id: SandboxConnectionId,
+            shutdown: tokio::sync::watch::Sender<()>,
+        ) {
+            let mut entries = lock(&self.entries);
+            if entries.len() == self.capacity
+                && let Some((_, oldest)) = entries.pop_front()
+            {
+                // Make room for a new bearer attempt even when every older
+                // connection is idle. Its transport observes this shutdown.
+                let _ = oldest.send(());
+            }
+            entries.push_back((connection_id, shutdown));
+        }
+
+        fn remove(&self, connection_id: SandboxConnectionId) {
+            lock(&self.entries).retain(|(id, _)| *id != connection_id);
+        }
+    }
+
+    struct UnauthenticatedControlRegistration {
+        connections: Arc<UnauthenticatedControlConnections>,
+        connection_id: SandboxConnectionId,
+    }
+
+    impl Drop for UnauthenticatedControlRegistration {
+        fn drop(&mut self) {
+            self.connections.remove(self.connection_id);
+        }
+    }
+
     static BOUNDARY_TERMINATION_REQUESTED: AtomicBool = AtomicBool::new(false);
     static BOUNDARY_TERMINATION_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
@@ -500,6 +549,9 @@ mod linux {
         let listener = ControlListener::bind(config)
             .map_err(|error| format!("bind boundary control listener: {error}"))?;
         let active_connections = Arc::new(AtomicUsize::new(0));
+        let unauthenticated_connections = Arc::new(UnauthenticatedControlConnections::new(
+            MAX_UNAUTHENTICATED_CONTROL_CONNECTIONS,
+        ));
         let pending_handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
         tracing::info!(?config, "Boundary control listener ready");
         loop {
@@ -530,6 +582,7 @@ mod linux {
                         continue;
                     };
                     let active_connections = active_connections.clone();
+                    let unauthenticated_connections = unauthenticated_connections.clone();
                     let runtime = runtime.clone();
                     runtime.process_runtime.spawn({
                         let runtime = runtime.clone();
@@ -539,6 +592,7 @@ mod linux {
                                 runtime,
                                 pending,
                                 active_connections,
+                                unauthenticated_connections,
                                 CONTROL_UNAUTHENTICATED_DEADLINE,
                             )
                             .await
@@ -571,6 +625,7 @@ mod linux {
         runtime: Arc<BoundaryRuntime>,
         pending: tokio::sync::OwnedSemaphorePermit,
         active_connections: Arc<AtomicUsize>,
+        unauthenticated_connections: Arc<UnauthenticatedControlConnections>,
         unauthenticated_deadline: Duration,
     ) -> Result<(), String> {
         let stream = stream
@@ -585,6 +640,7 @@ mod linux {
             runtime,
             SandboxConnectionId::new(),
             active_connections,
+            unauthenticated_connections,
             unauthenticated_deadline,
         )
         .await
@@ -595,9 +651,15 @@ mod linux {
         runtime: Arc<BoundaryRuntime>,
         connection_id: SandboxConnectionId,
         active_connections: Arc<AtomicUsize>,
+        unauthenticated_connections: Arc<UnauthenticatedControlConnections>,
         unauthenticated_deadline: Duration,
     ) -> Result<(), String> {
         let (connection_shutdown, connection_closed) = tokio::sync::watch::channel(());
+        unauthenticated_connections.register(connection_id, connection_shutdown.clone());
+        let _unauthenticated_registration = UnauthenticatedControlRegistration {
+            connections: unauthenticated_connections.clone(),
+            connection_id,
+        };
         runtime.register_connection(connection_id, connection_shutdown.clone());
         let connection_expiry = Arc::new(ConnectionExpiry::new(connection_shutdown.clone()));
         connection_expiry.update_deadline(tokio::time::Instant::now() + unauthenticated_deadline);
@@ -633,6 +695,7 @@ mod linux {
                     connection_expiry,
                     connection_closed,
                     active_connections,
+                    unauthenticated_connections,
                     control_slot: Arc::new(Mutex::new(None)),
                 })
                 .max_decoding_message_size(64 * 1024)
@@ -735,6 +798,7 @@ mod linux {
         connection_expiry: Arc<ConnectionExpiry>,
         connection_closed: tokio::sync::watch::Receiver<()>,
         active_connections: Arc<AtomicUsize>,
+        unauthenticated_connections: Arc<UnauthenticatedControlConnections>,
         /// Held from the first authenticated RPC until the connection ends.
         /// Shared across tonic's per-request service clones.
         control_slot: Arc<Mutex<Option<ControlConnectionSlot>>>,
@@ -771,6 +835,7 @@ mod linux {
             }
             self.connection_expiry
                 .update(principal.session().expires_at);
+            self.unauthenticated_connections.remove(self.connection_id);
             Ok(principal)
         }
     }
@@ -1468,7 +1533,7 @@ mod linux {
     #[derive(Default)]
     struct ReplayLedger {
         entries: std::collections::HashMap<String, ReplayRecord>,
-        order: std::collections::VecDeque<String>,
+        order: VecDeque<String>,
     }
 
     impl ReplayLedger {
@@ -4019,6 +4084,28 @@ mod linux {
             assert_eq!(active.load(Ordering::Acquire), MAX_CONTROL_CONNECTIONS - 1);
         }
 
+        #[tokio::test]
+        async fn unauthenticated_connection_pool_evicts_oldest_to_admit_new_peer() {
+            let connections = UnauthenticatedControlConnections::new(2);
+            let first_id = SandboxConnectionId::new();
+            let second_id = SandboxConnectionId::new();
+            let third_id = SandboxConnectionId::new();
+            let (first_shutdown, mut first_closed) = tokio::sync::watch::channel(());
+            let (second_shutdown, second_closed) = tokio::sync::watch::channel(());
+            let (third_shutdown, _third_closed) = tokio::sync::watch::channel(());
+
+            connections.register(first_id, first_shutdown);
+            connections.register(second_id, second_shutdown);
+            connections.register(third_id, third_shutdown);
+
+            first_closed.changed().await.expect("oldest peer is closed");
+            assert!(!second_closed.has_changed().unwrap());
+            let entries = lock(&connections.entries);
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].0, second_id);
+            assert_eq!(entries[1].0, third_id);
+        }
+
         #[test]
         fn unix_control_rejects_workload_descendants_before_admission() {
             const CHILD_SOCKET: &str = "OPENSHELL_TEST_CONTROL_PEER_SOCKET";
@@ -4158,6 +4245,9 @@ mod linux {
                     runtime.clone(),
                     permit,
                     active.clone(),
+                    Arc::new(UnauthenticatedControlConnections::new(
+                        MAX_UNAUTHENTICATED_CONTROL_CONNECTIONS,
+                    )),
                     CONTROL_UNAUTHENTICATED_DEADLINE,
                 ));
             }
@@ -4197,6 +4287,9 @@ mod linux {
                 runtime,
                 permit,
                 active.clone(),
+                Arc::new(UnauthenticatedControlConnections::new(
+                    MAX_UNAUTHENTICATED_CONTROL_CONNECTIONS,
+                )),
                 deadline,
             ));
 
@@ -4258,9 +4351,11 @@ mod linux {
         async fn control_slot_is_charged_only_after_a_valid_bearer() {
             let (runtime, token) = availability_test_runtime();
             let active = Arc::new(AtomicUsize::new(0));
+            let unauthenticated = Arc::new(UnauthenticatedControlConnections::new(2));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server_active = active.clone();
+            let server_unauthenticated = unauthenticated.clone();
             let server = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
                 serve_grpc(
@@ -4268,6 +4363,7 @@ mod linux {
                     runtime,
                     SandboxConnectionId::new(),
                     server_active,
+                    server_unauthenticated,
                     Duration::from_secs(30),
                 )
                 .await
@@ -4285,6 +4381,7 @@ mod linux {
                 .expect_err("missing bearer must be rejected");
             assert_eq!(status.code(), tonic::Code::Unauthenticated);
             assert_eq!(active.load(Ordering::Acquire), 0);
+            assert_eq!(lock(&unauthenticated.entries).len(), 1);
 
             let status = client
                 .exchange(bearer_request(
@@ -4295,6 +4392,7 @@ mod linux {
                 .expect_err("malformed bearer must be rejected");
             assert_eq!(status.code(), tonic::Code::Unauthenticated);
             assert_eq!(active.load(Ordering::Acquire), 0);
+            assert_eq!(lock(&unauthenticated.entries).len(), 1);
 
             for _ in 0..2 {
                 let mut body = client
@@ -4308,6 +4406,7 @@ mod linux {
                     1,
                     "one authenticated connection charges exactly one slot"
                 );
+                assert!(lock(&unauthenticated.entries).is_empty());
             }
 
             drop(client);
@@ -4328,6 +4427,7 @@ mod linux {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server_active = active.clone();
+            let unauthenticated = Arc::new(UnauthenticatedControlConnections::new(2));
             let server = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
                 serve_grpc(
@@ -4335,6 +4435,7 @@ mod linux {
                     runtime,
                     SandboxConnectionId::new(),
                     server_active,
+                    unauthenticated,
                     Duration::from_secs(30),
                 )
                 .await
@@ -4514,6 +4615,7 @@ mod linux {
                     server_runtime,
                     connection_id,
                     Arc::new(AtomicUsize::new(0)),
+                    Arc::new(UnauthenticatedControlConnections::new(2)),
                     CONTROL_UNAUTHENTICATED_DEADLINE,
                 )
                 .await
@@ -4956,6 +5058,7 @@ mod linux {
                     boundary,
                     SandboxConnectionId::new(),
                     Arc::new(AtomicUsize::new(0)),
+                    Arc::new(UnauthenticatedControlConnections::new(2)),
                     CONTROL_UNAUTHENTICATED_DEADLINE,
                 )
                 .await
