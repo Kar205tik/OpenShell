@@ -31,9 +31,11 @@ not govern `connect()` on a filesystem socket, so the sandbox rejects peers
 inside its own PID namespace that are not the sandbox or one of its ancestors
 before TLS, charges a bounded control-connection slot only after the first
 accepted bearer, and closes connections that present no valid bearer within a
-short deadline. TLS-complete connections awaiting a bearer have a separate
-bounded pool; admitting a new connection closes the oldest waiting peer when
-that pool is full. Independent bidirectional `Exchange` RPCs
+short deadline. Unauthenticated gRPC transports have a separate bounded pool.
+When it is full, a new connection closes the oldest waiting peer and holds a
+handshake permit until the closed peer releases its pool permit. The same
+unauthenticated deadline covers that wait. Independent
+bidirectional `Exchange` RPCs
 carry lifecycle, exec, TCP, and forwarding traffic, while one persistent
 bidirectional `Mediate` RPC carries multiplexed DNS traffic. General application
 UDP is unsupported; UDP DNS remains mediated by the supervisor.

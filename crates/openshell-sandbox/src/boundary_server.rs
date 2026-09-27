@@ -194,43 +194,82 @@ mod linux {
     }
 
     struct UnauthenticatedControlConnections {
-        capacity: usize,
-        entries: Mutex<VecDeque<(SandboxConnectionId, tokio::sync::watch::Sender<()>)>>,
+        permits: Arc<tokio::sync::Semaphore>,
+        entries: Mutex<VecDeque<UnauthenticatedControlEntry>>,
+    }
+
+    struct UnauthenticatedControlEntry {
+        connection_id: SandboxConnectionId,
+        shutdown: tokio::sync::watch::Sender<()>,
+        eviction_requested: bool,
     }
 
     impl UnauthenticatedControlConnections {
         fn new(capacity: usize) -> Self {
             assert!(capacity > 0);
             Self {
-                capacity,
+                permits: Arc::new(tokio::sync::Semaphore::new(capacity)),
                 entries: Mutex::new(VecDeque::new()),
             }
         }
 
-        fn register(
-            &self,
+        async fn register(
+            self: &Arc<Self>,
             connection_id: SandboxConnectionId,
             shutdown: tokio::sync::watch::Sender<()>,
-        ) {
+        ) -> Arc<UnauthenticatedControlRegistration> {
+            let permit = match self.permits.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(tokio::sync::TryAcquireError::NoPermits) => {
+                    self.evict_oldest();
+                    self.permits
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .expect("unauthenticated connection pool stays open")
+                }
+                Err(tokio::sync::TryAcquireError::Closed) => {
+                    unreachable!("unauthenticated connection pool stays open")
+                }
+            };
             let mut entries = lock(&self.entries);
-            if entries.len() == self.capacity
-                && let Some((_, oldest)) = entries.pop_front()
-            {
-                // Make room for a new bearer attempt even when every older
-                // connection is idle. Its transport observes this shutdown.
-                let _ = oldest.send(());
+            entries.push_back(UnauthenticatedControlEntry {
+                connection_id,
+                shutdown,
+                eviction_requested: false,
+            });
+            Arc::new(UnauthenticatedControlRegistration {
+                connections: self.clone(),
+                connection_id,
+                permit: Mutex::new(Some(permit)),
+            })
+        }
+
+        fn evict_oldest(&self) {
+            let mut entries = lock(&self.entries);
+            if let Some(oldest) = entries.iter_mut().find(|entry| !entry.eviction_requested) {
+                oldest.eviction_requested = true;
+                // Keep its permit charged until the transport actually closes.
+                let _ = oldest.shutdown.send(());
             }
-            entries.push_back((connection_id, shutdown));
         }
 
         fn remove(&self, connection_id: SandboxConnectionId) {
-            lock(&self.entries).retain(|(id, _)| *id != connection_id);
+            lock(&self.entries).retain(|entry| entry.connection_id != connection_id);
         }
     }
 
     struct UnauthenticatedControlRegistration {
         connections: Arc<UnauthenticatedControlConnections>,
         connection_id: SandboxConnectionId,
+        permit: Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
+    }
+
+    impl UnauthenticatedControlRegistration {
+        fn release(&self) {
+            self.connections.remove(self.connection_id);
+            lock(&self.permit).take();
+        }
     }
 
     impl Drop for UnauthenticatedControlRegistration {
@@ -632,7 +671,6 @@ mod linux {
             .establish_async(&runtime.process_runtime)
             .await
             .map_err(|error| format!("establish boundary transport: {error}"))?;
-        drop(pending);
         // TLS completion is not authentication. The control slot is acquired
         // only after an RPC on this connection presents a valid bearer.
         serve_grpc(
@@ -642,6 +680,7 @@ mod linux {
             active_connections,
             unauthenticated_connections,
             unauthenticated_deadline,
+            Some(pending),
         )
         .await
     }
@@ -653,16 +692,20 @@ mod linux {
         active_connections: Arc<AtomicUsize>,
         unauthenticated_connections: Arc<UnauthenticatedControlConnections>,
         unauthenticated_deadline: Duration,
+        pending_handshake: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<(), String> {
+        let unauthenticated_deadline = tokio::time::Instant::now() + unauthenticated_deadline;
         let (connection_shutdown, connection_closed) = tokio::sync::watch::channel(());
-        unauthenticated_connections.register(connection_id, connection_shutdown.clone());
-        let _unauthenticated_registration = UnauthenticatedControlRegistration {
-            connections: unauthenticated_connections.clone(),
-            connection_id,
-        };
+        let unauthenticated_registration = tokio::time::timeout_at(
+            unauthenticated_deadline,
+            unauthenticated_connections.register(connection_id, connection_shutdown.clone()),
+        )
+        .await
+        .map_err(|_| "unauthenticated control connection deadline reached".to_string())?;
+        drop(pending_handshake);
         runtime.register_connection(connection_id, connection_shutdown.clone());
         let connection_expiry = Arc::new(ConnectionExpiry::new(connection_shutdown.clone()));
-        connection_expiry.update_deadline(tokio::time::Instant::now() + unauthenticated_deadline);
+        connection_expiry.update_deadline(unauthenticated_deadline);
         let incoming = tokio_stream::StreamExt::chain(
             tokio_stream::iter([Ok::<_, io::Error>(GrpcServerIo {
                 stream,
@@ -695,7 +738,7 @@ mod linux {
                     connection_expiry,
                     connection_closed,
                     active_connections,
-                    unauthenticated_connections,
+                    unauthenticated_registration,
                     control_slot: Arc::new(Mutex::new(None)),
                 })
                 .max_decoding_message_size(64 * 1024)
@@ -798,7 +841,7 @@ mod linux {
         connection_expiry: Arc<ConnectionExpiry>,
         connection_closed: tokio::sync::watch::Receiver<()>,
         active_connections: Arc<AtomicUsize>,
-        unauthenticated_connections: Arc<UnauthenticatedControlConnections>,
+        unauthenticated_registration: Arc<UnauthenticatedControlRegistration>,
         /// Held from the first authenticated RPC until the connection ends.
         /// Shared across tonic's per-request service clones.
         control_slot: Arc<Mutex<Option<ControlConnectionSlot>>>,
@@ -835,7 +878,7 @@ mod linux {
             }
             self.connection_expiry
                 .update(principal.session().expires_at);
-            self.unauthenticated_connections.remove(self.connection_id);
+            self.unauthenticated_registration.release();
             Ok(principal)
         }
     }
@@ -4086,7 +4129,7 @@ mod linux {
 
         #[tokio::test]
         async fn unauthenticated_connection_pool_evicts_oldest_to_admit_new_peer() {
-            let connections = UnauthenticatedControlConnections::new(2);
+            let connections = Arc::new(UnauthenticatedControlConnections::new(2));
             let first_id = SandboxConnectionId::new();
             let second_id = SandboxConnectionId::new();
             let third_id = SandboxConnectionId::new();
@@ -4094,16 +4137,53 @@ mod linux {
             let (second_shutdown, second_closed) = tokio::sync::watch::channel(());
             let (third_shutdown, _third_closed) = tokio::sync::watch::channel(());
 
-            connections.register(first_id, first_shutdown);
-            connections.register(second_id, second_shutdown);
-            connections.register(third_id, third_shutdown);
+            let first = connections.register(first_id, first_shutdown).await;
+            let _second = connections.register(second_id, second_shutdown).await;
+            let third = tokio::spawn({
+                let connections = connections.clone();
+                async move { connections.register(third_id, third_shutdown).await }
+            });
 
             first_closed.changed().await.expect("oldest peer is closed");
+            assert!(!third.is_finished(), "new peer waits for the old permit");
+            assert_eq!(connections.permits.available_permits(), 0);
             assert!(!second_closed.has_changed().unwrap());
+            first.release();
+            let _third = tokio::time::timeout(Duration::from_secs(1), third)
+                .await
+                .expect("new peer is admitted once the old one releases its permit")
+                .unwrap();
             let entries = lock(&connections.entries);
             assert_eq!(entries.len(), 2);
-            assert_eq!(entries[0].0, second_id);
-            assert_eq!(entries[1].0, third_id);
+            assert_eq!(entries[0].connection_id, second_id);
+            assert_eq!(entries[1].connection_id, third_id);
+        }
+
+        #[tokio::test]
+        async fn unauthenticated_connection_wait_keeps_the_original_deadline() {
+            let (runtime, _) = availability_test_runtime();
+            let connections = Arc::new(UnauthenticatedControlConnections::new(1));
+            let (shutdown, _closed) = tokio::sync::watch::channel(());
+            let held = connections
+                .register(SandboxConnectionId::new(), shutdown)
+                .await;
+            let (stream, _client) = tokio::io::duplex(64);
+            let result = serve_grpc(
+                Box::new(stream),
+                runtime,
+                SandboxConnectionId::new(),
+                Arc::new(AtomicUsize::new(0)),
+                connections.clone(),
+                Duration::from_millis(40),
+                None,
+            )
+            .await;
+            assert!(result.unwrap_err().contains("deadline reached"));
+            assert_eq!(lock(&connections.entries).len(), 1);
+            assert_eq!(connections.permits.available_permits(), 0);
+            drop(held);
+            assert!(lock(&connections.entries).is_empty());
+            assert_eq!(connections.permits.available_permits(), 1);
         }
 
         #[test]
@@ -4365,6 +4445,7 @@ mod linux {
                     server_active,
                     server_unauthenticated,
                     Duration::from_secs(30),
+                    None,
                 )
                 .await
             });
@@ -4437,6 +4518,7 @@ mod linux {
                     server_active,
                     unauthenticated,
                     Duration::from_secs(30),
+                    None,
                 )
                 .await
             });
@@ -4617,6 +4699,7 @@ mod linux {
                     Arc::new(AtomicUsize::new(0)),
                     Arc::new(UnauthenticatedControlConnections::new(2)),
                     CONTROL_UNAUTHENTICATED_DEADLINE,
+                    None,
                 )
                 .await
             });
@@ -5060,6 +5143,7 @@ mod linux {
                     Arc::new(AtomicUsize::new(0)),
                     Arc::new(UnauthenticatedControlConnections::new(2)),
                     CONTROL_UNAUTHENTICATED_DEADLINE,
+                    None,
                 )
                 .await
             });
