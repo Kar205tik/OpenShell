@@ -23,7 +23,7 @@ use openshell_core::proto::{
     ListSandboxProvidersRequest, Provider, ProviderCredentialRefreshRecoveryAction,
     ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
     ProviderCredentialTokenGrantType, ProviderMutationKind, ProviderProfile,
-    ProviderProfileDiagnostic, ProviderProfileImportItem, RotateProviderCredentialRequest,
+    ProviderProfileDiagnostic, ProviderProfileImportItem, RotateProviderCredentialRequest, Sandbox,
     UpdateProviderProfilesRequest, UpdateProviderRequest,
 };
 use openshell_core::rpc_error::{ERROR_DOMAIN, decode_details};
@@ -39,6 +39,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use tonic::{Code, Status};
+
+const PROVIDER_MUTATION_CAS_RETRY_LIMIT: usize = 3;
 
 fn provider_mutation_is_uncertain(status: &Status) -> bool {
     // Only a validated gateway ErrorInfo identifies a possibly saved mutation.
@@ -62,6 +64,38 @@ fn provider_mutation_error(status: &Status, operation: &str) -> miette::Report {
     } else {
         miette!("provider {operation} failed ({})", status.code())
     }
+}
+
+fn provider_spec_unchanged(original: &Sandbox, latest: &Sandbox) -> bool {
+    original.object_id() == latest.object_id() && original.spec == latest.spec
+}
+
+async fn refreshed_provider_mutation_version(
+    client: &mut crate::tls::GrpcClient,
+    original: &Sandbox,
+    name: &str,
+    workspace: &str,
+    operation: &str,
+) -> Result<u64> {
+    let latest = client
+        .get_sandbox(GetSandboxRequest {
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+        })
+        .await
+        .map_err(|status| miette!("provider {operation} lookup failed ({})", status.code()))?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette!("sandbox not found"))?;
+    if !provider_spec_unchanged(original, &latest) {
+        return Err(miette!(
+            "Failed to {operation} provider: sandbox configuration was modified by another operation.\n\
+             Please retry the command."
+        ));
+    }
+    Ok(latest.metadata.as_ref().map_or(0, |m| m.resource_version))
 }
 
 fn proto_timestamp_ms(timestamp: Option<&prost_types::Timestamp>) -> i64 {
@@ -155,31 +189,47 @@ pub async fn sandbox_provider_attach(
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
 
-    let resource_version = sandbox.metadata.as_ref().map_or(0, |m| m.resource_version);
-
-    let response = match client
-        .attach_sandbox_provider(AttachSandboxProviderRequest {
-            request_id: String::new(),
-            sandbox: (name).to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                (workspace).to_string(),
-            )),
-            provider: provider.to_string(),
-            expected_resource_version: resource_version,
-        })
-        .await
-    {
-        Ok(response) => response.into_inner(),
-        // Explicit post-save uncertainty takes precedence over a generic retry hint.
-        Err(status)
-            if status.code() == Code::Aborted && !provider_mutation_is_uncertain(&status) =>
+    let mut resource_version = sandbox.metadata.as_ref().map_or(0, |m| m.resource_version);
+    let mut attempts = 0;
+    let response = loop {
+        match client
+            .attach_sandbox_provider(AttachSandboxProviderRequest {
+                request_id: String::new(),
+                sandbox: name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
+                provider: provider.to_string(),
+                expected_resource_version: resource_version,
+            })
+            .await
         {
-            return Err(miette::miette!(
-                "Failed to attach provider: sandbox was modified by another operation.\n\
-                 Please retry the command."
-            ));
+            Ok(response) => break response.into_inner(),
+            // Never replay a mutation when the gateway reports post-save uncertainty.
+            Err(status)
+                if status.code() == Code::Aborted
+                    && !provider_mutation_is_uncertain(&status)
+                    && attempts < PROVIDER_MUTATION_CAS_RETRY_LIMIT =>
+            {
+                attempts += 1;
+                resource_version = refreshed_provider_mutation_version(
+                    &mut client,
+                    &sandbox,
+                    name,
+                    workspace,
+                    "attach",
+                )
+                .await?;
+            }
+            Err(status)
+                if status.code() == Code::Aborted && !provider_mutation_is_uncertain(&status) =>
+            {
+                return Err(miette!(
+                    "Failed to attach provider: sandbox kept changing. Please retry the command."
+                ));
+            }
+            Err(error) => return Err(provider_mutation_error(&error, "attachment")),
         }
-        Err(error) => return Err(provider_mutation_error(&error, "attachment")),
     };
 
     let receipt = response.receipt.ok_or_else(|| {
@@ -230,31 +280,46 @@ pub async fn sandbox_provider_detach(
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
 
-    let resource_version = sandbox.metadata.as_ref().map_or(0, |m| m.resource_version);
-
-    let response = match client
-        .detach_sandbox_provider(DetachSandboxProviderRequest {
-            request_id: String::new(),
-            sandbox: (name).to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                (workspace).to_string(),
-            )),
-            provider: provider.to_string(),
-            expected_resource_version: resource_version,
-        })
-        .await
-    {
-        Ok(response) => response.into_inner(),
-        // Explicit post-save uncertainty takes precedence over a generic retry hint.
-        Err(status)
-            if status.code() == Code::Aborted && !provider_mutation_is_uncertain(&status) =>
+    let mut resource_version = sandbox.metadata.as_ref().map_or(0, |m| m.resource_version);
+    let mut attempts = 0;
+    let response = loop {
+        match client
+            .detach_sandbox_provider(DetachSandboxProviderRequest {
+                request_id: String::new(),
+                sandbox: name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
+                provider: provider.to_string(),
+                expected_resource_version: resource_version,
+            })
+            .await
         {
-            return Err(miette::miette!(
-                "Failed to detach provider: sandbox was modified by another operation.\n\
-                 Please retry the command."
-            ));
+            Ok(response) => break response.into_inner(),
+            Err(status)
+                if status.code() == Code::Aborted
+                    && !provider_mutation_is_uncertain(&status)
+                    && attempts < PROVIDER_MUTATION_CAS_RETRY_LIMIT =>
+            {
+                attempts += 1;
+                resource_version = refreshed_provider_mutation_version(
+                    &mut client,
+                    &sandbox,
+                    name,
+                    workspace,
+                    "detach",
+                )
+                .await?;
+            }
+            Err(status)
+                if status.code() == Code::Aborted && !provider_mutation_is_uncertain(&status) =>
+            {
+                return Err(miette!(
+                    "Failed to detach provider: sandbox kept changing. Please retry the command."
+                ));
+            }
+            Err(error) => return Err(provider_mutation_error(&error, "detachment")),
         }
-        Err(error) => return Err(provider_mutation_error(&error, "detachment")),
     };
 
     let receipt = response.receipt.ok_or_else(|| miette!("gateway did not return a provider receipt; saved detachment cannot establish revocation"))?;
@@ -2860,8 +2925,31 @@ mod tests {
         CredentialHandle, Provider, ProviderCredentialRefresh,
         ProviderCredentialRefreshRecoveryAction, ProviderCredentialRefreshStatus,
         ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant, ProviderProfile,
-        ProviderProfileCredential, datamodel::v1::ObjectMeta,
+        ProviderProfileCredential, SandboxSpec, datamodel::v1::ObjectMeta,
     };
+
+    #[test]
+    fn provider_mutation_retry_accepts_status_updates_but_not_spec_changes() {
+        let original = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "sandbox-a".to_string(),
+                resource_version: 1,
+                ..Default::default()
+            }),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+        let mut latest = original.clone();
+        latest.metadata.as_mut().unwrap().resource_version = 2;
+        assert!(provider_spec_unchanged(&original, &latest));
+
+        latest.spec.as_mut().unwrap().providers.push("other".into());
+        assert!(!provider_spec_unchanged(&original, &latest));
+
+        latest = original.clone();
+        latest.metadata.as_mut().unwrap().id = "sandbox-b".into();
+        assert!(!provider_spec_unchanged(&original, &latest));
+    }
 
     #[test]
     fn provider_profile_workspace_scope_omits_platform_scope() {

@@ -479,6 +479,9 @@ attached provider profile contributes endpoint and binary policy. The proxy
 then resolves the provider's credential placeholder only when both policy and
 the profile's endpoint binding authorize the native request. Model selection,
 request shape, headers, streaming, and timeouts remain client concerns.
+The CLI retries attach and detach when only sandbox status changes during the
+request. A concurrent sandbox specification change remains a conflict so one
+provider mutation cannot silently overwrite another configuration decision.
 
 In proxy-required networks, the supervisor chains upstream TLS tunnels through
 a corporate forward proxy with HTTP CONNECT instead of connecting directly,

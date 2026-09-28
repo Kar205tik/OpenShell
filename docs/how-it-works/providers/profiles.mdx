@@ -1030,6 +1030,7 @@ openshell sandbox provider detach provider-demo work-github --wait --timeout 30
 ```
 
 Attach and detach are idempotent. Attach validates that the provider exists before mutating the sandbox, and provider deletion fails while the provider is attached to any sandbox.
+The CLI handles concurrent sandbox status updates. If another operation changes the sandbox configuration at the same time, review the current attachments before retrying.
 
 ### Inspect Provider Readiness
 
