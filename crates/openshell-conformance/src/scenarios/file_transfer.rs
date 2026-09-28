@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
+use crate::platform::{self, SandboxFixture};
 use crate::{CommandResult, OpenShellRunner, Scenario, ScenarioFuture};
 
 const CREATE_TIMEOUT: Duration = Duration::from_mins(10);
@@ -41,37 +42,92 @@ pub const FILE_TRANSFER_PATH_SAFETY_SCENARIO: Scenario = Scenario {
 
 fn run_round_trip(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
     Box::pin(async move {
-        let (sandbox_name, remote_root, local) = prepare_sandbox(runner, "round-trip").await?;
-        round_trip(runner, &sandbox_name, &remote_root, local.path()).await?;
-        download_file(runner, &sandbox_name, &remote_root, local.path()).await?;
-        download_directory(runner, &sandbox_name, &remote_root, local.path()).await?;
-        delete_sandbox(runner, &sandbox_name).await
+        let prepared = prepare_sandbox(runner, "round-trip").await?;
+        round_trip(
+            runner,
+            &prepared.sandbox_name,
+            &prepared.remote_root,
+            prepared.local.path(),
+        )
+        .await?;
+        download_file(
+            runner,
+            &prepared.sandbox_name,
+            &prepared.remote_root,
+            prepared.local.path(),
+        )
+        .await?;
+        download_directory(
+            runner,
+            &prepared.sandbox_name,
+            &prepared.remote_root,
+            prepared.local.path(),
+        )
+        .await?;
+        delete_sandbox(runner, &prepared.sandbox_name).await
     })
 }
 
 fn run_git_filtering(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
     Box::pin(async move {
-        let (sandbox_name, remote_root, local) = prepare_sandbox(runner, "git-filtering").await?;
-        gitignore_filtering(runner, &sandbox_name, &remote_root, local.path()).await?;
-        single_file_from_git_repo(runner, &sandbox_name, &remote_root, local.path()).await?;
-        gitignored_directory_fallback(runner, &sandbox_name, &remote_root, local.path()).await?;
-        delete_sandbox(runner, &sandbox_name).await
+        let prepared = prepare_sandbox(runner, "git-filtering").await?;
+        gitignore_filtering(
+            runner,
+            &prepared.sandbox_name,
+            &prepared.remote_root,
+            prepared.local.path(),
+        )
+        .await?;
+        single_file_from_git_repo(
+            runner,
+            &prepared.sandbox_name,
+            &prepared.remote_root,
+            prepared.local.path(),
+        )
+        .await?;
+        gitignored_directory_fallback(
+            runner,
+            &prepared.sandbox_name,
+            &prepared.remote_root,
+            prepared.local.path(),
+        )
+        .await?;
+        delete_sandbox(runner, &prepared.sandbox_name).await
     })
 }
 
 fn run_path_safety(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
     Box::pin(async move {
-        let (sandbox_name, remote_root, local) = prepare_sandbox(runner, "path-safety").await?;
-        reject_workspace_escape(runner, &sandbox_name, &remote_root, local.path()).await?;
-        download_dash_leading_name(runner, &sandbox_name, &remote_root, local.path()).await?;
-        delete_sandbox(runner, &sandbox_name).await
+        let prepared = prepare_sandbox(runner, "path-safety").await?;
+        download_dash_leading_name(
+            runner,
+            &prepared.sandbox_name,
+            &prepared.remote_root,
+            prepared.local.path(),
+        )
+        .await?;
+        reject_workspace_escape(
+            runner,
+            &prepared.sandbox_name,
+            &prepared.remote_root,
+            prepared.local.path(),
+        )
+        .await?;
+        delete_sandbox(runner, &prepared.sandbox_name).await
     })
+}
+
+struct PreparedSandbox {
+    sandbox_name: String,
+    remote_root: String,
+    local: tempfile::TempDir,
+    _fixture: SandboxFixture,
 }
 
 async fn prepare_sandbox(
     runner: &mut OpenShellRunner,
     group: &str,
-) -> Result<(String, String, tempfile::TempDir), String> {
+) -> Result<PreparedSandbox, String> {
     let suffix = match group {
         "round-trip" => "fr",
         "git-filtering" => "fg",
@@ -79,29 +135,39 @@ async fn prepare_sandbox(
         _ => return Err(format!("unknown file-transfer group {group:?}")),
     };
     let sandbox_name = format!("ct-{}-{suffix}", runner.id());
-    let remote_root = format!("/sandbox/file-transfer-{}-{suffix}", runner.id());
+    let fixture = platform::file_transfer_fixture()?;
+    let remote_root = fixture.path(&format!("file-transfer-{}-{suffix}", runner.id()));
     let local =
         tempfile::tempdir().map_err(|error| format!("create temporary directory: {error}"))?;
 
     runner.track_sandbox(&sandbox_name);
+    let mut args = vec![
+        "sandbox".to_string(),
+        "create".to_string(),
+        "--name".to_string(),
+        sandbox_name.clone(),
+        "--detach".to_string(),
+        "--no-tty".to_string(),
+    ];
+    args.extend(fixture.create_args().iter().cloned());
+    args.push("--".to_string());
+    args.extend(platform::keep_alive(&fixture));
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
     let create = runner
         .step(format!("{group}/create"))
         .description(format!("sandbox '{sandbox_name}' is created"))
         .with_timeout(CREATE_TIMEOUT)
-        .run(&["sandbox", "create", "--name", &sandbox_name, "--detach"])
+        .run(&args)
         .await
         .map_err(|error| error.to_string())?;
     create.require_success()?;
 
-    exec(
-        runner,
-        &sandbox_name,
-        &format!("{group}/prepare"),
-        &format!("mkdir -p '{remote_root}'"),
-    )
-    .await?;
-
-    Ok((sandbox_name, remote_root, local))
+    Ok(PreparedSandbox {
+        sandbox_name,
+        remote_root,
+        local,
+        _fixture: fixture,
+    })
 }
 
 async fn delete_sandbox(runner: &mut OpenShellRunner, sandbox_name: &str) -> Result<(), String> {
@@ -136,7 +202,7 @@ async fn round_trip(
         .collect::<Vec<_>>();
     fs::write(source.join("large.bin"), &large).map_err(fs_error("write large.bin"))?;
 
-    let remote = format!("{remote_root}/roundtrip");
+    let remote = remote_path(remote_root, "roundtrip");
     upload(runner, sandbox, "roundtrip/upload", &source, &remote, true).await?;
 
     let destination = local_root.join("roundtrip-download");
@@ -172,7 +238,7 @@ async fn round_trip(
 
     let single = local_root.join("single.txt");
     fs::write(&single, "single-file-payload").map_err(fs_error("write single.txt"))?;
-    let remote_single = format!("{remote_root}/single.txt");
+    let remote_single = remote_path(remote_root, "single.txt");
     upload(
         runner,
         sandbox,
@@ -219,7 +285,7 @@ async fn gitignore_filtering(
         .map_err(fs_error("write ignored build artifact"))?;
     git(&repository, &["add", "."]).await?;
 
-    let remote = format!("{remote_root}/filtered");
+    let remote = remote_path(remote_root, "filtered");
     upload(
         runner,
         sandbox,
@@ -266,7 +332,7 @@ async fn single_file_from_git_repo(
     fs::write(repository.join("ignored.log"), "ignored")
         .map_err(fs_error("write repository ignored.log"))?;
 
-    let remote = format!("{remote_root}/single-from-repo");
+    let remote = remote_path(remote_root, "single-from-repo");
     upload(
         runner,
         sandbox,
@@ -304,12 +370,16 @@ async fn download_file(
     remote_root: &str,
     local_root: &Path,
 ) -> Result<(), String> {
-    let remote = format!("{remote_root}/download-file.txt");
-    exec(
+    let remote = remote_path(remote_root, "download-file.txt");
+    let seed = local_root.join("download-file.txt");
+    fs::write(&seed, "greeting-payload").map_err(fs_error("write download-file seed"))?;
+    upload(
         runner,
         sandbox,
-        "download-file/seed",
-        &format!("printf greeting-payload > '{remote}'"),
+        "download-file/upload-seed",
+        &seed,
+        &remote,
+        true,
     )
     .await?;
     let destination = local_root.join("download-file");
@@ -335,14 +405,20 @@ async fn download_directory(
     remote_root: &str,
     local_root: &Path,
 ) -> Result<(), String> {
-    let remote = format!("{remote_root}/tree");
-    exec(
+    let remote = remote_path(remote_root, "tree");
+    let seed = local_root.join("tree");
+    fs::create_dir_all(seed.join("sub")).map_err(fs_error("create directory-download seed"))?;
+    fs::write(seed.join("root.txt"), "top-level")
+        .map_err(fs_error("write directory-download root file"))?;
+    fs::write(seed.join("sub/child.txt"), "nested")
+        .map_err(fs_error("write directory-download nested file"))?;
+    upload(
         runner,
         sandbox,
-        "download-directory/seed",
-        &format!(
-            "mkdir -p '{remote}/sub' && printf top-level > '{remote}/root.txt' && printf nested > '{remote}/sub/child.txt'"
-        ),
+        "download-directory/upload-seed",
+        &seed,
+        remote_root,
+        true,
     )
     .await?;
     let destination = local_root.join("download-directory");
@@ -373,8 +449,8 @@ async fn reject_workspace_escape(
     remote_root: &str,
     local_root: &Path,
 ) -> Result<(), String> {
-    let etc_link = format!("{remote_root}/etc-link");
-    let passwd_link = format!("{remote_root}/passwd-link");
+    let etc_link = remote_path(remote_root, "etc-link");
+    let passwd_link = remote_path(remote_root, "passwd-link");
     exec(
         runner,
         sandbox,
@@ -388,7 +464,7 @@ async fn reject_workspace_escape(
     for (step, source) in [
         ("directory-link", etc_link.clone()),
         ("file-link", passwd_link),
-        ("linked-component", format!("{etc_link}/passwd")),
+        ("linked-component", remote_path(&etc_link, "passwd")),
     ] {
         let result = download_result(
             runner,
@@ -423,12 +499,16 @@ async fn download_dash_leading_name(
     remote_root: &str,
     local_root: &Path,
 ) -> Result<(), String> {
-    let remote = format!("{remote_root}/--checkpoint-action=evil");
-    exec(
+    let remote = remote_path(remote_root, "--checkpoint-action=evil");
+    let seed = local_root.join("--checkpoint-action=evil");
+    fs::write(&seed, "dash-payload").map_err(fs_error("write dash-leading seed"))?;
+    upload(
         runner,
         sandbox,
-        "dash-leading/seed",
-        &format!("printf dash-payload > '{remote}'"),
+        "dash-leading/upload-seed",
+        &seed,
+        remote_root,
+        true,
     )
     .await?;
     let destination = local_root.join("dash-leading");
@@ -454,12 +534,16 @@ async fn gitignored_directory_fallback(
     remote_root: &str,
     local_root: &Path,
 ) -> Result<(), String> {
-    let remote_seed = format!("{remote_root}/runs/test.json");
-    exec(
+    let remote_seed = remote_path(remote_root, "runs/test.json");
+    let seed = local_root.join("fallback-seed.json");
+    fs::write(&seed, "downloaded-payload").map_err(fs_error("write fallback seed"))?;
+    upload(
         runner,
         sandbox,
-        "gitignored-fallback/seed",
-        &format!("mkdir -p '{remote_root}/runs' && printf downloaded-payload > '{remote_seed}'"),
+        "gitignored-fallback/upload-seed",
+        &seed,
+        &remote_seed,
+        true,
     )
     .await?;
 
@@ -480,7 +564,7 @@ async fn gitignored_directory_fallback(
     .await?;
     require_exists(&runs.join("test.json"), "downloaded ignored file")?;
 
-    let remote = format!("{remote_root}/reuploaded");
+    let remote = remote_path(remote_root, "reuploaded");
     let upload_result = upload_result(
         runner,
         sandbox,
@@ -628,6 +712,10 @@ async fn git(repository: &Path, args: &[&str]) -> Result<(), String> {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     ))
+}
+
+fn remote_path(root: &str, path: &str) -> String {
+    Path::new(root).join(path).to_string_lossy().into_owned()
 }
 
 fn require_text(path: &Path, expected: &str, label: &str) -> Result<(), String> {

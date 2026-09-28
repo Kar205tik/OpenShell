@@ -365,6 +365,11 @@ When reporting `windows:ci`, distinguish these categories:
 - The complete mock-MXC conformance report, separating passed scenarios from
   expected capability gaps. Do not report an advisory hosted run as full
   conformance.
+- The first failing public operation in each conformance leaf. The
+  `sandbox/lifecycle/control-plane` leaf does not require exec; file-transfer
+  leaves should reach upload or download, and policy leaves should reach the
+  public exec or policy boundary. Treat a failure during sandbox creation from
+  a Unix-only fixture as a harness defect, not an MXC capability gap.
 - Explicit Cargo ignored tests, usually ignored doc examples.
 - Tests hidden by `#[cfg(not(target_os = "windows"))]`; these often appear as
   `running 0 tests`, not as ignored tests.

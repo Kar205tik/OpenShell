@@ -37,7 +37,10 @@ and `src/platform/windows.rs`. Scenarios select one implementation at compile
 time while their control flow and assertions remain shared. The platform layer
 provides a small set of reusable operations instead of mirroring the scenario
 tree. Implementations may construct temporary policies and commands, but must
-exercise the same public behavior.
+exercise the same public behavior. Platform fixtures establish only the
+prerequisites for a scenario: an unsupported platform capability must fail at
+the public CLI operation under test, not at sandbox creation because the
+fixture supplied a command or path for the wrong operating system.
 
 When adding a scenario, export it from the library and add the appropriate Cargo
 test wrapper under `tests/suites/conformance/cli`, then add the leaf to the

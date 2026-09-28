@@ -12,13 +12,13 @@ mod windows;
 
 #[cfg(unix)]
 pub use unix::{
-    increment_then_wait, keep_alive, lifecycle_fixture, marker_command, read_text, smoke_fixture,
-    write_text,
+    file_transfer_fixture, increment_then_wait, keep_alive, lifecycle_fixture, marker_command,
+    policy_fixture, read_text, restricted_network_policy_fixture, smoke_fixture, write_text,
 };
 #[cfg(target_os = "windows")]
 pub use windows::{
-    increment_then_wait, keep_alive, lifecycle_fixture, marker_command, read_text, smoke_fixture,
-    write_text,
+    file_transfer_fixture, increment_then_wait, keep_alive, lifecycle_fixture, marker_command,
+    policy_fixture, read_text, restricted_network_policy_fixture, smoke_fixture, write_text,
 };
 
 #[cfg(not(any(unix, target_os = "windows")))]

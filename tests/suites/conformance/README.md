@@ -18,8 +18,12 @@ as the portability boundary. In particular:
   not require `sandbox exec`.
 - `smoke/exec` covers `sandbox exec`. Drivers without exec support still run
   the test and report that capability gap.
-- `sandbox/lifecycle`, the `file-transfer/*` leaves, and the `policy/*` leaves
-  have additional runtime requirements documented in their source modules.
+- `sandbox/lifecycle/control-plane` covers stop and stopped deletion without
+  requiring exec.
+- `sandbox/lifecycle/restart-persistence` covers restart and workspace
+  persistence, including exec-based observations.
+- The `file-transfer/*` and `policy/*` leaves have additional runtime
+  requirements documented in their source modules.
 
 The scenario implementations live in the
 [`openshell-conformance` crate](../../../crates/openshell-conformance/README.md)

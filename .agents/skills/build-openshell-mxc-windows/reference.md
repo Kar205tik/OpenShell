@@ -61,6 +61,13 @@ runner. The task exits nonzero when any scenario fails so local runs retain an
 accurate result. Hosted Windows CI marks only this step as advisory and uploads
 the runner and gateway logs even when known MXC capability gaps fail.
 
+Interpret each failed leaf at its first public operation. Control-plane
+lifecycle coverage is independent of restart/exec persistence. File-transfer
+leaves must reach upload or download, and policy leaves must reach the public
+exec or policy boundary. A failure during sandbox creation caused by a Unix
+command, path, or policy is a conformance fixture defect rather than an MXC
+capability gap.
+
 The wrapper adds missing rustup targets and preserves an inherited
 `RUSTC_WRAPPER` when the command is available. Otherwise, it warns and clears
 the setting. It does not install Visual Studio, Rust, Docker, Kubernetes,

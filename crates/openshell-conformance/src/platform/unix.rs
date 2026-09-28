@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::fs;
+
 use super::{CommandExpectation, SandboxFixture, SmokeFixture};
 
 // Match the fallible Windows fixture constructor behind the platform boundary.
@@ -25,6 +27,35 @@ pub fn lifecycle_fixture() -> Result<SandboxFixture, String> {
         "/sandbox".to_string(),
         Vec::new(),
         None,
+    ))
+}
+
+pub fn file_transfer_fixture() -> Result<SandboxFixture, String> {
+    lifecycle_fixture()
+}
+
+pub fn policy_fixture() -> Result<SandboxFixture, String> {
+    lifecycle_fixture()
+}
+
+pub fn restricted_network_policy_fixture() -> Result<SandboxFixture, String> {
+    let temp_dir = tempfile::Builder::new()
+        .prefix("openshell-conformance-policy-")
+        .tempdir()
+        .map_err(|error| format!("create Unix policy fixture directory: {error}"))?;
+    let policy_path = temp_dir.path().join("policy.yaml");
+    fs::write(
+        &policy_path,
+        "version: 1\nfilesystem_policy:\n  include_workdir: true\n  read_only: [/usr, /bin, /lib, /lib64, /proc, /dev/urandom, /app, /etc, /var/log]\n  read_write: [/sandbox, /tmp, /dev/null]\nlandlock: { compatibility: best_effort }\nnetwork_policies: {}\n",
+    )
+    .map_err(|error| format!("write Unix conformance policy: {error}"))?;
+    Ok(SandboxFixture::new(
+        "/sandbox".to_string(),
+        vec![
+            "--policy".to_string(),
+            policy_path.to_string_lossy().into_owned(),
+        ],
+        Some(temp_dir),
     ))
 }
 
@@ -94,5 +125,13 @@ mod tests {
         assert_eq!(keep_alive(&fixture)[0], "sh");
         assert_eq!(write_text(&path, "value").expected_stdout(), "");
         assert_eq!(read_text(&path, "value").expected_stdout(), "value\n");
+    }
+
+    #[test]
+    fn restricted_network_policy_fixture_adds_an_empty_network_policy() {
+        let fixture = restricted_network_policy_fixture().unwrap();
+        let policy = fs::read_to_string(&fixture.create_args()[1]).unwrap();
+        assert!(policy.contains("network_policies: {}"));
+        assert!(policy.contains("read_write: [/sandbox, /tmp, /dev/null]"));
     }
 }

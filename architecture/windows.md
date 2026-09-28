@@ -252,7 +252,11 @@ Windows validation separates source correctness from host capability:
   failures in the archived report instead of being skipped. This report is
   advisory while those capability gaps remain: its scenario failures do not
   fail the surrounding Windows job, and CI always uploads the runner and
-  gateway logs.
+  gateway logs. Portable fixtures supply Windows commands, paths, and policies
+  only to establish each scenario's prerequisites. They keep control-plane
+  lifecycle coverage independent from restart/exec coverage and ensure that
+  file-transfer and policy failures identify the public unsupported operation
+  rather than an invalid Unix workload definition.
   The mock verifies public CLI, gateway, driver, lifecycle, and policy wiring;
   it does not claim Windows OS enforcement.
 - Mock MXC E2E validates gateway, CLI, driver, lifecycle, and policy wiring but

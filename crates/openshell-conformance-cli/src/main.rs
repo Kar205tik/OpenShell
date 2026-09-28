@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn selects_all_scenarios_by_default() {
         let selected = select_scenarios(&[]).expect("select all");
-        assert_eq!(selected.len(), 9);
+        assert_eq!(selected.len(), 10);
         assert_eq!(selected.len(), scenarios().len());
     }
 
@@ -257,6 +257,23 @@ mod tests {
             .map(|candidate| candidate.name)
             .collect::<Vec<_>>();
         assert_eq!(names, ["smoke/control-plane", "smoke/exec"]);
+    }
+
+    #[test]
+    fn expands_lifecycle_group_to_independent_capabilities() {
+        let selected =
+            select_scenarios(&["sandbox/lifecycle".to_string()]).expect("select lifecycle group");
+        let names = selected
+            .iter()
+            .map(|candidate| candidate.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "sandbox/lifecycle/control-plane",
+                "sandbox/lifecycle/restart-persistence",
+            ]
+        );
     }
 
     #[test]
