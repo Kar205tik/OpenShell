@@ -26,12 +26,12 @@ use crate::endpoint_status::{EndpointResult, EndpointStatusSnapshot};
 use crate::proto::{
     DenialSummary, EndpointObservation as ProtoEndpointObservation,
     EndpointResult as ProtoEndpointResult, ExchangeProviderSubjectTokenRequest,
-    GetDraftPolicyRequest, GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest,
-    GetSandboxProviderEnvironmentResponse, IssueSandboxTokenRequest, NetworkActivitySummary,
-    PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest,
-    ReportEndpointStatusRequest, ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy,
-    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UpdateConfigRequest,
-    open_shell_client::OpenShellClient,
+    GetDraftPolicyRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
+    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
+    IssueSandboxTokenRequest, NetworkActivitySummary, PolicyChunk, PolicySource, PolicyStatus,
+    RefreshSandboxTokenRequest, ReportEndpointStatusRequest, ReportPolicyStatusRequest,
+    SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
+    UpdateConfigRequest, open_shell_client::OpenShellClient,
 };
 use crate::sandbox_env;
 use crate::time::{duration_to_std, timestamp_to_millis};
@@ -60,6 +60,8 @@ pub type AuthedChannel = InterceptedService<Channel, AuthInterceptor>;
 /// the same slot, so the renewal task can replace the token in place without
 /// rebuilding the channel.
 type TokenSlot = Arc<RwLock<AsciiMetadataValue>>;
+
+const CONFIG_READ_AUTH_RETRY_LIMIT: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TokenSource {
@@ -927,18 +929,66 @@ pub async fn fetch_settings_snapshot(
     fetch_settings_snapshot_with_client(&mut client, sandbox_name, None).await
 }
 
+fn gateway_bearer_snapshot() -> Option<AsciiMetadataValue> {
+    TOKEN_SLOT.get().map(|slot| {
+        slot.read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    })
+}
+
+fn retry_config_read_after_rotation(
+    status: &Status,
+    before: Option<&AsciiMetadataValue>,
+    after: Option<&AsciiMetadataValue>,
+) -> bool {
+    status.code() == tonic::Code::Unauthenticated
+        && before
+            .zip(after)
+            .is_some_and(|(before, after)| before != after)
+}
+
+/// A read can be authenticated with the old bearer just before a concurrent
+/// refresh replaces it. Retry only after observing a local rotation; a stable
+/// bearer or another authentication failure must still reach the caller.
+async fn get_sandbox_config_after_rotation(
+    client: &mut OpenShellClient<AuthedChannel>,
+    request: GetSandboxConfigRequest,
+) -> std::result::Result<tonic::Response<GetSandboxConfigResponse>, Status> {
+    for attempt in 0..=CONFIG_READ_AUTH_RETRY_LIMIT {
+        let before = gateway_bearer_snapshot();
+        let result = client.get_sandbox_config(request.clone()).await;
+        match &result {
+            Err(status)
+                if attempt < CONFIG_READ_AUTH_RETRY_LIMIT
+                    && retry_config_read_after_rotation(
+                        status,
+                        before.as_ref(),
+                        gateway_bearer_snapshot().as_ref(),
+                    ) =>
+            {
+                debug!("retrying sandbox config read after gateway token rotation");
+            }
+            _ => return result,
+        }
+    }
+    unreachable!("bounded config read loop always returns on its final attempt")
+}
+
 async fn fetch_settings_snapshot_with_client(
     client: &mut OpenShellClient<AuthedChannel>,
     sandbox_name: &str,
     workspace: Option<&str>,
 ) -> Result<SettingsPollResult> {
-    let response = client
-        .get_sandbox_config(GetSandboxConfigRequest {
+    let response = get_sandbox_config_after_rotation(
+        client,
+        GetSandboxConfigRequest {
             workspace_scope: workspace.map(crate::proto::workspace_selector),
             name: sandbox_name.to_string(),
-        })
-        .await
-        .map_err(grpc_status_error)?;
+        },
+    )
+    .await
+    .map_err(grpc_status_error)?;
 
     Ok(settings_poll_result(response.into_inner()))
 }
@@ -1296,7 +1346,7 @@ pub struct SettingsPollResult {
     pub extension_authentication_enabled: bool,
 }
 
-fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> SettingsPollResult {
+fn settings_poll_result(inner: GetSandboxConfigResponse) -> SettingsPollResult {
     SettingsPollResult {
         configuration_instance_id: inner.configuration_instance_id,
         configuration_admitted: inner.configuration_admitted,
@@ -1323,9 +1373,34 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
 
 #[cfg(test)]
 mod settings_poll_tests {
-    use super::{learned_workspace_selector, settings_poll_result};
+    use super::{
+        learned_workspace_selector, retry_config_read_after_rotation, settings_poll_result,
+    };
     use crate::PolicyValidationFailureMode;
     use crate::proto::GetSandboxConfigResponse;
+    use tonic::Status;
+    use tonic::metadata::AsciiMetadataValue;
+
+    #[test]
+    fn config_read_retry_requires_an_observed_token_rotation() {
+        let old = AsciiMetadataValue::from_static("Bearer old");
+        let new = AsciiMetadataValue::from_static("Bearer new");
+        assert!(retry_config_read_after_rotation(
+            &Status::unauthenticated("stale bearer"),
+            Some(&old),
+            Some(&new),
+        ));
+        assert!(!retry_config_read_after_rotation(
+            &Status::unauthenticated("invalid bearer"),
+            Some(&old),
+            Some(&old),
+        ));
+        assert!(!retry_config_read_after_rotation(
+            &Status::permission_denied("denied"),
+            Some(&old),
+            Some(&new),
+        ));
+    }
 
     #[test]
     fn validation_failure_mode_round_trips_from_gateway_config() {
@@ -1434,15 +1509,15 @@ impl CachedOpenShellClient {
         // Once the first response identifies the workspace, scope every later
         // poll explicitly instead of constructing an invalid empty selector.
         let workspace_scope = learned_workspace_selector(self.workspace.get().map(String::as_str));
-        let response = self
-            .client
-            .clone()
-            .get_sandbox_config(GetSandboxConfigRequest {
+        let response = get_sandbox_config_after_rotation(
+            &mut self.client.clone(),
+            GetSandboxConfigRequest {
                 workspace_scope,
                 name: sandbox_name.to_string(),
-            })
-            .await
-            .into_diagnostic()?;
+            },
+        )
+        .await
+        .map_err(grpc_status_error)?;
 
         let result = settings_poll_result(response.into_inner());
         let _ = self.workspace.set(result.workspace.clone());
