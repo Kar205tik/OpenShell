@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn selects_all_scenarios_by_default() {
         let selected = select_scenarios(&[]).expect("select all");
-        assert_eq!(selected.len(), 11);
+        assert_eq!(selected.len(), 12);
         assert_eq!(selected.len(), scenarios().len());
     }
 
@@ -273,6 +273,17 @@ mod tests {
                 "sandbox-lifecycle/canonical-main",
             ]
         );
+    }
+
+    #[test]
+    fn expands_environment_group_to_declared_environment_capability() {
+        let selected = select_scenarios(&["sandbox-environment".to_string()])
+            .expect("select environment group");
+        let names = selected
+            .iter()
+            .map(|candidate| candidate.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["sandbox-environment/declared"]);
     }
 
     #[test]

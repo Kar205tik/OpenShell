@@ -757,41 +757,41 @@ async fn canonical_main_nonzero_exit_preserves_status() {
 
 #[tokio::test]
 #[serial(sandbox_lifecycle)]
-async fn canonical_main_and_exec_receive_declared_environment() {
-    for mode in ["--tty", "--no-tty"] {
-        let script = r#"printf 'declared_env=%s\n' "${REPRO_SENTINEL:-missing}"; while true; do sleep 1; done"#;
-        let mut sandbox = SandboxGuard::create_keep_with_args(
-            &[
-                mode,
-                "--no-auto-providers",
-                "--env",
-                "REPRO_SENTINEL=present",
-            ],
-            &["sh", "-c", script],
-            "declared_env=",
-        )
+async fn canonical_tty_main_and_exec_receive_declared_environment() {
+    let script =
+        r#"printf 'declared_env=%s\n' "${REPRO_SENTINEL:-missing}"; while true; do sleep 1; done"#;
+    let mut sandbox = SandboxGuard::create_keep_with_args(
+        &[
+            "--tty",
+            "--no-auto-providers",
+            "--env",
+            "REPRO_SENTINEL=present",
+        ],
+        &["sh", "-c", script],
+        "declared_env=",
+    )
+    .await
+    .expect("create canonical TTY process with declared environment");
+    let initial = normalize_output(&sandbox.create_output);
+    let later = sandbox
+        .exec(&[
+            "sh",
+            "-c",
+            r#"printf 'declared_env=%s\n' "${REPRO_SENTINEL:-missing}""#,
+        ])
         .await
-        .expect("create canonical process with declared environment");
-        let initial = normalize_output(&sandbox.create_output);
-        let later = sandbox
-            .exec(&[
-                "sh",
-                "-c",
-                r#"printf 'declared_env=%s\n' "${REPRO_SENTINEL:-missing}""#,
-            ])
-            .await;
-        sandbox.cleanup().await;
+        .expect("exec environment probe");
+    sandbox.cleanup().await;
 
-        assert!(
-            initial.lines().any(|line| line == "declared_env=present"),
-            "initial process must receive declared environment ({mode}): {initial}"
-        );
-        let later = normalize_output(&later.expect("exec environment probe"));
-        assert!(
-            later.lines().any(|line| line == "declared_env=present"),
-            "exec must receive the same declared environment ({mode}): {later}"
-        );
-    }
+    assert!(
+        initial.lines().any(|line| line == "declared_env=present"),
+        "initial TTY process must receive declared environment: {initial}"
+    );
+    let later = normalize_output(&later);
+    assert!(
+        later.lines().any(|line| line == "declared_env=present"),
+        "exec must receive the same declared environment as the TTY main: {later}"
+    );
 }
 
 #[tokio::test]

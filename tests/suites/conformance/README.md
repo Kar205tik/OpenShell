@@ -25,8 +25,8 @@ In particular:
   and requires `sandbox exec`.
 - `lifecycle::canonical_main` covers successful and failing canonical-main
   terminal states, persistent status, and deletion.
-- Future environment coverage should use a separate leaf when declared-
-  environment behavior has a distinct runtime requirement.
+- `environment::declared_environment` covers declared-environment propagation
+  to canonical-main and exec processes.
 - `policy-advisor/mechanistic-proposal`,
   `policy-advisor/new-hostname-proposal`, and `policy-advisor/sandbox-local` have
   additional runtime requirements documented in their source module.
