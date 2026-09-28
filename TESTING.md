@@ -149,14 +149,14 @@ Suites:
 
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
 - CLI conformance (`tests/suites/conformance`) - installed-artifact tests of
-  portable public CLI behavior. Smoke coverage is split into independent
-  control-plane and exec tests so failures identify the unsupported operation
-  without hiding later coverage. Conformance CI runs every test; focused
-  filters are for local diagnosis. Scenario implementations live in
-  `openshell-conformance`; the
-  standalone `openshell-conformance` binary remains a compatibility runner for
-  driver E2E wrappers. See the [suite README](tests/suites/conformance/README.md)
-  for scope and selection guidance.
+  portable public CLI behavior. Logical names use `/`, such as
+  `smoke/control-plane` and `smoke/exec`, so failures identify the unsupported
+  operation without hiding later coverage. Scenario implementations live in
+  `openshell-conformance`; Cargo tests and the standalone
+  `openshell-conformance` binary execute the same atomic scenarios. Conformance
+  CI runs every leaf; focused leaf or group selection is for local diagnosis.
+  See the [suite README](tests/suites/conformance/README.md) for scope and
+  selection guidance.
 - Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or
   `e2e-vm`) - CLI conformance plus the common and driver-specific coverage for
   the selected deployment.

@@ -297,9 +297,11 @@ for explicit publication.
 CLI conformance runs after target provisioning and operates only through the
 configured OpenShell CLI. The archive suite defines the installed-artifact test
 boundary, while `openshell-conformance` provides reusable scenarios and a
-standalone compatibility runner. Scenarios are independently selectable for
-local diagnosis, while conformance CI runs the complete suite so unsupported
-runtime behavior remains visible rather than being silently skipped.
+standalone runner. Its registry contains atomic `/`-separated leaves; group
+selectors expand to their leaves, and failures are accumulated until every
+selected leaf has run. Cargo tests wrap the same leaves. Conformance CI runs the
+complete registry so unsupported runtime behavior remains visible rather than
+being silently skipped.
 
 ## Python Wheel Packaging
 

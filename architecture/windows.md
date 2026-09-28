@@ -247,8 +247,9 @@ Windows validation separates source correctness from host capability:
 - The architecture-specific `windows:*` tasks check, lint, build, and run
   workspace and unsupported-driver contract tests for x64 and ARM64.
 - Hosted Windows CI runs the complete archive conformance suite against the
-  in-process MXC mock. Every scenario runs so unsupported operations appear as
-  explicit failures in the archived nextest report instead of being skipped.
+  in-process MXC mock through the standalone `openshell-conformance` runner.
+  Every atomic scenario runs so unsupported operations appear as explicit
+  failures in the archived report instead of being skipped.
   The mock verifies public CLI, gateway, driver, lifecycle, and policy wiring;
   it does not claim Windows OS enforcement.
 - Mock MXC E2E validates gateway, CLI, driver, lifecycle, and policy wiring but

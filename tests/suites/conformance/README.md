@@ -9,23 +9,24 @@ This workspace verifies that an installed `openshell` CLI and a selected gateway
 implement portable, public behavior. Tests treat the CLI as a black box. They do
 not inspect driver internals or replace driver-specific qualification.
 
-The suite separates portable contracts by capability. Conformance CI runs every
-test so unsupported behavior remains visible instead of treating one broad
-smoke test as the portability boundary. In particular:
+The suite separates portable contracts into independently executable leaves.
+Logical scenario names use `/` to express groups. Conformance CI runs every leaf
+so unsupported behavior remains visible instead of treating one broad scenario
+as the portability boundary. In particular:
 
-- `smoke::control_plane` covers status, create, get, list, and delete. It does
+- `smoke/control-plane` covers status, create, get, list, and delete. It does
   not require `sandbox exec`.
-- `smoke::exec` covers `sandbox exec`. Drivers without exec support still run
+- `smoke/exec` covers `sandbox exec`. Drivers without exec support still run
   the test and report that capability gap.
-- `lifecycle` and the policy advisor tests have additional runtime requirements
-  documented in their source modules.
+- `sandbox/lifecycle`, the `file-transfer/*` leaves, and the `policy/*` leaves
+  have additional runtime requirements documented in their source modules.
 
 The scenario implementations live in the
 [`openshell-conformance` crate](../../../crates/openshell-conformance/README.md)
-so the archive tests and the standalone `openshell-conformance` compatibility
-runner share assertions and cleanup. New installed-artifact CI should run this
-complete test workspace. Use nextest filters only to reproduce or diagnose one
-scenario locally.
+so the Cargo tests and the standalone `openshell-conformance` runner share
+assertions and cleanup. CI may use either frontend, but must run all leaves and
+continue after individual failures. Use focused selection only to reproduce or
+diagnose one scenario locally.
 
 Set `OPENSHELL_BIN` to the candidate CLI. The selected gateway must already be
 reachable. Runtimes that require an explicit sandbox workload can set
@@ -47,6 +48,17 @@ cargo nextest run \
   --profile ci \
   --manifest-path tests/suites/conformance/Cargo.toml
 ```
+
+The standalone runner provides equivalent leaf and group selection:
+
+```shell
+openshell-conformance run
+openshell-conformance run smoke
+openshell-conformance run smoke/exec
+```
+
+It executes selected leaves serially, reports every result, and exits non-zero
+after the run if any leaf failed.
 
 The runner owns only resources named for its generated run ID and attempts to
 delete them after success or failure. Tests must not depend on unrelated gateway

@@ -25,9 +25,9 @@ use self::executor::{CliExecutionError, CliExecutor, ProcessCli};
 
 pub use scenarios::{
     FILE_TRANSFER_GIT_FILTERING_SCENARIO, FILE_TRANSFER_PATH_SAFETY_SCENARIO,
-    FILE_TRANSFER_ROUND_TRIP_SCENARIO, FILE_TRANSFER_SCENARIO, MECHANISTIC_PROPOSAL_SCENARIO,
+    FILE_TRANSFER_ROUND_TRIP_SCENARIO, MECHANISTIC_PROPOSAL_SCENARIO,
     NEW_HOSTNAME_PROPOSAL_SCENARIO, POLICY_LOCAL_SCENARIO, SANDBOX_LIFECYCLE_SCENARIO,
-    SMOKE_CONTROL_PLANE_SCENARIO, SMOKE_EXEC_SCENARIO, SMOKE_SCENARIO,
+    SMOKE_CONTROL_PLANE_SCENARIO, SMOKE_EXEC_SCENARIO,
 };
 
 /// An installed conformance scenario.
@@ -47,9 +47,12 @@ impl Scenario {
 }
 
 const SCENARIOS: &[Scenario] = &[
-    SMOKE_SCENARIO,
+    SMOKE_CONTROL_PLANE_SCENARIO,
+    SMOKE_EXEC_SCENARIO,
     SANDBOX_LIFECYCLE_SCENARIO,
-    FILE_TRANSFER_SCENARIO,
+    FILE_TRANSFER_ROUND_TRIP_SCENARIO,
+    FILE_TRANSFER_GIT_FILTERING_SCENARIO,
+    FILE_TRANSFER_PATH_SAFETY_SCENARIO,
     MECHANISTIC_PROPOSAL_SCENARIO,
     NEW_HOSTNAME_PROPOSAL_SCENARIO,
     POLICY_LOCAL_SCENARIO,
@@ -60,7 +63,7 @@ pub fn scenarios() -> &'static [Scenario] {
     SCENARIOS
 }
 
-/// Finds a scenario by its stable command-line name.
+/// Finds a leaf scenario by its registered command-line name.
 pub fn scenario(name: &str) -> Option<&'static Scenario> {
     scenarios().iter().find(|candidate| candidate.name == name)
 }

@@ -16,7 +16,7 @@ async fn control_plane() {
     run_scenario(&SMOKE_CONTROL_PLANE_SCENARIO).await;
 }
 
-/// Exercise sandbox exec separately so runtimes can select it by capability.
+/// Exercise sandbox exec separately so failures identify this capability gap.
 #[tokio::test]
 async fn exec() {
     run_scenario(&SMOKE_EXEC_SCENARIO).await;

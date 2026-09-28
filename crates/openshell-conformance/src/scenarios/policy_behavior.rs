@@ -26,19 +26,19 @@ struct SandboxState {
 }
 
 pub const POLICY_LOCAL_SCENARIO: Scenario = Scenario {
-    name: "policy-local",
+    name: "policy/local",
     description: "Read and request a rule through the sandbox-local policy HTTP API.",
     run: run_policy_local,
 };
 
 pub const MECHANISTIC_PROPOSAL_SCENARIO: Scenario = Scenario {
-    name: "mechanistic-proposal",
+    name: "policy/mechanistic-proposal",
     description: "Turn a denied transparent TCP open into a scoped policy draft.",
     run: run_mechanistic_proposal,
 };
 
 pub const NEW_HOSTNAME_PROPOSAL_SCENARIO: Scenario = Scenario {
-    name: "new-hostname-proposal",
+    name: "policy/new-hostname-proposal",
     description: "Turn a denied TCP open to a hostname absent from policy into a scoped draft.",
     run: run_new_hostname_proposal,
 };

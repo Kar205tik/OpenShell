@@ -564,12 +564,13 @@ function Invoke-ConformanceTest([string] $RustTarget) {
 
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo build --target $RustTarget --bin openshell --bin openshell-gateway $Z3GatewayFeatures" `
+        -CargoArgs "cargo build --target $RustTarget --bin openshell --bin openshell-gateway --bin openshell-conformance $Z3GatewayFeatures" `
         -LogName "build-$RustTarget-conformance.log"
 
     $binaryDir = Join-Path $TargetDir "$RustTarget\debug"
     $gateway = Join-Path $binaryDir "openshell-gateway.exe"
     $cli = Join-Path $binaryDir "openshell.exe"
+    $conformance = Join-Path $binaryDir "openshell-conformance.exe"
 
     $buildRoot = Join-Path $binaryDir "build"
     $z3Candidates = @(
@@ -594,6 +595,8 @@ function Invoke-ConformanceTest([string] $RustTarget) {
     $sandboxPolicy = Join-Path $testRoot "policy.yaml"
     $gatewayLog = Join-Path $LogDir "test-$RustTarget-conformance-gateway.log"
     $gatewayErrorLog = Join-Path $LogDir "test-$RustTarget-conformance-gateway.err.log"
+    $conformanceLog = Join-Path $LogDir "test-$RustTarget-conformance.log"
+    $conformanceErrorLog = Join-Path $LogDir "test-$RustTarget-conformance.err.log"
     New-Item -ItemType Directory -Force -Path $configRoot, $stateRoot, $workloadRoot | Out-Null
     @"
 [openshell]
@@ -659,10 +662,16 @@ filesystem_policy:
         & $cli gateway select windows-conformance
         if ($LASTEXITCODE -ne 0) { throw "Failed to select the conformance gateway." }
 
-        Invoke-VsCargo `
-            -RustTarget $RustTarget `
-            -CargoArgs "cargo nextest run --no-fail-fast --manifest-path tests/suites/conformance/Cargo.toml --target $RustTarget --no-capture" `
-            -LogName "test-$RustTarget-conformance.log"
+        Write-Host "==> $conformance run --openshell-bin $cli"
+        Write-Host "    log:    $conformanceLog"
+        $conformanceProcess = Start-Process -FilePath $conformance `
+            -ArgumentList @("run", "--openshell-bin", "`"$cli`"") `
+            -PassThru -Wait -NoNewWindow `
+            -RedirectStandardOutput $conformanceLog -RedirectStandardError $conformanceErrorLog
+        Get-Content -LiteralPath $conformanceLog, $conformanceErrorLog -ErrorAction SilentlyContinue
+        if ($conformanceProcess.ExitCode -ne 0) {
+            throw "Conformance command failed with exit code $($conformanceProcess.ExitCode). See $conformanceLog"
+        }
     } catch {
         Get-Content -LiteralPath $gatewayLog, $gatewayErrorLog -ErrorAction SilentlyContinue
         throw

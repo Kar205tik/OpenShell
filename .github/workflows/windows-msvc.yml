@@ -108,6 +108,7 @@ jobs:
           path: |
             build-${{ matrix.rust_target }}-conformance.log
             test-${{ matrix.rust_target }}-conformance.log
+            test-${{ matrix.rust_target }}-conformance.err.log
             test-${{ matrix.rust_target }}-conformance-gateway.log
             test-${{ matrix.rust_target }}-conformance-gateway.err.log
           if-no-files-found: warn
@@ -193,6 +194,7 @@ jobs:
           path: |
             build-${{ matrix.rust_target }}-conformance.log
             test-${{ matrix.rust_target }}-conformance.log
+            test-${{ matrix.rust_target }}-conformance.err.log
             test-${{ matrix.rust_target }}-conformance-gateway.log
             test-${{ matrix.rust_target }}-conformance-gateway.err.log
           if-no-files-found: warn

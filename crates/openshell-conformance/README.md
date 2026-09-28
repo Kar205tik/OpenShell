@@ -10,28 +10,29 @@ This crate defines reusable black-box conformance scenarios for the public
 resource names, and best-effort cleanup. It does not provision a gateway or
 inspect compute-driver internals.
 
-The crate is a scenario library, not the primary CI entrypoint:
+The crate is a scenario library shared by two execution frontends:
 
 | Component | Responsibility |
 |---|---|
-| [`tests/suites/conformance/cli`](../../tests/suites/conformance/README.md) | Wrap exported scenarios as Cargo tests. Conformance CI should run the complete workspace; focused selection is for local diagnosis. |
+| [`tests/suites/conformance/cli`](../../tests/suites/conformance/README.md) | Wrap exported leaf scenarios as Cargo tests. |
 | `openshell-conformance` | Define portable scenarios and the shared `OpenShellRunner`. |
-| [`openshell-conformance-cli`](../openshell-conformance-cli) | Run registered scenarios manually or for compatibility with existing E2E tooling. |
+| [`openshell-conformance-cli`](../openshell-conformance-cli) | Run every registered leaf or select one leaf or group. |
 
-Cargo tests can invoke any exported `Scenario`. The standalone CLI invokes the
-scenarios returned by `scenarios()`. A scenario does not need to be registered
-with the CLI when it exists only as an independently selectable test capability.
-For example, the Cargo suite invokes `SMOKE_CONTROL_PLANE_SCENARIO` and
-`SMOKE_EXEC_SCENARIO` separately, while the compatibility CLI retains the
-registered aggregate `SMOKE_SCENARIO` under the stable name `smoke`.
+The registry returned by `scenarios()` contains only independently executable
+leaf scenarios. Names use `/` to express groups, such as
+`smoke/control-plane`, `smoke/exec`, and `file-transfer/path-safety`. The
+standalone CLI expands a group such as `smoke` to every leaf below that prefix,
+runs every selected leaf even after failures, and returns a failing status only
+after reporting all results. Cargo tests invoke the same exported leaves.
 
 Scenarios must exercise public CLI behavior, own only resources created for
 their run ID, and remain independent of unrelated gateway state. Split coverage
-when a behavior requires an optional runtime capability so environments can run
-the largest supported subset without weakening assertions. Driver internals,
+when a behavior requires an optional runtime capability so failures identify the
+specific unsupported operation without hiding later coverage. Driver internals,
 platform enforcement, and hardware qualification belong in driver-specific
 tests rather than this crate.
 
 When adding a scenario, export it from the library and add the appropriate Cargo
-test wrapper under `tests/suites/conformance/cli`. Add it to the standalone CLI
-registry only when existing E2E or manual workflows also need that entrypoint.
+test wrapper under `tests/suites/conformance/cli`, then add the leaf to the
+standalone CLI registry. Conformance CI must run all registered leaves; focused
+leaf or group selection is for local diagnosis.

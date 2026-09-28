@@ -22,7 +22,7 @@ struct SandboxState {
 
 /// Certify sandbox stop, start, and deletion lifecycle behavior.
 pub const SANDBOX_LIFECYCLE_SCENARIO: Scenario = Scenario {
-    name: "sandbox-lifecycle",
+    name: "sandbox/lifecycle",
     description: "Verify sandbox stop, start, and deletion lifecycle behavior.",
     run: run_sandbox_lifecycle,
 };

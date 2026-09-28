@@ -29,33 +29,19 @@ struct SandboxListPage {
     next_page_token: String,
 }
 
-/// Certify status -> create -> list Ready -> exec -> delete -> list empty.
-pub const SMOKE_SCENARIO: Scenario = Scenario {
-    name: "smoke",
-    description: "Run the control-plane and exec smoke scenarios.",
-    run: run_smoke,
-};
-
 /// Certify status -> create -> get/list Ready -> delete -> list empty.
 pub const SMOKE_CONTROL_PLANE_SCENARIO: Scenario = Scenario {
-    name: "smoke-control-plane",
+    name: "smoke/control-plane",
     description: "Create, inspect, and delete a sandbox without using sandbox exec.",
     run: run_smoke_control_plane,
 };
 
 /// Certify create -> exec -> delete for drivers that support interactive exec.
 pub const SMOKE_EXEC_SCENARIO: Scenario = Scenario {
-    name: "smoke-exec",
+    name: "smoke/exec",
     description: "Create a sandbox, execute a command in it, and delete it.",
     run: run_smoke_exec,
 };
-
-fn run_smoke(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
-    Box::pin(async move {
-        run_smoke_control_plane_inner(runner).await?;
-        run_smoke_exec_inner(runner).await
-    })
-}
 
 fn run_smoke_control_plane(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
     Box::pin(async move { run_smoke_control_plane_inner(runner).await })
