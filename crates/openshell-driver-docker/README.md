@@ -67,7 +67,8 @@ traverse every parent and write and enter the workdir; OpenShell does not
 change its ownership or mode.
 
 Image `VOLUME` declarations and user mounts must not cover the workdir, one of
-its parents, or the reserved `/.openshell` runtime/channel tree. OpenShell asks
+its parents, the workload's `/.openshell` runtime/channel tree, or its
+`/run/openshell-supervisor-ca` mount. OpenShell asks
 the kernel to validate access under the final identity, so POSIX ACL and host
 LSM decisions remain authoritative.
 
@@ -114,7 +115,8 @@ mount types are:
 Host bind mounts are disabled by default because they expose daemon-host paths
 to sandbox requests. User bind and volume mounts are read-only by default.
 Targets must be absolute, normalized paths and cannot overlap the workspace
-root or OpenShell control paths.
+root or private mounts still used inside the workload. Supervisor-only paths
+are allowed.
 
 Example:
 

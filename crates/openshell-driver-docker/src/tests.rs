@@ -1551,10 +1551,10 @@ fn container_creation_rejects_invalid_oci_working_dir() {
 
 #[test]
 fn container_creation_rejects_openshell_control_path_working_dir() {
-    let metadata = DockerImageMetadata {
+    let mut metadata = DockerImageMetadata {
         id: "sha256:immutable".to_string(),
         user: "1234:1235".to_string(),
-        working_dir: "/opt/openshell/bin/project".to_string(),
+        working_dir: "/.openshell/runtime/project".to_string(),
         volumes: Vec::new(),
     };
     let err = build_container_create_body_for_image(
@@ -1569,6 +1569,17 @@ fn container_creation_rejects_openshell_control_path_working_dir() {
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("OpenShell control path"));
+
+    metadata.working_dir = "/opt/openshell/bin/project".to_string();
+    build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &DockerSandboxDriverConfig::default(),
+        None,
+        &metadata,
+        &test_workload_identity(),
+    )
+    .expect("supervisor-only paths are not reserved in the workload");
 }
 
 #[test]
@@ -2145,7 +2156,7 @@ fn driver_config_rejects_reserved_mount_targets() {
         "mounts": [{
             "type": "volume",
             "source": "work-nfs",
-            "target": "/etc/openshell/auth"
+            "target": "/.openshell/runtime"
         }]
     })));
 
@@ -2153,6 +2164,19 @@ fn driver_config_rejects_reserved_mount_targets() {
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("reserved OpenShell path"));
+
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{"type": "volume", "source": "work-nfs", "target": "/etc/openshell/auth"}]
+    })));
+    build_container_create_body(&sandbox, &runtime_config())
+        .expect("supervisor-only paths are not reserved in the workload");
 }
 
 #[test]

@@ -429,8 +429,9 @@ live.
 Docker and Podman resolve OCI `Config.User` and `Config.WorkingDir` from one
 immutable image inspection. Empty, `/`, and explicit `/sandbox` values use the
 managed `/sandbox` workspace. Custom paths must be normalized absolute paths
-that do not overlap `/proc`, `/sys`, `/dev`, or OpenShell's private paths. Image
-and driver mounts cannot cover the workspace path or one of its parents.
+that do not overlap `/proc`, `/sys`, `/dev`, or private mounts still inside the
+workload container. Image and driver mounts cannot cover the workspace path or
+one of its parents. Supervisor-only paths are not reserved in the workload.
 
 Podman mounts its persistent workspace volume at a custom root. When the volume
 is first created, Podman copies existing image-directory contents into it.

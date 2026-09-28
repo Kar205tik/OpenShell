@@ -75,6 +75,11 @@ const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
 const SUPERVISOR_MOUNT_DIR: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_DIR;
 /// Full path to the supervisor binary inside sandbox containers.
 const SUPERVISOR_BINARY_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY;
+const WORKLOAD_RESERVED_PATHS: &[&str] = &[
+    "/.openshell",
+    SUPERVISOR_MOUNT_DIR,
+    openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_ROOT,
+];
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -235,15 +240,18 @@ impl ResolvedPodmanImage {
     /// - an image volume covering the workspace or any of its ancestors.
     pub fn from_inspect(inspected: &ImageInspect) -> Result<Self, ComputeDriverError> {
         let image_config = inspected.config.as_ref();
-        let workspace_root = driver_mounts::resolve_oci_workspace_root(
+        let workspace_root = driver_mounts::resolve_oci_workspace_root_for_workload(
             image_config.map_or("", |config| config.working_dir.as_str()),
+            WORKLOAD_RESERVED_PATHS,
         )
         .map_err(ComputeDriverError::Precondition)?;
-        driver_mounts::validate_workspace_control_path(&workspace_root, "/.openshell")
-            .map_err(ComputeDriverError::Precondition)?;
         if let Some(volumes) = image_config.and_then(|config| config.volumes.as_ref()) {
             for volume in volumes.keys() {
-                driver_mounts::validate_container_mount_target(volume).map_err(|error| {
+                driver_mounts::validate_container_mount_target_for_workload(
+                    volume,
+                    WORKLOAD_RESERVED_PATHS,
+                )
+                .map_err(|error| {
                     ComputeDriverError::Precondition(format!(
                         "invalid image-declared volume '{volume}': {error}"
                     ))
@@ -255,8 +263,6 @@ impl ResolvedPodmanImage {
                         ))
                     },
                 )?;
-                driver_mounts::validate_mount_control_path(volume, "/.openshell")
-                    .map_err(ComputeDriverError::Precondition)?;
             }
         }
 
@@ -871,7 +877,10 @@ fn podman_user_mounts(
                     None => {}
                 }
                 driver_mounts::validate_absolute_mount_source(&source, "bind source")?;
-                driver_mounts::validate_container_mount_target(&target)?;
+                driver_mounts::validate_container_mount_target_for_workload(
+                    &target,
+                    WORKLOAD_RESERVED_PATHS,
+                )?;
                 result.mounts.push(Mount {
                     kind: "bind".into(),
                     source,
@@ -887,7 +896,10 @@ fn podman_user_mounts(
             } => {
                 reject_subpath(subpath.as_deref(), "podman volume mounts")?;
                 driver_mounts::validate_mount_source(&source, "volume source")?;
-                driver_mounts::validate_container_mount_target(&target)?;
+                driver_mounts::validate_container_mount_target_for_workload(
+                    &target,
+                    WORKLOAD_RESERVED_PATHS,
+                )?;
                 result.volumes.push(NamedVolume {
                     name: source,
                     dest: target,
@@ -913,7 +925,10 @@ fn podman_user_mounts(
                 {
                     options.push(format!("mode={mode:o}"));
                 }
-                driver_mounts::validate_container_mount_target(&target)?;
+                driver_mounts::validate_container_mount_target_for_workload(
+                    &target,
+                    WORKLOAD_RESERVED_PATHS,
+                )?;
                 result.mounts.push(Mount {
                     kind: "tmpfs".into(),
                     source: "tmpfs".into(),
@@ -929,7 +944,10 @@ fn podman_user_mounts(
             } => {
                 reject_subpath(subpath.as_deref(), "podman image mounts")?;
                 driver_mounts::validate_mount_source(&source, "image source")?;
-                driver_mounts::validate_container_mount_target(&target)?;
+                driver_mounts::validate_container_mount_target_for_workload(
+                    &target,
+                    WORKLOAD_RESERVED_PATHS,
+                )?;
                 result.image_volumes.push(ImageVolume {
                     source,
                     destination: target,
@@ -1004,8 +1022,10 @@ fn validate_podman_driver_mounts(
                 target
             }
         };
-        driver_mounts::validate_container_mount_target(target)?;
-        driver_mounts::validate_mount_control_path(target, "/.openshell")?;
+        driver_mounts::validate_container_mount_target_for_workload(
+            target,
+            WORKLOAD_RESERVED_PATHS,
+        )?;
         let normalized_target = driver_mounts::normalize_mount_target(target);
         if !targets.insert(normalized_target.clone()) {
             return Err(format!(
@@ -2102,6 +2122,26 @@ mod tests {
         let image = ResolvedPodmanImage::from_inspect(&inspect("/workspace/project/cache"))
             .expect("image volumes nested below the workspace remain valid");
         assert_eq!(image.workspace_root, "/workspace/project");
+    }
+
+    #[test]
+    fn resolved_image_allows_supervisor_only_workdir_but_reserves_workload_mounts() {
+        let inspect = |working_dir: &str| ImageInspect {
+            id: "sha256:image".into(),
+            config: Some(ImageConfig {
+                working_dir: working_dir.into(),
+                ..Default::default()
+            }),
+        };
+
+        assert!(ResolvedPodmanImage::from_inspect(&inspect("/opt/openshell/bin/project")).is_err());
+        assert!(ResolvedPodmanImage::from_inspect(&inspect("/.openshell/channel")).is_err());
+        assert_eq!(
+            ResolvedPodmanImage::from_inspect(&inspect("/etc/openshell/tls/client"))
+                .unwrap()
+                .workspace_root,
+            "/etc/openshell/tls/client"
+        );
     }
 
     fn json_struct(value: Value) -> prost_types::Struct {
@@ -3449,7 +3489,7 @@ mod tests {
                     "mounts": [{
                         "type": "volume",
                         "source": "work-nfs",
-                        "target": "/etc/openshell/tls/client"
+                        "target": "/opt/openshell/bin"
                     }]
                 }))),
                 ..Default::default()
@@ -3461,6 +3501,19 @@ mod tests {
         let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
 
         assert!(err.to_string().contains("reserved OpenShell path"));
+
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config = Some(json_struct(serde_json::json!({
+            "mounts": [{"type": "volume", "source": "work-nfs", "target": "/etc/openshell/tls/client"}]
+        })));
+        try_build_container_spec_with_token(&sandbox, &config, None)
+            .expect("supervisor-only paths are not reserved in the workload");
     }
 
     #[test]

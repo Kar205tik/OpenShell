@@ -84,9 +84,17 @@ pub fn validate_mount_subpath(subpath: &str) -> Result<(), String> {
 /// Workspace collisions depend on the inspected image's resolved working
 /// directory and are checked separately by `validate_workspace_mount_target`.
 pub fn validate_container_mount_target(target: &str) -> Result<(), String> {
+    validate_container_mount_target_for_workload(target, CONTROL_ROOTS)
+}
+
+/// Validate a mount target against paths used by this specific workload.
+pub fn validate_container_mount_target_for_workload(
+    target: &str,
+    workload_reserved_paths: &[&str],
+) -> Result<(), String> {
     let normalized = normalize_absolute_container_path(target, "mount target")?;
     let path = Path::new(&normalized);
-    for reserved in CONTROL_ROOTS {
+    for reserved in workload_reserved_paths {
         let reserved = Path::new(reserved);
         if paths_overlap(path, reserved) {
             return Err(format!(
@@ -106,6 +114,16 @@ pub fn validate_container_mount_target(target: &str) -> Result<(), String> {
 /// value and the path passed to the supervisor cannot be interpreted
 /// differently.
 pub fn resolve_oci_workspace_root(working_dir: &str) -> Result<String, String> {
+    // The sandbox runtime checks syntax and OCI mounts again; each compute
+    // driver checks its own workload mounts before admitting the workspace.
+    resolve_oci_workspace_root_for_workload(working_dir, &[])
+}
+
+/// Resolve a workspace against paths still mounted inside this workload.
+pub fn resolve_oci_workspace_root_for_workload(
+    working_dir: &str,
+    workload_reserved_paths: &[&str],
+) -> Result<String, String> {
     if working_dir.is_empty() || working_dir == "/" {
         return Ok(DEFAULT_WORKSPACE_ROOT.to_string());
     }
@@ -113,7 +131,7 @@ pub fn resolve_oci_workspace_root(working_dir: &str) -> Result<String, String> {
     for runtime_path in OCI_RUNTIME_MOUNT_ROOTS {
         validate_workspace_reserved_path(&workspace_root, runtime_path, "OCI runtime mount")?;
     }
-    for control_path in CONTROL_ROOTS {
+    for control_path in workload_reserved_paths {
         validate_workspace_control_path(&workspace_root, control_path)?;
     }
 
@@ -173,23 +191,6 @@ fn validate_workspace_reserved_path(
     if paths_overlap(workspace, reserved) {
         return Err(format!(
             "OCI WorkingDir '{workspace_root}' conflicts with {description} '{reserved_path}'"
-        ));
-    }
-    Ok(())
-}
-
-/// Reject a mount that contains or is contained by a runtime-configured
-/// `OpenShell` control path, such as the sandbox SSH socket.
-pub fn validate_mount_control_path(target: &str, control_path: &str) -> Result<(), String> {
-    let normalized_target = normalize_absolute_container_path(target, "mount target")?;
-    let normalized_control =
-        normalize_absolute_container_path(control_path, "OpenShell control path")?;
-    if paths_overlap(
-        Path::new(&normalized_target),
-        Path::new(&normalized_control),
-    ) {
-        return Err(format!(
-            "mount target '{target}' conflicts with OpenShell control path '{control_path}'"
         ));
     }
     Ok(())
@@ -278,86 +279,33 @@ mod tests {
     }
 
     #[test]
-    fn oci_workspace_root_rejects_runtime_and_openshell_control_path_collisions() {
+    fn oci_workspace_root_rejects_runtime_and_selected_workload_paths() {
+        let reserved = &["/control"];
         for invalid in [
             "/proc",
             "/proc/self",
             "/sys",
-            "/sys/fs/cgroup",
-            "/dev",
             "/dev/shm",
-            "/etc",
-            "/opt",
-            "/opt/openshell",
-            "/opt/openshell/bin/project",
-            "/etc/openshell/tls/client",
-            "/etc/openshell/auth",
-            "/etc/openshell/skills",
-            "/etc/openshell-tls",
-            "/run",
-            "/run/openshell/cache",
-            "/run/openshell-sidecar/control.sock",
-            "/run/netns/project",
-            "/var/run/netns/project",
+            "/control",
+            "/control/data",
         ] {
             assert!(
-                resolve_oci_workspace_root(invalid).is_err(),
-                "expected control-path workspace '{invalid}' to be rejected"
+                resolve_oci_workspace_root_for_workload(invalid, reserved).is_err(),
+                "expected workspace '{invalid}' to be rejected"
             );
         }
-
-        for valid in [
-            "/app",
-            "/etc/project",
-            "/home/app",
-            "/opt/app",
-            "/usr/bin/project",
-            "/usr/src/app",
-            "/var/lib/app",
-            "/var/app/current",
-            "/var/task",
-            "/var/www/app",
-            "/processor",
-            "/system",
-            "/device",
-        ] {
-            assert_eq!(
-                resolve_oci_workspace_root(valid).unwrap(),
-                valid,
-                "expected application workspace '{valid}' to remain valid"
-            );
-        }
+        assert_eq!(
+            resolve_oci_workspace_root_for_workload("/etc/openshell", reserved).unwrap(),
+            "/etc/openshell"
+        );
     }
 
     #[test]
-    fn container_target_rejects_reserved_openshell_tls_legacy_path() {
-        let err = validate_container_mount_target("/etc/openshell-tls/proxy/client").unwrap_err();
-
-        assert!(err.contains("/etc/openshell-tls"));
-    }
-
-    #[test]
-    fn container_target_rejects_reserved_openshell_tree() {
-        let err = validate_container_mount_target("/etc/openshell/tls/client").unwrap_err();
-
-        assert!(err.contains("/etc/openshell"));
-    }
-
-    #[test]
-    fn container_target_does_not_prefix_match_unrelated_paths() {
-        validate_container_mount_target("/etc/openshell-tools").unwrap();
-        validate_container_mount_target("/run/openshell-tools").unwrap();
-    }
-
-    #[test]
-    fn mount_target_rejects_runtime_configured_control_path_overlap() {
-        for target in ["/custom", "/custom/ssh.sock", "/custom/ssh.sock/cache"] {
-            assert!(
-                validate_mount_control_path(target, "/custom/ssh.sock").is_err(),
-                "expected '{target}' to conflict with the configured control path"
-            );
-        }
-        validate_mount_control_path("/custom-other", "/custom/ssh.sock").unwrap();
+    fn container_target_uses_selected_workload_paths() {
+        let reserved = &["/control"];
+        assert!(validate_container_mount_target_for_workload("/control/data", reserved).is_err());
+        validate_container_mount_target_for_workload("/control-tools", reserved).unwrap();
+        validate_container_mount_target_for_workload("/etc/openshell", reserved).unwrap();
     }
 
     #[test]

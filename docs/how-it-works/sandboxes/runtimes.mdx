@@ -271,7 +271,8 @@ On Docker and Podman, the image's `WORKDIR` becomes the workspace. Images with
 no `WORKDIR`, `WORKDIR /`, or `WORKDIR /sandbox` use OpenShell's managed
 `/sandbox` workspace. Custom paths must be absolute, with no `.` or `..`
 segments, and cannot overlap container system paths (`/proc`, `/sys`, `/dev`)
-or OpenShell's private paths. Image and driver mounts cannot replace the
+or private mounts still used inside the workload. Paths used only by the
+separate supervisor are allowed. Image and driver mounts cannot replace the
 workspace or one of its parents.
 
 Docker validates the directory in the image filesystem. Podman mounts the

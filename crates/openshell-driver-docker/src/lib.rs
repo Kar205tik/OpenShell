@@ -105,6 +105,10 @@ const BOUNDARY_CONFIG_MOUNT_PATH: &str = "/.openshell/channel/sandbox/bootstrap.
 const BOUNDARY_SOCKET_MOUNT_PATH: &str = "/.openshell/channel/sandbox/control.sock";
 const BOUNDARY_CERTIFICATE_MOUNT_PATH: &str = "/.openshell/channel/sandbox/server.crt";
 const BOUNDARY_PRIVATE_KEY_MOUNT_PATH: &str = "/.openshell/channel/sandbox/server.key";
+const WORKLOAD_RESERVED_PATHS: &[&str] = &[
+    "/.openshell",
+    openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_ROOT,
+];
 const SUPERVISOR_STATE_MOUNT_PATH: &str = "/.openshell/supervisor";
 const SUPERVISOR_PROXY_AUTH_MOUNT_PATH: &str = "/.openshell/supervisor/upstream-proxy-auth";
 const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
@@ -3759,7 +3763,8 @@ fn docker_bind_string(
             "bind source path does not exist: {source}"
         )));
     }
-    driver_mounts::validate_container_mount_target(target).map_err(Status::failed_precondition)?;
+    driver_mounts::validate_container_mount_target_for_workload(target, WORKLOAD_RESERVED_PATHS)
+        .map_err(Status::failed_precondition)?;
     let normalized_target = driver_mounts::normalize_mount_target(target);
 
     let mut opts = Vec::new();
@@ -3897,8 +3902,11 @@ fn validate_docker_driver_mounts(
                 ));
             }
         };
-        driver_mounts::validate_container_mount_target(target)
-            .map_err(Status::failed_precondition)?;
+        driver_mounts::validate_container_mount_target_for_workload(
+            target,
+            WORKLOAD_RESERVED_PATHS,
+        )
+        .map_err(Status::failed_precondition)?;
         let normalized_target = driver_mounts::normalize_mount_target(target);
         if !targets.insert(normalized_target.clone()) {
             return Err(Status::failed_precondition(format!(
@@ -4524,8 +4532,11 @@ async fn prepare_docker_boundary_files(
     gpu_requested: bool,
 ) -> Result<(), Status> {
     let directory = docker_boundary_state_dir(sandbox, config)?;
-    let workspace_root = driver_mounts::resolve_oci_workspace_root(&image.working_dir)
-        .map_err(Status::failed_precondition)?;
+    let workspace_root = driver_mounts::resolve_oci_workspace_root_for_workload(
+        &image.working_dir,
+        WORKLOAD_RESERVED_PATHS,
+    )
+    .map_err(Status::failed_precondition)?;
     let launch_authentication = sandbox
         .spec
         .as_ref()
@@ -5652,12 +5663,17 @@ fn build_container_create_body_for_image(
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
     let resource_limits = docker_resource_limits(template)?;
-    let workspace_root = driver_mounts::resolve_oci_workspace_root(&image.working_dir)
-        .map_err(Status::failed_precondition)?;
-    driver_mounts::validate_workspace_control_path(&workspace_root, BOUNDARY_MOUNT_PATH)
-        .map_err(Status::failed_precondition)?;
+    let workspace_root = driver_mounts::resolve_oci_workspace_root_for_workload(
+        &image.working_dir,
+        WORKLOAD_RESERVED_PATHS,
+    )
+    .map_err(Status::failed_precondition)?;
     for volume in &image.volumes {
-        driver_mounts::validate_container_mount_target(volume).map_err(|error| {
+        driver_mounts::validate_container_mount_target_for_workload(
+            volume,
+            WORKLOAD_RESERVED_PATHS,
+        )
+        .map_err(|error| {
             Status::failed_precondition(format!(
                 "invalid image-declared volume '{volume}': {error}"
             ))
@@ -5667,8 +5683,6 @@ fn build_container_create_body_for_image(
                 "image-declared volume '{volume}' masks OCI WorkingDir '{workspace_root}' before workspace validation"
             ))
         })?;
-        driver_mounts::validate_mount_control_path(volume, BOUNDARY_MOUNT_PATH)
-            .map_err(Status::failed_precondition)?;
     }
     for mount in &driver_config.mounts {
         let target = match mount {
@@ -5678,8 +5692,6 @@ fn build_container_create_body_for_image(
             | DockerDriverMountConfig::Image { target, .. } => target,
         };
         driver_mounts::validate_workspace_mount_target(target, &workspace_root)
-            .map_err(Status::failed_precondition)?;
-        driver_mounts::validate_mount_control_path(target, BOUNDARY_MOUNT_PATH)
             .map_err(Status::failed_precondition)?;
     }
     let mut user_mounts = docker_driver_mounts(driver_config)?;
