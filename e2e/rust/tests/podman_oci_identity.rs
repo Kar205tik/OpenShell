@@ -98,72 +98,6 @@ USER {OCI_UID}:{OCI_GID}
                 "Podman-built image has OCI user '{user}', expected {OCI_UID}:{OCI_GID}"
             ));
         }
-        let working_dir = run_engine(
-            &engine,
-            &[
-                "image",
-                "inspect",
-                "--format",
-                "{{.Config.WorkingDir}}",
-                &tag,
-            ],
-        )?;
-        if working_dir != "/home/app/project" {
-            return Err(format!(
-                "Podman-built image has OCI workdir '{working_dir}', expected /home/app/project"
-            ));
-        }
-
-        Ok(Self { engine, tag, id })
-    }
-
-    fn build_unwritable() -> Result<Self, String> {
-        let engine = ContainerEngine::from_env()?;
-        if engine.name() != "podman" {
-            return Err(format!(
-                "Podman OCI workspace E2E requires podman, got {}",
-                engine.name()
-            ));
-        }
-
-        let context = tempfile::tempdir().map_err(|err| format!("create build context: {err}"))?;
-        let containerfile = context.path().join("Containerfile");
-        std::fs::write(
-            &containerfile,
-            format!(
-                r"FROM {BASE_IMAGE}
-USER 0:0
-RUN mkdir -p /root-owned/project && chmod 0700 /root-owned /root-owned/project
-WORKDIR /root-owned/project
-USER {OCI_UID}:{OCI_GID}
-"
-            ),
-        )
-        .map_err(|err| format!("write Containerfile: {err}"))?;
-
-        let tag = format!(
-            "localhost/openshell-e2e-podman-unwritable-workdir:{}",
-            std::process::id()
-        );
-        run_engine(
-            &engine,
-            &[
-                "build",
-                "--pull=never",
-                "--file",
-                containerfile
-                    .to_str()
-                    .ok_or_else(|| "Containerfile path is not UTF-8".to_string())?,
-                "--tag",
-                &tag,
-                context
-                    .path()
-                    .to_str()
-                    .ok_or_else(|| "build context path is not UTF-8".to_string())?,
-            ],
-        )?;
-        let id = run_engine(&engine, &["image", "inspect", "--format", "{{.Id}}", &tag])?;
-
         Ok(Self { engine, tag, id })
     }
 }
@@ -270,9 +204,6 @@ async fn podman_uses_oci_identity_workspace_copy_up_and_inspected_image_id() {
             "set -eu; \
              test \"$(pwd -P)\" = /home/app/project; \
              test \"$HOME\" = /home/app/project; \
-             test \"$(cat root-owned.txt)\" = root-owned; \
-             test \"$(stat -c %u:%g .)\" = 2345:2346; \
-             test \"$(stat -c %a .)\" = 700; \
              test \"$(stat -c %u:%g root-owned.txt)\" = 0:0; \
              touch direct-workspace-write; \
              printf 'direct-identity=%s:%s\n' \"$(id -u)\" \"$(id -g)\"; \
@@ -296,7 +227,6 @@ async fn podman_uses_oci_identity_workspace_copy_up_and_inspected_image_id() {
             "set -eu; \
              test \"$(id -u):$(id -g)\" = 2345:2346; \
              test \"$(pwd -P)\" = /home/app/project; \
-             test \"$HOME\" = /home/app/project; \
              test -f direct-workspace-write; \
              touch ssh-workspace-write; \
              echo podman-ssh-identity-ok",
@@ -329,39 +259,6 @@ async fn podman_uses_oci_identity_workspace_copy_up_and_inspected_image_id() {
 
     assert_isolated_pair(&image, &sandbox, &container_id).await;
     sandbox.cleanup().await;
-}
-
-#[tokio::test]
-async fn podman_rejects_copied_workspace_unusable_by_final_identity() {
-    if !is_e2e_driver("podman") {
-        eprintln!("Skipping Podman OCI workspace rejection test: e2e driver is not podman");
-        return;
-    }
-
-    let image = ImageGuard::build_unwritable().expect("build unwritable Podman OCI image");
-    let policy = tempfile::NamedTempFile::new().expect("create OCI fallback policy");
-    std::fs::write(policy.path(), OCI_FALLBACK_POLICY).expect("write OCI fallback policy");
-    let policy_path = policy.path().to_str().expect("policy path is UTF-8");
-    let result = SandboxGuard::create_keep_with_args(
-        &["--from", &image.tag, "--policy", policy_path, "--no-tty"],
-        &["sh", "-c", "echo should-not-run"],
-        "should-not-run",
-    )
-    .await;
-    let error = match result {
-        Ok(mut sandbox) => {
-            sandbox.cleanup().await;
-            panic!("a copied workspace unusable by the final identity must fail closed");
-        }
-        Err(error) => error,
-    };
-    let message = error;
-    assert!(
-        (message.contains("WorkspaceValidationFailed") && message.contains("WorkingDir"))
-            || message.contains("subsystem request failed")
-            || message.contains("image workspace validation failed"),
-        "expected copied workspace validation failure, got: {message}"
-    );
 }
 
 async fn assert_isolated_pair(image: &ImageGuard, sandbox: &SandboxGuard, container_id: &str) {

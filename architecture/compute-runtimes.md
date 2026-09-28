@@ -427,28 +427,16 @@ policy updates require sandbox recreation, while other policy updates remain
 live.
 
 Docker and Podman resolve OCI `Config.User` and `Config.WorkingDir` from one
-immutable image inspection. Empty, root (`/`), and explicit `/sandbox` working
-directories select the managed `/sandbox` compatibility workspace. A custom
-working directory must be a normalized absolute path outside kernel runtime,
-OpenShell control, and private channel paths. A driver-config mount cannot cover
-the workspace root or one of its parents; mounts nested beneath the root remain
-valid. Image-declared volumes follow the same collision rules. Malformed paths
-and collisions fail before untrusted execution.
+immutable image inspection. Empty, `/`, and explicit `/sandbox` values use the
+managed `/sandbox` workspace. Custom paths must be normalized absolute paths
+outside runtime and control mounts; image and driver mounts cannot cover them.
 
-Podman mounts its persistent named workspace volume at the resolved custom root
-without `nocopy` or ownership-changing options, retaining Podman's normal
-first-use copy-up from the workload image. The trusted sandbox runtime starts at
-`/` directly as the final non-root identity with no capabilities, validates the
-effective copied-up path, and only then permits untrusted execution. Every path
-component must be a real traversable directory and the root must be writable;
-OpenShell preserves its ownership and mode. Only the `/sandbox` fallback uses
-the root/chown bootstrap and managed-workspace archive.
-
-The separate supervisor receives the resolved path as the logical
-`AgentSpec.workdir` but does not mount or traverse the workload workspace.
-Podman copy-up results can vary with rootless or rootful operation, user
-namespaces, backing filesystems, and SELinux; an unusable effective path fails
-closed. Kubernetes and VM continue to use `/sandbox`.
+Podman mounts its persistent workspace volume at a custom root with normal
+image copy-up, preserves the resulting ownership and mode, and starts directly
+as the final non-root identity. An unusable path fails closed. Only the managed
+`/sandbox` fallback uses the root/chown bootstrap. The separate supervisor uses
+the path logically but does not mount the workspace. Kubernetes and VM continue
+to use `/sandbox`.
 
 ### Executable Identity Binding
 

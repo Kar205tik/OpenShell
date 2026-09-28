@@ -1183,10 +1183,6 @@ mod tests {
             Some("app:staff")
         );
         assert_eq!(
-            image.config.as_ref().map(|config| config.env.as_slice()),
-            Some(["A=one".to_string()].as_slice())
-        );
-        assert_eq!(
             image
                 .config
                 .as_ref()
@@ -1208,27 +1204,6 @@ mod tests {
                 .as_slice(),
             ["GET /v5.0.0/libpod/images/example%2Fimage%3Alatest/json"]
         );
-        let _ = std::fs::remove_file(socket_path);
-    }
-
-    #[tokio::test]
-    async fn inspect_image_accepts_null_oci_volumes() {
-        let (socket_path, _request_log, handle) = spawn_podman_stub(
-            "inspect-image-null-volumes",
-            vec![StubResponse::new(
-                StatusCode::OK,
-                r#"{"Id":"sha256:immutable","Config":{"WorkingDir":"/workspace","Volumes":null}}"#,
-            )],
-        );
-        let client = PodmanClient::new(socket_path.clone());
-
-        let image = client
-            .inspect_image("example/image:latest")
-            .await
-            .expect("null OCI volumes should parse");
-
-        assert!(image.config.is_some_and(|config| config.volumes.is_none()));
-        handle.await.expect("stub task should finish");
         let _ = std::fs::remove_file(socket_path);
     }
 

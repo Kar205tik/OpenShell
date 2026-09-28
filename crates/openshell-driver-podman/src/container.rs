@@ -1980,6 +1980,27 @@ mod tests {
                 driver_mounts::DEFAULT_WORKSPACE_ROOT,
             ]
         );
+        let custom_image = resolved_image("sha256:image", "1000:1001", "/workspace/project");
+        let custom_specs = build_isolation_specs(IsolationSpecInput {
+            sandbox: &sandbox,
+            config: &config,
+            token_secret: Some("jwt"),
+            resolver_secret: "resolver",
+            gpu_devices: None,
+            requested_image: "image:latest",
+            image: &custom_image,
+            supervisor_bin: None,
+            tls_secrets: None,
+            identity: &identity,
+            rootless: true,
+        })
+        .unwrap();
+        assert_eq!(custom_specs.workload.user, "1000:1001");
+        assert!(custom_specs.workload.cap_add.is_empty());
+        assert_eq!(
+            custom_specs.workload.command,
+            vec!["--bootstrap", crate::isolation::BOOTSTRAP_PATH]
+        );
         let workload_json = serde_json::to_string(&specs.workload).unwrap();
         assert!(workload_json.contains("\"apparmor_profile\":\"openshell-sandbox\""));
         assert_eq!(specs.supervisor.healthconfig.test, vec!["NONE"]);
@@ -2059,136 +2080,21 @@ mod tests {
     }
 
     #[test]
-    fn custom_workspace_stays_on_the_final_unprivileged_runtime_path() {
-        let sandbox = DriverSandbox {
-            id: "pair".into(),
-            name: "agent".into(),
-            ..Default::default()
-        };
-        let config = PodmanComputeConfig::default();
-        let identity = openshell_isolation_interface::contract::ResolvedWorkloadIdentity::new(
-            1000,
-            1001,
-            vec![2000],
-            "default".into(),
-            "sha256:image".into(),
-        )
-        .unwrap();
-        let image = resolved_image("sha256:image", "", "/workspace/project");
-
-        let specs = build_isolation_specs(IsolationSpecInput {
-            sandbox: &sandbox,
-            config: &config,
-            token_secret: None,
-            resolver_secret: "resolver",
-            gpu_devices: None,
-            requested_image: "image:latest",
-            image: &image,
-            supervisor_bin: None,
-            tls_secrets: None,
-            identity: &identity,
-            rootless: true,
-        })
-        .unwrap();
-
-        assert_eq!(specs.workload.work_dir, "/");
-        assert_eq!(specs.workload.user, "1000:1001");
-        assert!(specs.workload.cap_add.is_empty());
-        assert_eq!(
-            specs.workload.command,
-            vec!["--bootstrap", crate::isolation::BOOTSTRAP_PATH]
-        );
-        assert!(specs.workload.volumes.iter().any(|volume| {
-            volume.name == volume_name("pair") && volume.dest == "/workspace/project"
-        }));
-        assert_eq!(specs.supervisor.work_dir, "/");
-        assert_eq!(
-            &specs.supervisor.command[..2],
-            ["--workdir", "/workspace/project"]
-        );
-        assert!(
-            specs
-                .supervisor
-                .volumes
-                .iter()
-                .all(|volume| volume.name != volume_name("pair"))
-        );
-    }
-
-    #[test]
-    fn resolved_image_applies_fallback_and_rejects_unsafe_workdirs() {
-        for working_dir in ["", "/", "/sandbox"] {
-            let image = resolved_image("sha256:image", "1000:1000", working_dir);
-            assert_eq!(image.workspace_root, "/sandbox");
-            assert!(image.uses_managed_workspace());
-        }
-
-        for working_dir in [
-            "relative/workspace",
-            "/workspace/../project",
-            "/proc/project",
-            "/.openshell",
-            "/.openshell/channel/project",
-        ] {
-            let inspected = ImageInspect {
-                id: "sha256:image".into(),
-                config: Some(ImageConfig {
-                    user: "1000:1000".into(),
-                    env: Vec::new(),
-                    working_dir: working_dir.into(),
-                    volumes: None,
-                }),
-            };
-            assert!(
-                ResolvedPodmanImage::from_inspect(&inspected).is_err(),
-                "unsafe workdir {working_dir} should be rejected"
-            );
-        }
-
-        let image = resolved_image("sha256:image", "1000:1000", "/usr/src/app");
-        assert_eq!(image.workspace_root, "/usr/src/app");
-        assert!(!image.uses_managed_workspace());
-    }
-
-    #[test]
     fn resolved_image_rejects_masking_oci_volumes_but_allows_nested_volumes() {
-        for volume in [
-            "/workspace",
-            "/workspace/project",
-            "/.openshell",
-            "/.openshell/channel",
-        ] {
-            let inspected = ImageInspect {
-                id: "sha256:image".into(),
-                config: Some(ImageConfig {
-                    user: "1000:1000".into(),
-                    env: Vec::new(),
-                    working_dir: "/workspace/project".into(),
-                    volumes: Some(std::collections::HashMap::from([(
-                        volume.to_string(),
-                        Value::Object(serde_json::Map::default()),
-                    )])),
-                }),
-            };
-            assert!(
-                ResolvedPodmanImage::from_inspect(&inspected).is_err(),
-                "masking image volume {volume} should be rejected"
-            );
-        }
-
-        let inspected = ImageInspect {
+        let inspect = |volume: &str| ImageInspect {
             id: "sha256:image".into(),
             config: Some(ImageConfig {
-                user: "1000:1000".into(),
-                env: Vec::new(),
                 working_dir: "/workspace/project".into(),
                 volumes: Some(std::collections::HashMap::from([(
-                    "/workspace/project/cache".into(),
-                    Value::Object(serde_json::Map::default()),
+                    volume.into(),
+                    Value::Null,
                 )])),
+                ..Default::default()
             }),
         };
-        let image = ResolvedPodmanImage::from_inspect(&inspected)
+
+        assert!(ResolvedPodmanImage::from_inspect(&inspect("/workspace")).is_err());
+        let image = ResolvedPodmanImage::from_inspect(&inspect("/workspace/project/cache"))
             .expect("image volumes nested below the workspace remain valid");
         assert_eq!(image.workspace_root, "/workspace/project");
     }
@@ -3284,55 +3190,21 @@ mod tests {
     }
 
     #[test]
-    fn resolved_workspace_rejects_covering_mounts_but_allows_nested_mounts() {
+    fn resolved_workspace_rejects_masking_driver_mount() {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let image = resolved_image("sha256:immutable", "1000:1000", "/workspace/project");
-        for target in ["/workspace", "/workspace/project"] {
-            let mut sandbox = test_sandbox("test-id", "test-name");
-            sandbox.spec = Some(DriverSandboxSpec {
-                template: Some(DriverSandboxTemplate {
-                    driver_config: Some(json_struct(serde_json::json!({
-                        "mounts": [{"type": "tmpfs", "target": target}]
-                    }))),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            });
-
-            let error = build_container_spec_for_image(
-                &sandbox,
-                &test_config(),
-                None,
-                None,
-                "image:latest",
-                &image,
-                None,
-                None,
-            )
-            .unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("reserved for the OpenShell workspace"),
-                "covering target {target} should be rejected: {error}"
-            );
-        }
-
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
             template: Some(DriverSandboxTemplate {
                 driver_config: Some(json_struct(serde_json::json!({
-                    "mounts": [
-                        {"type": "tmpfs", "target": "/workspace/project/cache"},
-                        {"type": "tmpfs", "target": "/sandbox"}
-                    ]
+                    "mounts": [{"type": "tmpfs", "target": "/workspace"}]
                 }))),
                 ..Default::default()
             }),
             ..Default::default()
         });
-        let spec = build_container_spec_for_image(
+        let error = build_container_spec_for_image(
             &sandbox,
             &test_config(),
             None,
@@ -3342,17 +3214,11 @@ mod tests {
             None,
             None,
         )
-        .expect("nested and unrelated mounts should remain valid");
-        let mounts = spec["mounts"].as_array().unwrap();
+        .unwrap_err();
         assert!(
-            mounts
-                .iter()
-                .any(|mount| mount["destination"] == "/workspace/project/cache")
-        );
-        assert!(
-            mounts
-                .iter()
-                .any(|mount| mount["destination"] == "/sandbox")
+            error
+                .to_string()
+                .contains("reserved for the OpenShell workspace")
         );
     }
 

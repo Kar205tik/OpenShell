@@ -680,11 +680,9 @@ files, mounted volumes, or devices.
 
 Docker and Podman gateways also use a normalized absolute OCI `WORKDIR` as the
 workspace. Empty, `/`, and explicit `/sandbox` declarations use the managed
-`/sandbox` fallback. Podman mounts its persistent workspace volume at a custom
-workdir and preserves normal first-use image copy-up; it does not repair the
-copied ownership or mode. Make the final non-root identity able to traverse and
-write that directory, and test the image with the target rootless/rootful,
-user-namespace, filesystem, and SELinux configuration.
+`/sandbox` fallback. Podman preserves normal volume copy-up and does not repair
+custom workspace ownership or mode; the final identity must be able to traverse
+and write the directory.
 
 ### Forward ports
 

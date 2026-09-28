@@ -326,13 +326,6 @@ Common findings:
 - Rootless networking unavailable: inspect Podman network configuration.
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
 - Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Numeric workload identities `1` through `4294967294` are accepted; root, the invalid identity sentinel, and missing identities are rejected.
-- A custom OCI `WORKDIR` uses the Podman workspace volume at that path. Inspect
-  the workload container's mounts and the copied directory ownership/mode. The
-  custom path starts directly as the final non-root identity; only managed
-  `/sandbox` uses OpenShell's root/chown bootstrap. Rootless/rootful services,
-  user namespaces, backing filesystems, and SELinux can produce different
-  copy-up results. Fix the image or runtime configuration instead of adding
-  capabilities or asking OpenShell to repair the custom path.
 - Supervisor cannot connect: check its gateway endpoint and gateway logs.
 - Inspect both Podman containers for the sandbox: the `sandbox` isolation role
   must have network mode `none`; the `supervisor` role owns the gateway session

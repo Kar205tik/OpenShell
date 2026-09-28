@@ -92,35 +92,24 @@ environment belong to agent children, never the supervisor process.
 
 ## OCI working directory
 
-The same immutable workload-image inspection resolves OCI `WorkingDir`. An
-empty value, `/`, or explicit `/sandbox` selects OpenShell's managed
-`/sandbox` compatibility workspace. Any other value must be a normalized
-absolute path that does not overlap kernel runtime mounts, OpenShell control
-paths, or the private `/.openshell` channel.
-Image-declared volumes and driver-config mounts may be nested below the
-workspace, but cannot replace it or one of its parents.
+The immutable workload-image inspection also resolves OCI `WorkingDir`. Empty,
+`/`, and explicit `/sandbox` values select the managed `/sandbox` workspace.
+Custom paths must be normalized absolute paths outside runtime and control
+mounts. Image and driver mounts may be nested below the workspace but cannot
+cover it.
 
 For a custom root, the driver mounts the persistent workspace volume at the
 resolved path without `nocopy` or ownership-changing volume options. Podman
-performs its normal first-use copy-up from the image. The driver does not upload
-its managed-workspace ownership archive, chown the copied directory, or change
-its mode. The capability-free sandbox runtime starts directly as the final
-non-root identity and validates the effective copied-up path before it releases
-untrusted code. Every path component must be a real, traversable directory and
-the final directory must be writable. Direct and later exec/SSH children use
-the path as both cwd and `HOME`; `filesystem.include_workdir` grants that same
-root when enabled.
+performs its normal first-use copy-up from the image. OpenShell preserves the
+copied ownership and mode, starts directly as the final non-root identity, and
+fails closed unless that identity can traverse and write the path. Agent
+children use the path as cwd and `HOME`; `filesystem.include_workdir` grants it
+when enabled.
 
-Only the `/sandbox` fallback uses the root-to-non-root bootstrap and ownership
-archive needed to create a driver-managed workspace. The separate supervisor
-container receives the resolved path as logical `AgentSpec.workdir`; it neither
-mounts nor traverses the workload workspace.
-
-Podman copy-up details can vary across rootless/rootful services, user namespace
-modes, backing filesystems, and SELinux configuration. OpenShell preserves the
-effective custom-workspace ownership and mode and fails closed when the final
-identity cannot use it. Validate custom images with the deployment's actual
-Podman configuration.
+Only `/sandbox` uses the root-to-non-root bootstrap needed to prepare a managed
+workspace. The separate supervisor receives the path logically but does not
+mount it. Because Podman copy-up varies by deployment, validate custom images
+with the target runtime configuration.
 
 ## Lifecycle and readiness
 

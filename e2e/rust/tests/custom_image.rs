@@ -49,7 +49,6 @@ USER 2345:2346
 CMD ["sleep", "infinity"]
 "#;
 
-#[cfg(feature = "e2e-docker")]
 const UNWRITABLE_WORKDIR_DOCKERFILE_CONTENT: &str = r#"FROM public.ecr.aws/docker/library/python:3.13-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
@@ -224,7 +223,6 @@ async fn sandbox_from_passwd_less_numeric_oci_user() {
 
 #[tokio::test]
 #[serial(custom_image)]
-#[cfg(feature = "e2e-docker")]
 async fn sandbox_rejects_image_workdir_that_would_require_new_authority() {
     let tmpdir = tempfile::tempdir().expect("create tmpdir");
     let dockerfile_path = tmpdir.path().join("Dockerfile");
@@ -245,7 +243,7 @@ async fn sandbox_rejects_image_workdir_that_would_require_new_authority() {
         }
         Err(error) => error,
     };
-    let message = error.to_string();
+    let message = error;
     assert!(
         (message.contains("WorkspaceValidationFailed") && message.contains("WorkingDir"))
             || message.contains("subsystem request failed")
