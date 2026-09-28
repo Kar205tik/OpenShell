@@ -1,29 +1,19 @@
 # Jupyter Sandbox
 
-Launch one OpenShell sandbox, expose its Jupyter API server as a named service,
-and submit Python code to a kernel through that service.
-
-The example uses the OpenShell Python SDK for gateway health, sandbox creation,
-service exposure, readiness, command execution, and deletion.
+Launch a Jupyter Server in one OpenShell sandbox, open its local service URL in
+your browser, and submit code to a kernel through the exposed service.
 
 ## Prerequisites
 
-- A running local OpenShell gateway (`mise run gateway:docker` for development)
-- OpenShell gateway configuration for the Python SDK
-- Docker to build the example image
-- Python 3.11 or later
-- [uv](https://docs.astral.sh/uv/) to install the Python dependencies
+- A working local OpenShell gateway and its gateway configuration
+- Docker to build the Jupyter image
+- Python 3.11 or later and [uv](https://docs.astral.sh/uv/)
 
-The example supports a local gateway only. Remote service access requires
-handling the gateway authentication boundary and is outside this example's
-scope.
+## Run
 
-## Run the example
-
-Install the Python dependencies, build the Jupyter image, and run the script:
+From this directory:
 
 ```shell
-cd examples/jupyter-sandbox
 uv venv
 source .venv/bin/activate
 uv pip install -e ../.. pyyaml websocket-client
@@ -31,93 +21,26 @@ docker build -t openshell-jupyter-sandbox:local .
 python demo.py
 ```
 
-The script:
+The script creates a sandbox and exposes port 8888 as the `jupyter` service. It
+starts a token-authenticated Jupyter Server on the sandbox's loopback address,
+then prints a URL to open in your local browser. Jupyter may take a few seconds
+to start. Keep the script running while you use it; press Enter or Ctrl-C to
+delete the sandbox and its service.
 
-1. Creates one sandbox from the configured image and policy through the Python
-   SDK.
-2. Starts a token-authenticated Jupyter Server on `127.0.0.1:8888` in the
-   sandbox.
-3. Exposes the server as an OpenShell service named `jupyter` during sandbox
-   creation and prints the service URL.
-4. Creates a Python kernel with `POST /api/kernels` through the service.
-5. Connects to `/api/kernels/{kernel_id}/channels` through the service and sends
-   a Jupyter `execute_request` over WebSocket.
-6. Prints the kernel output, then deletes the kernel and sandbox. Sandbox
-   deletion also removes its service.
-
-The submitted code is:
+The script also creates a Jupyter kernel through the exposed REST API, sends
+this code through the kernel's WebSocket channel, and prints `285`:
 
 ```python
 print(sum(i * i for i in range(10)))
 ```
 
-The expected result is `285`.
+The code runs in a Jupyter kernel inside the sandbox. You can also run code
+interactively by opening the printed URL in your browser.
 
-## Submit code through the service
+The URL contains a Jupyter token. Treat it as a credential and do not share it.
+The example requires a local gateway; it does not configure remote gateway
+authentication for browser access.
 
-`JupyterSandbox` owns the sandbox, Jupyter server, exposed service, and cleanup
-lifecycle. Call `execute()` inside its context to create a kernel and submit
-code through the exposed service:
-
-```python
-with JupyterSandbox(
-    client=client,
-    name="jupyter-example",
-    workspace="default",
-    image="openshell-jupyter-sandbox:local",
-    policy="policy.yaml",
-) as sandbox:
-    print(f"Jupyter service: {sandbox.service_url}")
-    output = sandbox.execute("print('hello from Jupyter')")
-    print(output)
-```
-
-Each sandbox gets a unique Jupyter token. The token travels to the sandbox over
-standard input, is stored in a mode-restricted file, and is attached internally
-to the REST and WebSocket requests. The example prints the service URL without
-the token.
-
-## Configure the sandbox
-
-Edit the constants at the top of `demo.py` to select the image, policy, sandbox
-name prefix, workspace, gateway, and code:
-
-```python
-IMAGE = "registry.example.com/jupyter-sandbox:latest"
-POLICY = EXAMPLE_DIR / "my-policy.yaml"
-NAME_PREFIX = "analysis"
-WORKSPACE = "default"
-CODE = 'print("hello from Jupyter")'
-GATEWAY = None
-```
-
-`IMAGE` accepts an OCI image reference. The Python SDK does not currently build
-a Dockerfile the way `openshell sandbox create --from` does, so build or publish
-the image first. A custom image must provide `jupyter server`, a `python3`
-kernel, and the non-root `sandbox` user and group selected by the policy.
-
-`policy.yaml` allows the system paths Jupyter needs and writable access to
-`/sandbox` and `/tmp`. Its empty `network_policies` map denies outbound network
-access. Exposing the loopback Jupyter server through OpenShell is inbound and
-does not require an egress rule.
-
-## Proposed Python SDK APIs
-
-The example still has deliberate seams because the SDK does not expose all CLI
-functionality:
-
-- The SDK can expose a service during sandbox creation. Public methods for
-  adding, querying, and deleting services after creation would support a
-  longer-lived sandbox workflow.
-- Add a public sandbox configuration builder that accepts `image` and a
-  `SandboxPolicy`. The low-level client currently requires generated protobuf
-  types from the private `openshell._proto` package.
-- Add `load_sandbox_policy()` with the same canonical YAML validation and
-  conversion as the CLI. This example only normalizes the
-  `filesystem_policy` field needed by its policy before parsing the protobuf.
-- Add an image-source helper with CLI parity for OCI references, Dockerfiles,
-  and build directories. Until then, Python SDK callers must prepare the OCI
-  image before creating a sandbox.
-
-With the remaining configuration APIs, `JupyterSandbox` could remove its
-imports from `openshell._proto`.
+Edit the constants at the top of `demo.py` to change the image, policy,
+workspace, gateway, or command. The image must contain Jupyter Server and
+Python, plus the `sandbox` user and group selected by the policy.
