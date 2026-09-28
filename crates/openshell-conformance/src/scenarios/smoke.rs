@@ -6,6 +6,7 @@
 use std::ffi::OsString;
 use std::time::{Duration, Instant};
 
+use crate::platform::{self, SmokeFixture};
 use crate::{OpenShellRunner, STATUS_TIMEOUT, Scenario, ScenarioFuture};
 use serde::Deserialize;
 use tokio::time::sleep;
@@ -62,7 +63,7 @@ async fn run_smoke_control_plane_inner(runner: &mut OpenShellRunner) -> Result<(
     status.require_success()?;
 
     let sandbox_name = format!("ct-{}-cp", runner.id());
-    create_sandbox(runner, &sandbox_name, "create").await?;
+    let _fixture = create_sandbox(runner, &sandbox_name, "create").await?;
     check_sandbox_ready(runner, &sandbox_name).await?;
     check_sandbox_listed(runner, &sandbox_name).await?;
 
@@ -71,7 +72,7 @@ async fn run_smoke_control_plane_inner(runner: &mut OpenShellRunner) -> Result<(
 
 async fn run_smoke_exec_inner(runner: &mut OpenShellRunner) -> Result<(), String> {
     let sandbox_name = format!("ct-{}-ex", runner.id());
-    create_sandbox(runner, &sandbox_name, "create").await?;
+    let _fixture = create_sandbox(runner, &sandbox_name, "create").await?;
     check_sandbox_ready(runner, &sandbox_name).await?;
 
     let marker = format!("openshell-conformance-{}", runner.id());
@@ -104,7 +105,8 @@ async fn create_sandbox(
     runner: &mut OpenShellRunner,
     sandbox_name: &str,
     step: &str,
-) -> Result<(), String> {
+) -> Result<SmokeFixture, String> {
+    let fixture = platform::smoke_fixture()?;
     runner.track_sandbox(sandbox_name);
     let mut args = vec![
         "sandbox".to_string(),
@@ -116,9 +118,10 @@ async fn create_sandbox(
     if let Some(extra_args) = json_string_array_env("OPENSHELL_CONFORMANCE_SMOKE_CREATE_ARGS")? {
         args.extend(extra_args);
     }
-    if let Some(command) = smoke_command()? {
+    args.extend(fixture.create_args().iter().cloned());
+    if let Some(command) = fixture.command() {
         args.push("--".to_string());
-        args.extend(command);
+        args.extend(command.iter().cloned());
     }
     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
     let create = runner
@@ -128,23 +131,8 @@ async fn create_sandbox(
         .run(&args)
         .await
         .map_err(|error| error.to_string())?;
-    create.require_success()
-}
-
-fn smoke_command() -> Result<Option<Vec<String>>, String> {
-    parse_smoke_command(std::env::var_os("OPENSHELL_CONFORMANCE_SMOKE_COMMAND"))
-}
-
-fn parse_smoke_command(value: Option<OsString>) -> Result<Option<Vec<String>>, String> {
-    let Some(command) = json_string_array("OPENSHELL_CONFORMANCE_SMOKE_COMMAND", value)? else {
-        return Ok(None);
-    };
-    if command.first().is_none_or(String::is_empty) {
-        return Err(
-            "OPENSHELL_CONFORMANCE_SMOKE_COMMAND must contain a non-empty executable".to_string(),
-        );
-    }
-    Ok(Some(command))
+    create.require_success()?;
+    Ok(fixture)
 }
 
 fn json_string_array_env(name: &str) -> Result<Option<Vec<String>>, String> {
@@ -294,30 +282,6 @@ async fn find_sandbox(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn smoke_command_is_optional() {
-        assert_eq!(parse_smoke_command(None).unwrap(), None);
-    }
-
-    #[test]
-    fn smoke_command_parses_a_json_string_array() {
-        assert_eq!(
-            parse_smoke_command(Some(OsString::from(r#"["cmd.exe","/c","exit","0"]"#))).unwrap(),
-            Some(vec![
-                "cmd.exe".into(),
-                "/c".into(),
-                "exit".into(),
-                "0".into()
-            ])
-        );
-    }
-
-    #[test]
-    fn smoke_command_rejects_an_empty_executable() {
-        let error = parse_smoke_command(Some(OsString::from(r#"[""]"#))).unwrap_err();
-        assert!(error.contains("non-empty executable"));
-    }
 
     #[test]
     fn smoke_create_args_parse_a_json_string_array() {

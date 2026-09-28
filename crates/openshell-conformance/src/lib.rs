@@ -4,6 +4,7 @@
 //! Reusable support for portable `OpenShell` CLI conformance scenarios.
 
 pub mod executor;
+mod platform;
 mod scenarios;
 
 use std::collections::BTreeSet;

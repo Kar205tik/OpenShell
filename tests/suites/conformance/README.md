@@ -29,13 +29,13 @@ continue after individual failures. Use focused selection only to reproduce or
 diagnose one scenario locally.
 
 Set `OPENSHELL_BIN` to the candidate CLI. The selected gateway must already be
-reachable. Runtimes that require an explicit sandbox workload can set
-`OPENSHELL_CONFORMANCE_SMOKE_COMMAND` to a JSON string array. Set
-`OPENSHELL_CONFORMANCE_SMOKE_CREATE_ARGS` to a JSON string array when the
-runtime also needs portable create options such as `--policy`. For example:
+reachable. Smoke workloads are selected from the conformance crate's Unix or
+Windows implementation at compile time. Set
+`OPENSHELL_CONFORMANCE_SMOKE_CREATE_ARGS` to a JSON string array when a runtime
+needs additional portable create options. For example:
 
 ```shell
-export OPENSHELL_CONFORMANCE_SMOKE_COMMAND='["sleep","infinity"]'
+export OPENSHELL_CONFORMANCE_SMOKE_CREATE_ARGS='["--policy","policy.yaml"]'
 cargo nextest run \
   --manifest-path tests/suites/conformance/Cargo.toml \
   -E 'binary(smoke) & test(=control_plane)'

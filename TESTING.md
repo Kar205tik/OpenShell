@@ -194,13 +194,15 @@ starts. The task does not provision a gateway or select a compute driver. Set
 the current checkout.
 
 The smoke contract verifies the CLI-to-gateway-to-driver path without depending
-on how the gateway was installed. Its control-plane test requires
+on how the gateway was installed. Its target-specific fixture is selected at
+compile time: Unix targets use the runtime's default workload, while Windows
+targets create a temporary writable policy and start a native long-running
+command. Its control-plane test requires
 machine-readable status, creates a uniquely named detached sandbox, verifies it
 is `Ready` through get and paginated list output, deletes it, and verifies its
 name no longer appears. The exec test creates its own sandbox and checks
-`sandbox exec` with a run-specific marker. Runtimes that require an explicit workload set
-`OPENSHELL_CONFORMANCE_SMOKE_COMMAND` to a JSON string array; additional create
-options can be supplied through `OPENSHELL_CONFORMANCE_SMOKE_CREATE_ARGS`.
+`sandbox exec` with a run-specific marker. Additional create options can be
+supplied through `OPENSHELL_CONFORMANCE_SMOKE_CREATE_ARGS`.
 Sandbox lifecycle, label matrices, VM overlay, and TLS-key permission assertions
 remain regular E2E coverage.
 

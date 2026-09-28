@@ -32,6 +32,11 @@ specific unsupported operation without hiding later coverage. Driver internals,
 platform enforcement, and hardware qualification belong in driver-specific
 tests rather than this crate.
 
+Target-specific fixture construction lives under `src/platform`. The smoke
+scenarios select the Unix or Windows implementation at compile time while the
+scenario assertions remain shared. Platform implementations may construct
+temporary policies and commands, but must exercise the same public behavior.
+
 When adding a scenario, export it from the library and add the appropriate Cargo
 test wrapper under `tests/suites/conformance/cli`, then add the leaf to the
 standalone CLI registry. Conformance CI must run all registered leaves; focused

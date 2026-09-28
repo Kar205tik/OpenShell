@@ -590,14 +590,12 @@ function Invoke-ConformanceTest([string] $RustTarget) {
     $testRoot = Join-Path $tempRoot "openshell-conformance-$RustTarget-$([guid]::NewGuid().ToString('N'))"
     $configRoot = Join-Path $testRoot "config"
     $stateRoot = Join-Path $testRoot "state"
-    $workloadRoot = Join-Path $testRoot "workload"
     $gatewayConfig = Join-Path $testRoot "gateway.toml"
-    $sandboxPolicy = Join-Path $testRoot "policy.yaml"
     $gatewayLog = Join-Path $LogDir "test-$RustTarget-conformance-gateway.log"
     $gatewayErrorLog = Join-Path $LogDir "test-$RustTarget-conformance-gateway.err.log"
     $conformanceLog = Join-Path $LogDir "test-$RustTarget-conformance.log"
     $conformanceErrorLog = Join-Path $LogDir "test-$RustTarget-conformance.err.log"
-    New-Item -ItemType Directory -Force -Path $configRoot, $stateRoot, $workloadRoot | Out-Null
+    New-Item -ItemType Directory -Force -Path $configRoot, $stateRoot | Out-Null
     @"
 [openshell]
 version = 2
@@ -606,16 +604,6 @@ version = 2
 wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
 backend = "process_container"
 "@ | Set-Content -LiteralPath $gatewayConfig -Encoding utf8
-    $workloadPolicyPath = $workloadRoot.Replace('\', '/')
-    @"
-version: 1
-filesystem_policy:
-  include_workdir: false
-  read_only: []
-  read_write:
-    - "$workloadPolicyPath"
-"@ | Set-Content -LiteralPath $sandboxPolicy -Encoding utf8
-
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
     $listener.Start()
     $port = ([System.Net.IPEndPoint] $listener.LocalEndpoint).Port
@@ -627,15 +615,6 @@ filesystem_policy:
     $env:XDG_CONFIG_HOME = $configRoot
     $env:XDG_STATE_HOME = $stateRoot
     $env:OPENSHELL_BIN = $cli
-    $env:OPENSHELL_CONFORMANCE_SMOKE_CREATE_ARGS = (@(
-        "--policy", $sandboxPolicy
-    ) | ConvertTo-Json -Compress)
-    $env:OPENSHELL_CONFORMANCE_SMOKE_COMMAND = (@(
-        "C:\Windows\System32\cmd.exe",
-        "/c",
-        "echo ready > `"$workloadPolicyPath/ready.txt`" & ping -t 127.0.0.1 > NUL"
-    ) | ConvertTo-Json -Compress)
-
     $gatewayProcess = $null
     try {
         $gatewayProcess = Start-Process -FilePath $gateway `
