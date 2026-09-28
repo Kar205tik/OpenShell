@@ -224,6 +224,14 @@ export interface SandboxWorkspaceOptions {
   workspace?: string;
 }
 
+/** Pagination and workspace scope for providers attached to one sandbox. */
+export type SandboxProviderListOptions = SandboxWorkspaceOptions & {
+  /** Maximum providers requested per page. */
+  pageSize?: number;
+  /** Opaque token from a previous page. Omit to start at the beginning. */
+  pageToken?: string;
+};
+
 export type SandboxCallOptions = CallOptions & SandboxWorkspaceOptions;
 
 export interface SandboxTemplateWorkspaceOptions {
@@ -299,14 +307,26 @@ export interface ExecInteractiveOptions extends SandboxWorkspaceOptions {
 
 // The transport half of an interactive exec: raw stdin/stdout/stderr plus
 // resize, with no terminal glue. Drive it by consuming `output`, which yields
-// chunks then a terminal exit event; `done` resolves with the exit code once
-// the stream reaches that exit event and rejects if the stream ends without one.
+// chunks then a terminal exit event; `done` resolves only after an exit event
+// and successful RPC completion. Consume output concurrently with awaiting done.
 export interface ExecInteractiveSession {
   output: AsyncIterable<ExecStreamEvent>;
   write(data: Buffer): void;
   resize(cols: number, rows: number): void;
+  /** Close stdin and resize input while preserving output. */
   close(): void;
   done: Promise<number>;
+}
+
+/** Lifecycle controls available on SDK-created sessions. The base interface
+ * retains its original members for existing custom sessions and wrappers. */
+export interface ExecInteractiveSessionControl extends ExecInteractiveSession {
+  /** Close stdin and resize input, preserving output until completion. */
+  closeInput(): void;
+  /** Cancel the RPC and stop receiving output. */
+  cancel(): void;
+  /** Observed process exit, retained even if final RPC completion fails. */
+  readonly exitCode: number | undefined;
 }
 
 /** Cancellation for the poll-based wait helpers. */
@@ -709,27 +729,109 @@ export class Pushable<T> implements AsyncIterable<T> {
   }
 }
 
+// Single producer/consumer queue. Closing wakes both directions, including a
+// producer blocked by backpressure. Successful completion drains queued values.
+class ExecOutputQueue {
+  private readonly values: ExecStreamEvent[] = [];
+  private ended = false;
+  private error: unknown;
+  private reader?: () => void;
+  private writer?: () => void;
+
+  async push(value: ExecStreamEvent): Promise<void> {
+    // The terminal exit carries no output bytes and must never block cleanup
+    // after done has already settled and its cancellation listener is removed.
+    while (!('type' in value) && this.values.length >= 16 && !this.ended) {
+      await new Promise<void>((resolve) => {
+        this.writer = resolve;
+      });
+    }
+    if (this.ended) throw this.error ?? new SdkError('canceled', 'exec output closed');
+    this.values.push(value);
+    this.reader?.();
+    this.reader = undefined;
+  }
+
+  end(error?: unknown, discard = false): void {
+    if (discard) this.values.length = 0;
+    if (!this.ended) {
+      this.ended = true;
+      this.error = error;
+    }
+    this.reader?.();
+    this.writer?.();
+    this.reader = undefined;
+    this.writer = undefined;
+  }
+
+  async *[Symbol.asyncIterator](): AsyncGenerator<ExecStreamEvent> {
+    for (;;) {
+      const value = this.values.shift();
+      if (value !== undefined) {
+        this.writer?.();
+        this.writer = undefined;
+        yield value;
+      } else if (this.ended) {
+        if (this.error !== undefined) throw this.error;
+        return;
+      } else {
+        await new Promise<void>((resolve) => {
+          this.reader = resolve;
+        });
+      }
+    }
+  }
+}
+
 /** One response page from a list operation. */
 export interface Page<T> {
   readonly items: T[];
   readonly nextPageToken: string;
 }
 
+const maxConsumedPageTokens = 10_000;
+const maxConsumedPageTokenBytes = 1 << 20;
+
 /** Lazy, single-pass iterator that fetches one RPC page per advance. */
 export class Pager<T> implements AsyncIterable<Page<T>> {
   private nextToken: string | undefined;
+  private readonly consumedTokens = new Set<string>();
+  private consumedTokenBytes = 0;
 
   constructor(
     private readonly fetch: (pageToken: string) => Promise<Page<T>>,
     pageToken = '',
+    private readonly maxConsumedTokens = maxConsumedPageTokens,
+    private readonly maxConsumedTokenBytes = maxConsumedPageTokenBytes,
   ) {
     this.nextToken = pageToken;
+  }
+
+  private validateCurrentTokenBudget(pageToken: string): number {
+    if (pageToken === '') return 0;
+    const tokenBytes = new TextEncoder().encode(pageToken).byteLength;
+    if (
+      this.consumedTokens.size >= this.maxConsumedTokens ||
+      tokenBytes > this.maxConsumedTokenBytes - this.consumedTokenBytes
+    ) {
+      throw new Error('pager continuation token history limit exceeded');
+    }
+    return tokenBytes;
   }
 
   /** Fetch the next page, or return undefined after the final page. */
   async nextPage(): Promise<Page<T> | undefined> {
     if (this.nextToken === undefined) return undefined;
-    const page = await this.fetch(this.nextToken);
+    const pageToken = this.nextToken;
+    const tokenBytes = this.validateCurrentTokenBudget(pageToken);
+    const page = await this.fetch(pageToken);
+    if (pageToken !== '') {
+      this.consumedTokens.add(pageToken);
+      this.consumedTokenBytes += tokenBytes;
+    }
+    if (page.nextPageToken !== '' && this.consumedTokens.has(page.nextPageToken)) {
+      throw new Error('pager received a repeated continuation token');
+    }
     this.nextToken = page.nextPageToken === '' ? undefined : page.nextPageToken;
     return page;
   }
@@ -1112,7 +1214,7 @@ export class SandboxClient {
     name: string,
     command: string[],
     options?: ExecInteractiveOptions | null,
-  ): Promise<ExecInteractiveSession> {
+  ): Promise<ExecInteractiveSessionControl> {
     try {
       await this.get(name, { workspace: options?.workspace, ...(options?.signal ? { signal: options.signal } : {}) });
     } catch (e) {
@@ -1138,7 +1240,19 @@ export class SandboxClient {
       },
     });
 
-    const stream = this.grpc.execSandboxInteractive(input, { signal: options?.signal });
+    const controller = new AbortController();
+    const signal = options?.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
+    const grpc = this.grpc;
+    const queue = new ExecOutputQueue();
+    let inputClosed = false;
+    let exitCode: number | undefined;
+    const closeInput = (): void => {
+      inputClosed = true;
+      input.end();
+    };
+    const assertInputOpen = (): void => {
+      if (inputClosed || signal.aborted) throw new SdkError('io', 'exec input is closed');
+    };
     let resolveDone!: (code: number) => void;
     let rejectDone!: (err: unknown) => void;
     const done = new Promise<number>((resolve, reject) => {
@@ -1149,72 +1263,113 @@ export class SandboxClient {
     // keeps an unobserved rejection from surfacing as an unhandledRejection;
     // real awaiters still receive it through their own handler.
     void done.catch(() => {});
-    // Settle exactly once. The exit code wins; error/abandonment only apply
-    // when no exit was observed.
+    // The process exit and the terminal transport status are separate outcomes.
     let settled = false;
     const settleExit = (code: number): void => {
       if (settled) return;
       settled = true;
+      signal.removeEventListener('abort', onAbort);
       resolveDone(code);
     };
     const settleError = (err: unknown): void => {
       if (settled) return;
       settled = true;
+      signal.removeEventListener('abort', onAbort);
       rejectDone(err);
     };
 
-    async function* output(): AsyncGenerator<ExecStreamEvent, void, void> {
-      let sawExit = false;
+    const onAbort = (): void => {
+      closeInput();
+      const error = new SdkError('canceled', 'exec cancelled');
+      queue.end(error, true);
+      settleError(error);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
+
+    async function receive(): Promise<void> {
       try {
+        if (signal.aborted) throw new SdkError('canceled', 'exec cancelled');
+        // Start and observe the transport immediately, independently of output
+        // consumption. Backpressure bounds the queue to 16 chunks of 64 KiB.
+        const stream = grpc.execSandboxInteractive(input, { signal });
         for await (const event of stream) {
+          if (signal.aborted) throw new SdkError('canceled', 'exec cancelled');
+          if (exitCode !== undefined) {
+            throw new SdkError('rpc', 'ExecSandboxInteractive received an event after exit');
+          }
           switch (event.payload.case) {
             case 'stdout':
-              yield {
-                stream: 'stdout',
-                data: Buffer.from(event.payload.value.data),
-              };
-              break;
             case 'stderr':
-              yield {
-                stream: 'stderr',
-                data: Buffer.from(event.payload.value.data),
-              };
+              for (let offset = 0; offset < event.payload.value.data.length; offset += 64 * 1024) {
+                await queue.push({
+                  stream: event.payload.case,
+                  data: Buffer.from(event.payload.value.data.subarray(offset, offset + 64 * 1024)),
+                });
+              }
               break;
             case 'exit':
-              sawExit = true;
-              // Settle `done` before yielding: a consumer that breaks on the
-              // exit event abandons the generator at the yield, so anything
-              // after it would never run.
-              settleExit(event.payload.value.exitCode);
-              yield { type: 'exit', exitCode: event.payload.value.exitCode };
+              exitCode = event.payload.value.exitCode;
+              closeInput();
               break;
+            default:
+              throw new SdkError('rpc', 'ExecSandboxInteractive received an empty or unknown event');
           }
         }
-        if (!sawExit) {
+        if (exitCode === undefined) {
           throw new SdkError('rpc', 'ExecSandboxInteractive stream ended without an exit event');
         }
+        if (signal.aborted) throw new SdkError('canceled', 'exec cancelled before completion');
+        // Delay the public exit event until trailers have been consumed. A
+        // caller can still break on exit without losing the terminal status.
+        settleExit(exitCode);
+        await queue.push({ type: 'exit', exitCode });
+        queue.end();
       } catch (e) {
         const err = e instanceof SdkError ? e : fromConnect(e);
         settleError(err);
-        throw err;
+        queue.end(err);
       } finally {
-        input.end();
-        // Consumer abandoned the stream before an exit event (early break or
-        // return): settle `done` so it can never hang.
-        settleError(new SdkError('rpc', 'exec output abandoned before exit'));
+        closeInput();
+        controller.abort();
+      }
+    }
+
+    // receive catches transport failures even when nobody consumes output/done.
+    const receiving = receive();
+    async function* output(): AsyncGenerator<ExecStreamEvent, void, void> {
+      try {
+        yield* queue;
+      } finally {
+        const error = new SdkError('rpc', 'exec output abandoned before completion');
+        settleError(error);
+        queue.end(error, true);
+        closeInput();
+        controller.abort();
+        await receiving;
       }
     }
 
     return {
       output: output(),
       write(data: Buffer): void {
+        assertInputOpen();
         input.push({ payload: { case: 'stdin', value: new Uint8Array(data) } });
       },
       resize(cols: number, rows: number): void {
+        assertInputOpen();
         input.push({ payload: { case: 'resize', value: { cols, rows } } });
       },
-      close(): void {
-        input.end();
+      closeInput,
+      close: closeInput,
+      cancel(): void {
+        closeInput();
+        queue.end(new SdkError('canceled', 'exec cancelled'), true);
+        controller.abort();
+        settleError(new SdkError('canceled', 'exec cancelled'));
+      },
+      get exitCode(): number | undefined {
+        return exitCode;
       },
       done,
     };
@@ -1487,15 +1642,27 @@ export class SandboxClient {
     }
   }
 
-  async listProviders(name: string, options?: SandboxWorkspaceOptions | null): Promise<ProviderRef[]> {
-    try {
-      const resp = await this.grpc.listSandboxProviders({
-        ...sandboxTarget(name, options),
-      });
-      return resp.providers.map((p) => providerRef(p));
-    } catch (e) {
-      throw fromConnect(e);
-    }
+  listProviders(name: string, options?: SandboxProviderListOptions | null): Pager<ProviderRef> {
+    return new Pager(async (pageToken) => {
+      try {
+        const resp = await this.grpc.listSandboxProviders({
+          ...sandboxTarget(name, options),
+          pageSize: options?.pageSize ?? 0,
+          pageToken,
+        });
+        return {
+          items: resp.providers.map((provider) => providerRef(provider)),
+          nextPageToken: resp.nextPageToken,
+        };
+      } catch (e) {
+        throw fromConnect(e);
+      }
+    }, options?.pageToken ?? '');
+  }
+
+  /** List and collect every provider attached to this sandbox. */
+  async listAllProviders(name: string, options?: SandboxProviderListOptions | null): Promise<ProviderRef[]> {
+    return this.listProviders(name, options).all();
   }
 
   async getConfig(name: string, options?: SandboxCallOptions | null): Promise<SandboxConfig> {

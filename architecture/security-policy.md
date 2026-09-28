@@ -6,7 +6,7 @@ policy proxy. The gateway stores and delivers policy, but it does not make
 per-request egress decisions.
 
 For the field-by-field YAML reference, use
-[Policy Schema Reference](../docs/reference/policy-schema.mdx).
+[Policy Schema Reference](../docs/how-it-works/policies/schema.mdx).
 
 ## Policy Areas
 
@@ -113,7 +113,10 @@ allowing them to continue under stale authorization. HTTP upgrades switch to
 raw relay by default. A `protocol: rest` endpoint can opt in to
 `websocket_credential_rewrite` for client-to-server WebSocket text messages
 after an allowed `101` upgrade; server-to-client traffic and all other upgraded
-protocols remain raw passthrough.
+protocols remain raw passthrough. JSON-RPC and MCP endpoints refuse every
+request that carries an `Upgrade` header with `403` before forwarding,
+whatever the enforcement mode, because their rules apply to individual HTTP
+requests and a raw relay would bypass them.
 
 A `protocol: tcp` hostname is a connection-routing constraint, not an
 application-authority boundary. Transparent capture validates the approved DNS
@@ -242,8 +245,11 @@ higher specificity rank deterministically overrides broader request-processing
 metadata. Equally specific overlapping endpoints must agree.
 
 Endpoint `tls`, `enforcement`, and `access` use protobuf enums and retain their
-named YAML spellings. `protocol` remains a string so the supported protocol set
-can evolve, but every ingress validates it before persistence or activation.
+named YAML spellings. `tls` admits only an omitted value, meaning auto-detect
+and terminate for inspection, or `skip`; every other value, including the
+removed `terminate` and `passthrough` spellings, is rejected. `protocol`
+remains a string so the supported protocol set can evolve, but every ingress
+validates it before persistence or activation.
 The supervisor also refuses unknown enum numbers and protocol values
 defensively; an unrecognized enforcement value never falls back to audit.
 
@@ -279,6 +285,19 @@ because it changes the effective access model for every sandbox on the gateway.
 The policy advisor pipeline turns observed denials into draft policy
 recommendations. There are two proposers (sandbox-side mechanistic mapper,
 agent-authored via `policy.local`); the gateway is the single referee.
+For a new DNS name absent from policy, the supervisor can
+publish a bounded, short-lived synthetic observation mapping without querying
+an upstream resolver. It carries only the name to the subsequent TCP mediation
+step, which supplies the destination port and verified process identity for a
+denial summary. Observation mappings have no endpoint contracts or real pinned
+addresses, cannot authorize a relay, and become stale on policy generation
+change. Transparent TCP re-acquires the mapping at the generation that
+authorized the connection, so a reload between DNS and authorization fails
+closed instead of resolving the name again. Every unknown name still produces a
+DNS denial event. Reserved names, fail-closed quarantine, and an exhausted
+observation budget (a quarter of each address family's synthetic pool) keep the
+plain DNS refusal. This mechanistic observation path does not depend on the
+agent-authored proposal setting.
 When enabled, L7 `policy_denied` responses include both structured
 `next_steps` and a short `agent_guidance` string so generic agents can continue
 through the proposal loop instead of treating the denial as terminal.
@@ -421,7 +440,7 @@ reported modeled domains. See the `openshell-prover` crate README for the
 supported construction and matching patterns.
 
 This containment operation is separate from the proposal-risk queries below.
-See the [standalone policy prover documentation](../docs/reference/policy-prover.mdx)
+See the [standalone policy prover documentation](../docs/how-it-works/policies/prover.mdx)
 for installation, command behavior, model limitations, evidence, and exit codes.
 
 ## What the proposal prover decides

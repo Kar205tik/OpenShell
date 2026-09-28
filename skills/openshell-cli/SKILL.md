@@ -34,12 +34,12 @@ This is your primary fallback. Use it freely -- the CLI's help output is authori
 
 Use `openshell --help` and nested `--help` output as the authority for the installed CLI version. Use the published documentation for product concepts and supported workflows:
 
-- [Manage gateways](https://docs.nvidia.com/openshell/latest/sandboxes/manage-gateways.md)
-- [Manage sandboxes](https://docs.nvidia.com/openshell/latest/sandboxes/manage-sandboxes.md)
-- [Manage providers](https://docs.nvidia.com/openshell/latest/sandboxes/manage-providers.md)
-- [Profiles](https://docs.nvidia.com/openshell/latest/providers/profiles.md)
-- [Sandbox policies](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md)
-- [Inference routing](https://docs.nvidia.com/openshell/latest/sandboxes/inference-routing.md)
+- [Manage gateways](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/overview)
+- [Manage sandboxes](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview)
+- [Manage providers](https://docs.nvidia.com/openshell/latest/how-it-works/providers/overview)
+- [Profiles](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles)
+- [Sandbox policies](https://docs.nvidia.com/openshell/latest/how-it-works/policies/overview)
+- [Inference routing](https://docs.nvidia.com/openshell/latest/how-it-works/inference)
 
 ---
 
@@ -82,10 +82,13 @@ attaches your terminal to that retained process. Add `--detach` to return after
 the sandbox becomes ready without attaching.
 
 An explicit trailing command is foreground even when stdin or stdout is not a
-terminal. The CLI streams its stdout and stderr and returns its exact exit
-status. Exit code 0 leaves a retained sandbox in `Completed`; nonzero leaves it
-in `Error` with `MainProcessFailed`. Use `--no-keep` to delete either result
-after output drains, or `--detach` for a long-running service. Combine
+terminal. The CLI streams its stdout and stderr and reports the command's exit
+status after output drains. A failure to deliver output makes the CLI report a
+failure even if the command itself exited successfully; check the sandbox's
+state before retrying work that might have side effects. Exit code 0 leaves a
+retained sandbox in `Completed`; nonzero leaves it in `Error` with
+`MainProcessFailed`. Use `--no-keep` to delete either result after output
+drains, or `--detach` for a long-running service. Combine
 `--detach --no-keep` when the gateway should run the service without a host
 attachment and delete its sandbox after the service exits.
 
@@ -97,15 +100,15 @@ exist but a profile with that ID is available, the CLI can create it from local
 credentials:
 
 ```bash
-openshell sandbox create --provider claude-code -- claude
-openshell sandbox create --provider codex -- codex
+openshell sandbox create --from registry.example.com/your-org/claude-agent:latest --provider claude-code -- claude
+openshell sandbox create --from registry.example.com/your-org/codex-agent:latest --provider codex -- codex
 ```
 
 The agent will be prompted interactively if credentials are missing.
 
 ### Step 4: Exit and clean up
 
-Exit the sandbox shell (`exit` or Ctrl-D), then:
+Exit the sandbox shell with `exit`, or detach with Ctrl-D, then:
 
 ```bash
 openshell sandbox delete <name>
@@ -165,7 +168,13 @@ openshell profile describe github
 openshell profile export github --output yaml
 openshell profile lint --file ./my-profile.yaml
 openshell profile import --file ./my-profile.yaml
+openshell profile lint --url https://example.com/profiles/my-profile.yaml
+openshell profile import --url https://example.com/profiles/my-profile.yaml
 ```
+
+`--url` accepts one HTTP or HTTPS YAML or JSON profile. Review its endpoint and
+binary grants before importing it. The URL path must end in `.yaml`, `.yml`, or
+`.json`; downloads are limited to 1 MiB and 15 seconds.
 
 Use `profile describe` to inspect a definition's credential metadata, endpoints, TLS handling, MCP access settings, rule counts, binaries, source, and scope before creating a provider. Check for `tls: skip` and the uninspected-credential opt-in before relying on displayed L7 rules. List and describe accept table, JSON, and YAML output; use structured output for complete rule definitions, `--workspace` for a workspace catalog, or `--global` for platform scope. Use `profile export` when preparing an editable definition, `profile update <id> --file <file>` to replace an existing custom profile with its current resource version, and `profile delete <id>...` to remove custom profiles. Provider instances remain under `provider`.
 
@@ -292,7 +301,7 @@ image, environment, sizing, or driver-specific configuration:
 
 ```bash
 openshell sandbox template create gpu-kata \
-  --image ghcr.io/nvidia/openshell-community/sandboxes/python:latest \
+  --image registry.example.com/agents/python:latest \
   --cpu 2 \
   --memory 4Gi \
   --gpu 1 \
@@ -301,14 +310,21 @@ openshell sandbox template create gpu-kata \
 openshell sandbox create --name my-sandbox --template gpu-kata --provider my-github -- claude
 ```
 
-Direct `sandbox create --driver-config-json` remains valid for one-off
-creates. Put driver config on a template only when it should be reused.
+Driver config is disabled by default. These template and one-off
+`sandbox create --driver-config-json` examples require the administrator to set
+`allow_driver_config = true` for the selected driver. This does not waive
+resource admission: external attachments need administrator-controlled approval
+labels on the actual resources, not sandbox labels. GPU device attachments
+are temporarily exempt from labels; the public `--gpu` flag needs no driver
+config opt-in. Consult the published gateway configuration reference before
+changing admission settings; do not recommend disabling admission to bypass a
+denial. Put driver config on a template only when it should be reused.
 
 ### Manage sandbox workload templates
 
 ```bash
 openshell sandbox template create gpu-kata \
-  --image ghcr.io/nvidia/openshell-community/sandboxes/python:latest \
+  --image registry.example.com/agents/python:latest \
   --cpu 2 \
   --memory 4Gi \
   --gpu 1 \
@@ -345,14 +361,25 @@ openshell sandbox connect my-sandbox --editor vscode
 
 Attaches to the sandbox's existing canonical main process. Disconnecting leaves
 that process running; reconnecting targets the same process instance and replays
-recent output. Use `sandbox exec --tty -- /bin/bash -l` for a new shell. Press
-`Ctrl-P`, then `Ctrl-Q` to disconnect without terminating main. `Ctrl-C` retains
-its normal terminal behavior and interrupts the foreground process. Configure
-VS Code Remote-SSH with:
+recent output. If an established SSH transport is interrupted, such as when a
+laptop sleeps and wakes, the CLI retries transient failures for up to 60 seconds
+and reattaches to that same process. Use `sandbox exec --tty -- /bin/bash -l`
+for a new shell. Press `Ctrl-D` or `Ctrl-P`, then `Ctrl-Q` to disconnect without
+terminating main. OpenSSH's `~.` escape looks like transport loss and therefore
+starts automatic recovery; after it reattaches, use `Ctrl-D` or `Ctrl-P`, then
+`Ctrl-Q` to exit, or press `Ctrl-C` between retry attempts to cancel recovery.
+When you own stdin, `Ctrl-C` interrupts the foreground process. In a read-only
+attachment, `Ctrl-C` or `Ctrl-D` exits the viewer and leaves main and other
+attachments running. Configure VS Code Remote-SSH with:
 
 ```bash
 openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
 ```
+
+If `connect` reports `canonical main process already finished`, inspect the
+result with `sandbox get`. A pending
+foreground attachment can still retrieve retained output in `Completed` or
+`Error`; phase alone does not determine whether attachment is available.
 
 ### Upload and download files
 
@@ -381,9 +408,13 @@ openshell sandbox exec --name my-sandbox --workdir /workspace -- ls -la
 openshell sandbox exec --name my-sandbox --env MODE=test -- cargo test
 ```
 
-`sandbox exec` starts an independent sibling process, streams output, and exits
-with the remote command's exit code. Use `sandbox connect` to attach to the
-canonical main process.
+`sandbox exec` starts an independent sibling process and streams output. After
+stdout and stderr drain, it returns the remote command's exit code if delivery
+succeeds. Output delivery failure instead returns exit code 74, even when the
+command exited successfully. A descendant that keeps an inherited output pipe
+open for more than 30 seconds after the command exits triggers that failure.
+Check whether the command ran before retrying work with side effects. Use
+`sandbox connect` to attach to the canonical main process.
 Use `--env` only for non-secret values. Attach credentials to the sandbox with a
 provider instead of passing API keys, tokens, or other secrets to `sandbox exec`.
 
@@ -467,7 +498,7 @@ first failed load reset that window; repeated failures do not. After
 `ProvisioningTimedOut`, inspect the retained record and cleanup status, repair
 configuration, and explicitly run `sandbox start` once cleanup completes. A CLI
 wait timeout is separate from this gateway deadline. Follow the
-published [policy repair guidance](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md)
+published [policy repair guidance](https://docs.nvidia.com/openshell/latest/how-it-works/policies/overview)
 and confirm current replacement/detach syntax with installed CLI help.
 
 An endpoint with omitted `protocol` retains explicit-proxy behavior. Explicit
@@ -501,7 +532,7 @@ Create sandbox with initial policy
 ### Step 1: Create sandbox with initial policy
 
 ```bash
-openshell sandbox create --name dev --policy ./initial-policy.yaml -- claude
+openshell sandbox create --name dev --from registry.example.com/your-org/claude-agent:latest --policy ./initial-policy.yaml -- claude
 ```
 
 Sandboxes stay alive by default for iteration. Add `--no-keep` only when the sandbox should be deleted automatically after the initial session.
@@ -514,7 +545,7 @@ In a separate terminal or as the agent:
 openshell logs dev --tail --source sandbox
 ```
 
-Look for log lines with `action: deny` -- these indicate blocked network requests. The logs include:
+Look for `DENIED` log lines. `NET:OPEN [MED] DENIED` marks a blocked connection, and `HTTP:<METHOD> [MED] DENIED` marks a blocked request. Policy events are INFO-level log records, so do not add `--level warn`. The logs include:
 
 - **Destination host and port** (what was blocked)
 - **Binary path** (which process attempted the connection)
@@ -523,17 +554,18 @@ Look for log lines with `action: deny` -- these indicate blocked network request
 ### Step 3: Pull the current policy
 
 ```bash
-openshell policy get dev --full > current-policy.yaml
+set -o pipefail
+openshell policy get dev --base | sed '1,/^---$/d' > current-policy.yaml
 ```
 
-The `--full` flag includes the effective policy, including provider-composed entries. Use `--base` instead when the editable base policy is needed without provider-composed entries. Before resubmitting a `--full` result, review composed entries and prefer incremental updates or the base policy when appropriate.
+`--base` returns the editable policy without provider-composed entries; OpenShell composes attached provider rules separately. The command prints revision details, a `---` line, and then the policy YAML. The `sed` expression keeps only the YAML, because `policy set` cannot parse the revision details. Use `--full` only to inspect the effective policy, not as input to `policy set`.
 
 ### Step 4: Modify the policy
 
 Edit `current-policy.yaml` to allow the blocked actions. **For policy content authoring, delegate to the `generate-sandbox-policy` skill.** That skill handles:
 
 - Network endpoint rule structure
-- L4 vs REST, WebSocket, JSON-RPC, MCP, and SQL L7 policy decisions
+- L4 vs REST, WebSocket, JSON-RPC, and MCP L7 policy decisions
 - Access presets (`read-only`, `read-write`, `full`)
 - TLS termination configuration
 - Enforcement modes (`audit` vs `enforce`)
@@ -634,15 +666,14 @@ docker build -t my-app:latest .
 openshell sandbox create --from my-app:latest --name my-app
 ```
 
-The `--from` flag accepts an existing full image reference such as `myregistry.com/img:tag`, or a community sandbox name such as `ollama`. Build local Dockerfiles first with the same container engine as the local gateway, then pass the image tag.
+The `--from` flag accepts an explicit OCI image reference such as `myregistry.com/img:tag`. It does not expand catalog aliases. Build local Dockerfiles first with the same container engine as the local gateway, then pass the image tag.
 
-Use `docker build -t my-app:latest` for Docker gateways. For Podman gateways, use `podman build -t localhost/my-app:latest` and pass `localhost/my-app:latest` to `--from`. For remote gateways, push the image to a registry reachable by the gateway. Bare community names resolve under `ghcr.io/nvidia/openshell-community/sandboxes` unless `OPENSHELL_COMMUNITY_REGISTRY` overrides the prefix.
+Use `docker build -t my-app:latest` for Docker gateways. For Podman gateways, use `podman build -t localhost/my-app:latest` and pass `localhost/my-app:latest` to `--from`. For remote gateways, push the image to a registry reachable by the gateway.
 
 For Docker and Podman gateways, custom images should declare a non-root OCI
-`USER`. Each explicit `process.run_as_user` or `process.run_as_group` policy
+`USER`. Images without one run as numeric UID and GID `1000`. Each explicit `process.run_as_user` or `process.run_as_group` policy
 field wins independently; omitted fields fall back to the image declaration.
-An image with no `USER` fails before readiness unless policy supplies both
-fields. Explicit numeric fields may use any UID/GID from `1` through
+Explicit numeric fields may use any UID/GID from `1` through
 `4294967294`; `0` is root and `4294967295` is the invalid identity sentinel.
 Warn users that low IDs can inherit permissions from matching accounts, image
 files, mounted volumes, or devices.
@@ -711,7 +742,7 @@ openshell sandbox connect work-session --editor vscode
 Monitor denied activity:
 
 ```bash
-openshell logs work-session --tail --source sandbox --level warn
+openshell logs work-session --tail --source sandbox
 ```
 
 When denied actions appear:
@@ -730,9 +761,11 @@ When denied actions appear:
    one.
 
    `--add-allow` and `--add-deny` require `--rule-name` and the complete binary scope through repeated `--binary` or explicit `--any-binary`. Declare every port on the endpoint in the operation, for example `api.example.com:443,8443:POST:/admin`. Use `--endpoint-path` to disambiguate endpoints within the selected rule; an explicitly empty path selects an endpoint without a path selector. The gateway rejects missing or mismatched scope before persistence. Inspect the current policy and confirm the intended affected scope; do not automatically fill declarations from current policy just to make a rejection pass.
-2. Use full YAML replacement for broad changes or non-network fields, including
-   any change that would otherwise require restating a large existing scope:
-   `openshell policy get work-session --full > policy.yaml`
+2. Use full YAML replacement for broad network changes or settings that
+   `policy update` cannot express, including any change that would otherwise
+   require restating a large existing scope. Filesystem, Landlock, and process
+   changes still require recreating the sandbox:
+   `openshell policy get work-session --base | sed '1,/^---$/d' > policy.yaml`
    Modify the policy with the `generate-sandbox-policy` skill.
    `openshell policy set work-session --policy policy.yaml --wait`
 3. Verify with `openshell policy list work-session`.
@@ -772,6 +805,8 @@ openshell gateway select production
 openshell gateway info --name production
 openshell status
 ```
+
+`openshell gateway info` reports the immutable startup snapshot for compute drivers, credential drivers, gateway interceptors, and supervisor middleware. Use each entry's protocol version, implementation version, supported capabilities, and gateway requirements when diagnosing extension skew; implementation versions do not identify underlying Docker, Kubernetes, or credential backends.
 
 Register or remove gateways:
 

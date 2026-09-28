@@ -64,6 +64,7 @@ use openshell_core::proto::{
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
+use prost::Message;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{ErrorKind, IsTerminal, Read, Write};
@@ -809,6 +810,7 @@ pub async fn sandbox_create(
             since_time: None,
             log_sources: vec!["gateway".to_string()],
             log_min_level: String::new(),
+            resume_after_cursor: String::new(),
         })
         .await
         .into_diagnostic()?
@@ -1273,7 +1275,7 @@ enum ResolvedSource {
 /// 1. Existing file with `.tar`, `.tar.gz`, or `.tgz` extension → rootfs tar archive.
 /// 2. Local Dockerfile and directory paths → an actionable build-and-tag error.
 /// 3. Other explicit local paths → an actionable error.
-/// 4. Full image reference or community sandbox name → resolve as an image.
+/// 4. Any other value is passed through as an explicit image reference.
 fn resolve_from(value: &str) -> Result<ResolvedSource> {
     let path = Path::new(value);
 
@@ -1314,11 +1316,7 @@ fn resolve_from(value: &str) -> Result<ResolvedSource> {
         ));
     }
 
-    // Full image reference or community sandbox name — delegate to shared
-    // resolution in openshell-core.
-    Ok(ResolvedSource::Image(
-        openshell_core::image::resolve_community_image(value),
-    ))
+    Ok(ResolvedSource::Image(value.to_string()))
 }
 
 #[allow(clippy::case_sensitive_file_extension_comparisons)] // already lowercased
@@ -1797,15 +1795,14 @@ where
     Ok(())
 }
 
-/// Maximum stdin payload size (4 MiB). Prevents the CLI from reading unbounded
-/// data into memory before the server rejects an oversized message.
-const MAX_STDIN_PAYLOAD: usize = 4 * 1024 * 1024;
-
 fn local_terminal_size() -> Option<(u32, u32)> {
     crossterm::terminal::size()
         .ok()
         .map(|(cols, rows)| (u32::from(cols), u32::from(rows)))
 }
+
+const MAX_EXEC_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_EXEC_STDIN_BYTES: usize = 4 * 1024 * 1024;
 
 /// Execute a command in a running sandbox via gRPC, streaming output to the terminal.
 ///
@@ -1849,37 +1846,66 @@ pub async fn sandbox_exec_grpc(
         ));
     }
 
-    // Read stdin if piped (not a TTY), using spawn_blocking to avoid blocking
-    // the async runtime. Cap the read at MAX_STDIN_PAYLOAD + 1 so we never
-    // buffer more than the limit into memory.
-    let stdin_payload = if std::io::stdin().is_terminal() {
+    // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise auto-detect.
+    let stdin_is_terminal = std::io::stdin().is_terminal();
+    let tty = tty_override.unwrap_or_else(|| stdin_is_terminal && std::io::stdout().is_terminal());
+
+    // Preserve unary exec for small pipes, including older gateways whose
+    // interactive RPC closes the SSH channel when stdin reaches EOF. Retain
+    // the existing 4 MiB input cap because the supervisor's process stdin
+    // queue is unbounded; larger input should use file upload instead.
+    let stdin_prefix = if stdin_is_terminal {
         Vec::new()
     } else {
         tokio::task::spawn_blocking(|| {
-            let limit = (MAX_STDIN_PAYLOAD + 1) as u64;
-            let mut buf = Vec::new();
+            let mut prefix = Vec::new();
             std::io::stdin()
-                .take(limit)
-                .read_to_end(&mut buf)
+                .take((MAX_EXEC_STDIN_BYTES + 1) as u64)
+                .read_to_end(&mut prefix)
                 .into_diagnostic()?;
-            if buf.len() > MAX_STDIN_PAYLOAD {
+            if prefix.len() > MAX_EXEC_STDIN_BYTES {
                 return Err(miette::miette!(
-                    "stdin payload exceeds {} byte limit; pipe smaller inputs or use `sandbox upload`",
-                    MAX_STDIN_PAYLOAD
+                    "piped stdin exceeds the 4 MiB limit; use `sandbox upload` for larger input"
                 ));
             }
-            Ok(buf)
+            Ok::<_, miette::Report>(prefix)
         })
         .await
-        .into_diagnostic()?? // first ? unwraps JoinError, second ? unwraps Result
+        .into_diagnostic()??
     };
 
-    // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise auto-detect.
-    let tty = tty_override
-        .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
+    let (cols, rows) = if tty {
+        local_terminal_size().unwrap_or((80, 24))
+    } else {
+        (0, 0)
+    };
+    let mut request = ExecSandboxRequest {
+        request_id: String::new(),
+        sandbox: name.to_string(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            workspace.to_string(),
+        )),
+        command: command.to_vec(),
+        workdir: workdir.unwrap_or_default().to_string(),
+        environment: environment.clone(),
+        execution_timeout: proto_execution_timeout(timeout_seconds)?,
+        stdin: stdin_prefix,
+        tty,
+        cols,
+        rows,
+        no_login_shell,
+    };
 
-    if tty && std::io::stdin().is_terminal() {
-        return sandbox_exec_interactive_grpc(
+    let stdin_for_size_check = std::mem::take(&mut request.stdin);
+    let start_request_bytes = request.encoded_len();
+    request.stdin = stdin_for_size_check;
+    if start_request_bytes > MAX_EXEC_REQUEST_BYTES {
+        return Err(miette::miette!(
+            "exec command or environment exceeds the gateway's 1 MiB message limit"
+        ));
+    }
+    if (tty && stdin_is_terminal) || request.encoded_len() > MAX_EXEC_REQUEST_BYTES {
+        return sandbox_exec_streaming_grpc(
             client,
             &sandbox,
             command,
@@ -1887,33 +1913,16 @@ pub async fn sandbox_exec_grpc(
             timeout_seconds,
             environment,
             no_login_shell,
+            tty,
+            stdin_is_terminal,
+            std::mem::take(&mut request.stdin),
         )
         .await;
     }
 
-    let (cols, rows) = if tty {
-        local_terminal_size().unwrap_or_default()
-    } else {
-        (0, 0)
-    };
-
     // Make the streaming gRPC call.
     let mut stream = client
-        .exec_sandbox(ExecSandboxRequest {
-            sandbox: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                workspace.to_string(),
-            )),
-            command: command.to_vec(),
-            workdir: workdir.unwrap_or_default().to_string(),
-            environment: environment.clone(),
-            execution_timeout: proto_execution_timeout(timeout_seconds)?,
-            stdin: stdin_payload,
-            tty,
-            cols,
-            rows,
-            no_login_shell,
-        })
+        .exec_sandbox(request)
         .await
         .into_diagnostic()?
         .into_inner();
@@ -2281,7 +2290,8 @@ impl Drop for TaskGuard {
     }
 }
 
-async fn sandbox_exec_interactive_grpc(
+#[allow(clippy::too_many_arguments)]
+async fn sandbox_exec_streaming_grpc(
     mut client: crate::tls::GrpcClient,
     sandbox: &Sandbox,
     command: &[String],
@@ -2289,20 +2299,28 @@ async fn sandbox_exec_interactive_grpc(
     timeout_seconds: u32,
     environment: &HashMap<String, String>,
     no_login_shell: bool,
+    tty: bool,
+    stdin_is_terminal: bool,
+    stdin_prefix: Vec<u8>,
 ) -> Result<i32> {
     #[cfg(unix)]
     use openshell_core::proto::ExecSandboxWindowResize;
     use openshell_core::proto::{ExecSandboxInput, exec_sandbox_input};
     use tokio_stream::wrappers::ReceiverStream;
 
-    let (cols, rows) = local_terminal_size().unwrap_or((80, 24));
+    let (cols, rows) = if tty {
+        local_terminal_size().unwrap_or((80, 24))
+    } else {
+        (0, 0)
+    };
 
-    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(4096);
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
 
     // Send the start message with exec metadata.
     input_tx
         .send(ExecSandboxInput {
             payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
+                request_id: String::new(),
                 sandbox: sandbox.object_name().to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     (sandbox.object_workspace()).to_string(),
@@ -2313,7 +2331,7 @@ async fn sandbox_exec_interactive_grpc(
                 no_login_shell,
                 execution_timeout: proto_execution_timeout(timeout_seconds)?,
                 stdin: Vec::new(),
-                tty: true,
+                tty,
                 cols,
                 rows,
             })),
@@ -2327,40 +2345,62 @@ async fn sandbox_exec_interactive_grpc(
         .into_diagnostic()?
         .into_inner();
 
-    // Enable raw mode so keystrokes are forwarded immediately.
-    crossterm::terminal::enable_raw_mode().into_diagnostic()?;
-    let raw_guard = RawModeGuard;
+    // Raw mode is only appropriate for an interactive terminal, not a pipe.
+    let raw_guard = if tty && stdin_is_terminal {
+        crossterm::terminal::enable_raw_mode().into_diagnostic()?;
+        Some(RawModeGuard)
+    } else {
+        None
+    };
 
     // Stdin reader on a detached OS thread. Using std::thread (not
     // spawn_blocking) so the tokio runtime shutdown doesn't wait for a
     // thread blocked on stdin.read(). The thread exits when the channel
     // closes (blocking_send returns Err) or stdin hits EOF.
     let stdin_tx = input_tx.clone();
+    let (stdin_result_tx, mut stdin_result_rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin().lock();
         let mut buf = [0u8; 4096];
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if stdin_tx
-                        .blocking_send(ExecSandboxInput {
-                            payload: Some(exec_sandbox_input::Payload::Stdin(buf[..n].to_vec())),
-                        })
-                        .is_err()
-                    {
-                        break;
+        let result = (|| {
+            for chunk in stdin_prefix.chunks(buf.len()) {
+                if stdin_tx
+                    .blocking_send(ExecSandboxInput {
+                        payload: Some(exec_sandbox_input::Payload::Stdin(chunk.to_vec())),
+                    })
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) => return Ok(()),
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                    Ok(n) => {
+                        if stdin_tx
+                            .blocking_send(ExecSandboxInput {
+                                payload: Some(exec_sandbox_input::Payload::Stdin(
+                                    buf[..n].to_vec(),
+                                )),
+                            })
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
                     }
                 }
             }
-        }
+        })();
+        let _ = stdin_result_tx.send(result);
     });
 
     // SIGWINCH handler: forward terminal resize events.
     #[cfg(unix)]
-    let resize_task = {
+    let resize_task = if tty && stdin_is_terminal {
         let resize_tx = input_tx.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut sig =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
                     .expect("failed to register SIGWINCH handler");
@@ -2376,17 +2416,56 @@ async fn sandbox_exec_interactive_grpc(
                     }
                 }
             }
-        })
+        }))
+    } else {
+        None
     };
     #[cfg(unix)]
-    let _resize_guard = TaskGuard(resize_task);
+    let _resize_guard = resize_task.map(TaskGuard);
+
+    // Keep a sender until the reader confirms clean EOF. On a read error,
+    // cancel the response stream before the gateway can treat channel EOF as
+    // successful completion of a partial command.
+    let mut pipe_input_tx = Some(input_tx);
 
     let mut exit_code = 0i32;
     let mut exit_seen = false;
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
 
-    while let Some(event) = stream.next().await {
+    let mut stdin_reader_done = false;
+    loop {
+        let event = tokio::select! {
+            result = &mut stdin_result_rx, if !stdin_reader_done => {
+                stdin_reader_done = true;
+                match result.into_diagnostic()? {
+                    Ok(()) => {
+                        let sender = pipe_input_tx.take().expect("stdin sender is held until EOF");
+                        drop(sender);
+                    }
+                    Err(error) => {
+                        let sender = pipe_input_tx.take().expect("stdin sender is held until EOF");
+                        // A clean request EOF would make the gateway execute
+                        // the truncated input. An invalid frame makes the
+                        // gateway abort the command instead.
+                        let abort = ExecSandboxInput { payload: None };
+                        if tokio::time::timeout(Duration::from_secs(5), sender.send(abort))
+                            .await
+                            .is_err()
+                        {
+                            // Keep the request body open if a blocked remote
+                            // stdin prevents delivery of the abort frame.
+                            std::mem::forget(sender);
+                        }
+                        drop(stream);
+                        return Err(error).into_diagnostic();
+                    }
+                }
+                continue;
+            }
+            event = stream.next() => event,
+        };
+        let Some(event) = event else { break };
         let event = event.into_diagnostic()?;
         match event.payload {
             Some(exec_sandbox_event::Payload::Stdout(out)) => {
@@ -2408,10 +2487,12 @@ async fn sandbox_exec_interactive_grpc(
         }
     }
 
-    drop(input_tx);
-
     // Drop the raw mode guard to restore the terminal before returning.
     drop(raw_guard);
+
+    if !stdin_reader_done && let Ok(result) = stdin_result_rx.try_recv() {
+        result.into_diagnostic()?;
+    }
 
     // A stream that closes without an Exit event means we never observed the
     // command's outcome. Treat it as a relay failure rather than reporting a
@@ -3617,6 +3698,7 @@ async fn wait_for_lifecycle_phase(
             since_time: None,
             log_sources: Vec::new(),
             log_min_level: String::new(),
+            resume_after_cursor: String::new(),
         })
         .await
         .into_diagnostic()?
@@ -5851,6 +5933,7 @@ pub async fn sandbox_logs(
                     .into_diagnostic()?,
                 log_sources: source_filter,
                 log_min_level: level.to_uppercase(),
+                resume_after_cursor: String::new(),
             })
             .await
             .into_diagnostic()?
@@ -6907,7 +6990,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_from_keeps_bare_community_name_when_local_directory_matches() {
+    fn resolve_from_keeps_bare_image_reference_when_local_directory_matches() {
         let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6919,11 +7002,8 @@ mod tests {
         let result = resolve_from("python");
 
         std::env::set_current_dir(original_dir).expect("restore current directory");
-        match result.expect("bare community name should not be a local path") {
-            super::ResolvedSource::Image(image) => assert_eq!(
-                image,
-                "ghcr.io/nvidia/openshell-community/sandboxes/python:latest"
-            ),
+        match result.expect("bare image reference should not be a local path") {
+            super::ResolvedSource::Image(image) => assert_eq!(image, "python"),
             other @ super::ResolvedSource::RootfsTar { .. } => {
                 panic!("expected image source, got {other:?}");
             }

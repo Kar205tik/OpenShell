@@ -71,6 +71,12 @@ let
 
     installers = [
       {
+        name = "none";
+        use_galaxy = false;
+        playbooks = [ ];
+        inputs = { };
+      }
+      {
         name = "binaries";
         use_galaxy = false;
         playbooks = [
@@ -100,8 +106,21 @@ let
 
     testsuites = [
       {
+        name = "shell";
+        playbooks = [ "ansible/playbooks/shell.yaml" ];
+        inputs = { };
+        interactive = true;
+      }
+      {
         name = "conformance";
         playbooks = [ "ansible/playbooks/conformance/cli.yaml" ];
+        inputs = {
+          openshell_conformance_test_bundle = "../artifacts/test-archives/${muslTarget}/openshell-conformance-tests.tar";
+        };
+      }
+      {
+        name = "policy-advisor";
+        playbooks = [ "ansible/playbooks/conformance/policy-advisor.yaml" ];
         inputs = {
           openshell_conformance_test_bundle = "../artifacts/test-archives/${muslTarget}/openshell-conformance-tests.tar";
         };
@@ -112,6 +131,36 @@ let
         inputs = {
           keycloak_realm_file = "../scripts/keycloak-realm.json";
           provider_refresh_keycloak_test_bundle = "../artifacts/test-archives/${muslTarget}/provider-refresh-keycloak-tests.tar";
+        };
+      }
+      {
+        name = "e2e-podman";
+        playbooks = [ "ansible/playbooks/drivers/podman/e2e.yaml" ];
+        inputs = {
+          openshell_podman_e2e_test_bundle = "../artifacts/test-archives/${muslTarget}/openshell-podman-e2e-tests.tar";
+          openshell_podman_e2e_workload_image = "../artifacts/images/openshell-e2e-python-dev.tar";
+        };
+      }
+      {
+        name = "driver-podman";
+        playbooks = [
+          "ansible/playbooks/drivers/podman/default-userns-baseline.yaml"
+          "ansible/playbooks/drivers/podman/tests.yaml"
+          "ansible/playbooks/drivers/podman/userns-auto.yaml"
+          "ansible/playbooks/drivers/podman/tests.yaml"
+          "ansible/playbooks/drivers/podman/userns-keep-id.yaml"
+          "ansible/playbooks/drivers/podman/tests.yaml"
+          "ansible/playbooks/drivers/podman/userns-private.yaml"
+          "ansible/playbooks/drivers/podman/tests.yaml"
+        ];
+        inputs = {
+          openshell_podman_test_bundle = "../artifacts/test-archives/${muslTarget}/openshell-podman-tests.tar";
+          # Match OpenShell's compiled-in default so direct Podman and
+          # OpenShell containers resolve the same workload image metadata.
+          openshell_podman_reference_image = "nvcr.io/nvidia/base/ubuntu:24.04";
+          openshell_podman_userns_auto_config = "suites/drivers/podman/fixtures/userns-auto.toml";
+          openshell_podman_userns_keep_id_config = "suites/drivers/podman/fixtures/userns-keep-id.toml";
+          openshell_podman_userns_private_config = "suites/drivers/podman/fixtures/userns-private.toml";
         };
       }
     ];

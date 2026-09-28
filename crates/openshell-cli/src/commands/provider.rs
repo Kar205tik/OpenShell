@@ -87,6 +87,8 @@ fn aggregate_delete_failures(resource: &str, failures: &[String]) -> Result<()> 
 pub async fn sandbox_provider_list(
     server: &str,
     name: &str,
+    page_size: i32,
+    page_token: &str,
     output: &str,
     workspace: &str,
     tls: &TlsOptions,
@@ -98,14 +100,25 @@ pub async fn sandbox_provider_list(
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 (workspace).to_string(),
             )),
+            page_size,
+            page_token: page_token.to_string(),
         })
         .await
         .into_diagnostic()?;
-    let providers = response.into_inner().providers;
+    let response = response.into_inner();
+    let next_page_token = response.next_page_token;
+    let providers = response.providers;
 
-    if crate::output::print_output_collection(output, &providers, attached_provider_to_json)? {
+    if crate::output::print_paginated_output_collection(
+        output,
+        "providers",
+        &providers,
+        &next_page_token,
+        attached_provider_to_json,
+    )? {
         return Ok(());
     }
+    crate::output::print_next_page_token(&next_page_token);
 
     if providers.is_empty() {
         println!("No providers attached to sandbox {name}.");
@@ -1689,10 +1702,11 @@ pub async fn provider_profile_import(
     server: &str,
     file: Option<&Path>,
     from: Option<&Path>,
+    url: Option<&str>,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let (items, mut diagnostics) = load_profile_import_items(file, from)?;
+    let (items, mut diagnostics) = load_profile_import_items_with_url(file, from, url).await?;
     if items.is_empty() && diagnostics.is_empty() {
         return Err(miette!("no provider profile files found"));
     }
@@ -1779,10 +1793,11 @@ pub async fn provider_profile_lint(
     server: &str,
     file: Option<&Path>,
     from: Option<&Path>,
+    url: Option<&str>,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let (items, mut diagnostics) = load_profile_import_items(file, from)?;
+    let (items, mut diagnostics) = load_profile_import_items_with_url(file, from, url).await?;
     if items.is_empty() && diagnostics.is_empty() {
         return Err(miette!("no provider profile files found"));
     }
@@ -2124,6 +2139,92 @@ fn load_profile_import_items(
     Ok((items, diagnostics))
 }
 
+const MAX_REMOTE_PROFILE_BYTES: usize = 1024 * 1024;
+
+async fn load_profile_import_items_with_url(
+    file: Option<&Path>,
+    from: Option<&Path>,
+    url: Option<&str>,
+) -> Result<(
+    Vec<ProviderProfileImportItem>,
+    Vec<ProviderProfileDiagnostic>,
+)> {
+    let Some(source) = url else {
+        return load_profile_import_items(file, from);
+    };
+    let parsed = reqwest::Url::parse(source)
+        .into_diagnostic()
+        .wrap_err("invalid provider profile URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(miette!("provider profile URL must use http or https"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(miette!("provider profile URL must not contain userinfo"));
+    }
+    let mut display_url = parsed.clone();
+    display_url.set_query(None);
+    display_url.set_fragment(None);
+    let path = parsed.path().to_owned();
+    let format = Path::new(&path).extension().and_then(|ext| ext.to_str());
+    if !matches!(format, Some("yaml" | "yml" | "json")) {
+        return Err(miette!(
+            "provider profile URL must end in .yaml, .yml, or .json"
+        ));
+    }
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .into_diagnostic()?;
+    let mut response = client
+        .get(parsed)
+        .send()
+        .await
+        .map_err(|err| {
+            miette!(
+                "failed to fetch provider profile from {display_url}: {}",
+                err.without_url()
+            )
+        })?
+        .error_for_status()
+        .map_err(|err| {
+            miette!(
+                "failed to fetch provider profile from {display_url}: {}",
+                err.without_url()
+            )
+        })?;
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_REMOTE_PROFILE_BYTES as u64)
+    {
+        return Err(miette!(
+            "provider profile at {display_url} exceeds the 1 MiB download limit"
+        ));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|err| {
+        miette!(
+            "failed to read provider profile from {display_url}: {}",
+            err.without_url()
+        )
+    })? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_REMOTE_PROFILE_BYTES {
+            return Err(miette!(
+                "provider profile at {display_url} exceeds the 1 MiB download limit"
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let input = std::str::from_utf8(&bytes)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("provider profile at {display_url} is not UTF-8"))?;
+    let item = parse_profile_import_item(display_url.as_str(), input, format);
+    Ok(match item {
+        Ok(item) => (vec![item], Vec::new()),
+        Err(diagnostic) => (Vec::new(), vec![diagnostic]),
+    })
+}
+
 fn profile_source_paths(file: Option<&Path>, from: Option<&Path>) -> Result<Vec<PathBuf>> {
     if let Some(file) = file {
         return Ok(vec![file.to_path_buf()]);
@@ -2163,19 +2264,31 @@ fn load_profile_import_item(
             format!("failed to read provider profile file: {err}"),
         )
     })?;
-    let profile = match path.extension().and_then(|ext| ext.to_str()) {
-        Some("yaml" | "yml") => parse_profile_yaml(&input),
-        Some("json") => parse_profile_json(&input),
+    parse_profile_import_item(
+        &source,
+        &input,
+        path.extension().and_then(|ext| ext.to_str()),
+    )
+}
+
+fn parse_profile_import_item(
+    source: &str,
+    input: &str,
+    format: Option<&str>,
+) -> Result<ProviderProfileImportItem, ProviderProfileDiagnostic> {
+    let profile = match format {
+        Some("yaml" | "yml") => parse_profile_yaml(input),
+        Some("json") => parse_profile_json(input),
         _ => {
             return Err(profile_file_diagnostic(
-                &source,
+                source,
                 "unsupported provider profile file format".to_string(),
             ));
         }
     }
-    .map_err(|err| profile_file_diagnostic(&source, err.to_string()))?;
+    .map_err(|err| profile_file_diagnostic(source, err.to_string()))?;
 
-    let pre_lower = profile.validate_before_lowering(&source);
+    let pre_lower = profile.validate_before_lowering(source);
     if let Some(diag) = pre_lower.into_iter().find(|d| d.severity == "error") {
         return Err(ProviderProfileDiagnostic {
             source: diag.source,
@@ -2188,7 +2301,7 @@ fn load_profile_import_item(
 
     Ok(ProviderProfileImportItem {
         profile: Some(profile.to_proto()),
-        source,
+        source: source.to_string(),
     })
 }
 
@@ -2909,13 +3022,7 @@ binaries: [/usr/bin/curl]
         )
         .expect("valid profile fixture");
         let mut descriptions = Vec::new();
-        for (tls, allow_uninspected_credentials) in [
-            ("", false),
-            ("", true),
-            ("skip", true),
-            ("terminate", false),
-            ("passthrough", false),
-        ] {
+        for (tls, allow_uninspected_credentials) in [("", false), ("", true), ("skip", true)] {
             let mut variant = profile.clone();
             variant.endpoints[0].tls = tls.to_string();
             variant.endpoints[0].allow_uninspected_credentials = allow_uninspected_credentials;
@@ -2947,8 +3054,6 @@ binaries: [/usr/bin/curl]
                 .contains("TLS: skip (raw tunnel; no L7 inspection or credential rewrite)\n")
         );
         assert!(descriptions[2].contains("Allow uninspected credentials: true\n"));
-        assert!(descriptions[3].contains("TLS: terminate (automatic TLS detection)\n"));
-        assert!(descriptions[4].contains("TLS: passthrough (automatic TLS detection)\n"));
     }
 
     #[test]
