@@ -18,9 +18,9 @@ EXAMPLE_DIR = Path(__file__).resolve().parent
 IMAGE = "openshell-jupyter-sandbox:local"
 POLICY = EXAMPLE_DIR / "policy.yaml"
 NAME_PREFIX = "jupyter"
+WORKSPACE = "default"
 CODE = "print(sum(i * i for i in range(10)))"
 GATEWAY: str | None = None  # None selects the active OpenShell gateway.
-OPENSHELL_BIN = "openshell"  # Used only for service APIs missing from the SDK.
 
 
 def main() -> None:
@@ -32,10 +32,9 @@ def main() -> None:
         with JupyterSandbox(
             client=client,
             name=sandbox_name,
+            workspace=WORKSPACE,
             image=IMAGE,
             policy=POLICY,
-            openshell_bin=OPENSHELL_BIN,
-            cluster=GATEWAY,
         ) as sandbox:
             print(f"\nStarted sandbox {sandbox.name}")
             print(f"Jupyter service: {sandbox.service_url}")

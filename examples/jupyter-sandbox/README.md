@@ -4,13 +4,12 @@ Launch one OpenShell sandbox, expose its Jupyter API server as a named service,
 and submit Python code to a kernel through that service.
 
 The example uses the OpenShell Python SDK for gateway health, sandbox creation,
-readiness, command execution, and deletion. It uses the `openshell` CLI only for
-service expose and delete operations that are not yet available in the SDK.
+service exposure, readiness, command execution, and deletion.
 
 ## Prerequisites
 
 - A running local OpenShell gateway (`mise run gateway:docker` for development)
-- The `openshell` CLI configured to use that gateway
+- OpenShell gateway configuration for the Python SDK
 - Docker to build the example image
 - Python 3.11 or later
 - [uv](https://docs.astral.sh/uv/) to install the Python dependencies
@@ -27,7 +26,7 @@ Install the Python dependencies, build the Jupyter image, and run the script:
 cd examples/jupyter-sandbox
 uv venv
 source .venv/bin/activate
-uv pip install openshell pyyaml websocket-client
+uv pip install -e ../.. pyyaml websocket-client
 docker build -t openshell-jupyter-sandbox:local .
 python demo.py
 ```
@@ -38,12 +37,13 @@ The script:
    SDK.
 2. Starts a token-authenticated Jupyter Server on `127.0.0.1:8888` in the
    sandbox.
-3. Exposes the server as an OpenShell service named `jupyter` and prints the
-   service URL.
+3. Exposes the server as an OpenShell service named `jupyter` during sandbox
+   creation and prints the service URL.
 4. Creates a Python kernel with `POST /api/kernels` through the service.
 5. Connects to `/api/kernels/{kernel_id}/channels` through the service and sends
    a Jupyter `execute_request` over WebSocket.
-6. Prints the kernel output, then deletes the kernel, service, and sandbox.
+6. Prints the kernel output, then deletes the kernel and sandbox. Sandbox
+   deletion also removes its service.
 
 The submitted code is:
 
@@ -63,6 +63,7 @@ code through the exposed service:
 with JupyterSandbox(
     client=client,
     name="jupyter-example",
+    workspace="default",
     image="openshell-jupyter-sandbox:local",
     policy="policy.yaml",
 ) as sandbox:
@@ -79,12 +80,13 @@ the token.
 ## Configure the sandbox
 
 Edit the constants at the top of `demo.py` to select the image, policy, sandbox
-name prefix, gateway, and code:
+name prefix, workspace, gateway, and code:
 
 ```python
 IMAGE = "registry.example.com/jupyter-sandbox:latest"
 POLICY = EXAMPLE_DIR / "my-policy.yaml"
 NAME_PREFIX = "analysis"
+WORKSPACE = "default"
 CODE = 'print("hello from Jupyter")'
 GATEWAY = None
 ```
@@ -104,9 +106,9 @@ does not require an egress rule.
 The example still has deliberate seams because the SDK does not expose all CLI
 functionality:
 
-- Add `SandboxClient.expose_service()`, `get_service()`, `list_services()`, and
-  `delete_service()`, returning a public `ServiceEndpoint` model. The example
-  currently uses the `openshell service` CLI only for expose and delete.
+- The SDK can expose a service during sandbox creation. Public methods for
+  adding, querying, and deleting services after creation would support a
+  longer-lived sandbox workflow.
 - Add a public sandbox configuration builder that accepts `image` and a
   `SandboxPolicy`. The low-level client currently requires generated protobuf
   types from the private `openshell._proto` package.
@@ -117,5 +119,5 @@ functionality:
   and build directories. Until then, Python SDK callers must prepare the OCI
   image before creating a sandbox.
 
-With those APIs, `JupyterSandbox` could remove its CLI subprocess adapter and
-all imports from `openshell._proto`.
+With the remaining configuration APIs, `JupyterSandbox` could remove its
+imports from `openshell._proto`.

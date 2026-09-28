@@ -7,11 +7,9 @@ from __future__ import annotations
 
 import importlib
 import json
-import os
 import re
 import secrets
 import struct
-import subprocess
 import time
 import uuid
 import warnings
@@ -26,6 +24,7 @@ from urllib.request import ProxyHandler, Request, build_opener
 import yaml
 from google.protobuf.json_format import ParseDict, ParseError
 
+from openshell import ServiceExposure
 from openshell._proto import openshell_pb2, sandbox_pb2
 
 if TYPE_CHECKING:
@@ -35,7 +34,6 @@ JUPYTER_PORT = 8888
 JUPYTER_SERVICE = "jupyter"
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
-_SERVICE_URL = re.compile(r"^\s*URL:\s+(\S+)\s*$", re.MULTILINE)
 _START_JUPYTER = r"""
 set -eu
 umask 077
@@ -74,10 +72,9 @@ class JupyterSandbox(AbstractContextManager["JupyterSandbox"]):
         *,
         client: SandboxClient,
         name: str,
+        workspace: str,
         image: str | Path,
         policy: str | Path,
-        openshell_bin: str = "openshell",
-        cluster: str | None = None,
         ready_timeout: float = 60.0,
         execute_timeout: float = 60.0,
     ) -> None:
@@ -87,6 +84,8 @@ class JupyterSandbox(AbstractContextManager["JupyterSandbox"]):
             )
         if ready_timeout <= 0 or execute_timeout <= 0:
             raise ValueError("timeouts must be greater than zero")
+        if not workspace:
+            raise ValueError("workspace must be non-empty")
 
         policy_path = Path(policy).expanduser().resolve()
         if not policy_path.is_file():
@@ -101,25 +100,20 @@ class JupyterSandbox(AbstractContextManager["JupyterSandbox"]):
 
         self.client = client
         self.name = name
+        self.workspace = workspace
         self.image = image_reference
         self.policy = policy_path
-        self.openshell_bin = openshell_bin
-        self.cluster = cluster
         self.ready_timeout = ready_timeout
         self.execute_timeout = execute_timeout
         self.service_url: str | None = None
 
         self._token = secrets.token_urlsafe(32)
         self._session: SandboxSession | None = None
-        self._sandbox_create_attempted = False
-        self._sandbox_created = False
-        self._service_created = False
 
     def __enter__(self) -> JupyterSandbox:
         try:
             self._create_sandbox()
             self._start_jupyter()
-            self.service_url = self._expose_service()
             self._wait_until_ready()
         except BaseException as error:
             cleanup_errors = self._cleanup()
@@ -168,14 +162,33 @@ class JupyterSandbox(AbstractContextManager["JupyterSandbox"]):
                 )
 
     def _create_sandbox(self) -> None:
-        self._sandbox_create_attempted = True
         self._session = self.client.create_session(
+            workspace=self.workspace,
             name=self.name,
             labels={"app": "jupyter", "managed-by": "jupyter-sandbox-example"},
             spec=self._sandbox_spec(),
+            service_exposures=[
+                ServiceExposure(service=JUPYTER_SERVICE, target_port=JUPYTER_PORT)
+            ],
         )
-        self._sandbox_created = True
-        self.client.wait_ready(self.name, timeout_seconds=self.ready_timeout)
+        service_url = self._session.sandbox.service_urls.get(JUPYTER_SERVICE, "")
+        if not service_url:
+            raise JupyterSandboxError(
+                "OpenShell did not return the Jupyter service URL"
+            )
+        parsed = urlsplit(service_url)
+        host = parsed.hostname or ""
+        local_host = host in {"127.0.0.1", "::1", "localhost"} or host.endswith(
+            ".localhost"
+        )
+        if parsed.scheme not in {"http", "https"} or not local_host:
+            raise JupyterSandboxError(
+                "this example supports services exposed by a local gateway only"
+            )
+        self.service_url = service_url.rstrip("/")
+        self.client.wait_ready(
+            self.name, workspace=self.workspace, timeout_seconds=self.ready_timeout
+        )
 
     def _start_jupyter(self) -> None:
         self._exec(
@@ -212,35 +225,6 @@ class JupyterSandbox(AbstractContextManager["JupyterSandbox"]):
             policy=policy,
             providers=[],
         )
-
-    def _expose_service(self) -> str:
-        completed = self._run_service(
-            "service",
-            "expose",
-            self.name,
-            str(JUPYTER_PORT),
-            JUPYTER_SERVICE,
-            capture=True,
-        )
-        self._service_created = True
-        output = _ANSI_ESCAPE.sub("", completed.stdout or "")
-        match = _SERVICE_URL.search(output)
-        if match is None:
-            raise JupyterSandboxError(
-                "OpenShell exposed the service but did not return its URL"
-            )
-
-        service_url = match.group(1).rstrip("/")
-        parsed = urlsplit(service_url)
-        host = parsed.hostname or ""
-        local_host = host in {"127.0.0.1", "::1", "localhost"} or host.endswith(
-            ".localhost"
-        )
-        if parsed.scheme not in {"http", "https"} or not local_host:
-            raise JupyterSandboxError(
-                "this example supports services exposed by a local gateway only"
-            )
-        return service_url
 
     def _wait_until_ready(self) -> None:
         deadline = time.monotonic() + self.ready_timeout
@@ -468,35 +452,22 @@ class JupyterSandbox(AbstractContextManager["JupyterSandbox"]):
 
     def _cleanup(self) -> list[BaseException]:
         errors: list[BaseException] = []
-        if self._service_created:
+        if self._session is not None:
             try:
-                self._run_service(
-                    "service",
-                    "delete",
-                    self.name,
-                    JUPYTER_SERVICE,
-                    capture=True,
-                )
-            except BaseException as error:
-                errors.append(error)
-            finally:
-                self._service_created = False
-                self.service_url = None
-
-        if self._sandbox_create_attempted or self._sandbox_created:
-            try:
-                deleted = self.client.delete(self.name)
-                if deleted:
+                deletion = self._session.delete(allow_missing=True)
+                if deletion.sandbox_id:
                     self.client.wait_deleted(
-                        self.name, timeout_seconds=self.ready_timeout
+                        self.name,
+                        workspace=self.workspace,
+                        timeout_seconds=self.ready_timeout,
+                        expected_sandbox_id=deletion.sandbox_id,
                     )
             except BaseException as error:
                 if "not found" not in str(error).lower():
                     errors.append(error)
             finally:
                 self._session = None
-                self._sandbox_create_attempted = False
-                self._sandbox_created = False
+                self.service_url = None
         return errors
 
     @staticmethod
@@ -530,32 +501,6 @@ class JupyterSandbox(AbstractContextManager["JupyterSandbox"]):
                 f"{' '.join(command)}{suffix}"
             )
         return result
-
-    def _run_service(
-        self,
-        *args: str,
-        capture: bool = False,
-    ) -> subprocess.CompletedProcess[str]:
-        command = [self.openshell_bin, *args]
-        environment = os.environ.copy()
-        if self.cluster is not None:
-            environment["OPENSHELL_GATEWAY"] = self.cluster
-        completed = subprocess.run(
-            command,
-            check=False,
-            env=environment,
-            text=True,
-            stdout=subprocess.PIPE if capture else None,
-            stderr=subprocess.PIPE if capture else None,
-        )
-        if completed.returncode != 0:
-            detail = self._redact(completed.stderr or completed.stdout or "").strip()
-            suffix = f": {detail}" if detail else ""
-            raise JupyterSandboxError(
-                f"OpenShell command failed ({completed.returncode}): "
-                f"{' '.join(command)}{suffix}"
-            )
-        return completed
 
     def _redact(self, value: str) -> str:
         value = value.replace(self._token, "<redacted>")
