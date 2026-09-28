@@ -99,6 +99,7 @@ jobs:
       - name: Test
         run: mise run --skip-tools windows:test:${{ matrix.arch }}
       - name: Full MXC conformance
+        continue-on-error: true
         run: mise run --skip-tools windows:test:conformance:${{ matrix.arch }}
       - name: Upload MXC conformance report
         if: always()
@@ -185,6 +186,7 @@ jobs:
       - name: Test
         run: mise run --skip-tools windows:test:${{ matrix.arch }}
       - name: Full MXC conformance
+        continue-on-error: true
         run: mise run --skip-tools windows:test:conformance:${{ matrix.arch }}
       - name: Upload MXC conformance report
         if: always()

@@ -249,7 +249,10 @@ Windows validation separates source correctness from host capability:
 - Hosted Windows CI runs the complete archive conformance suite against the
   in-process MXC mock through the standalone `openshell-conformance` runner.
   Every atomic scenario runs so unsupported operations appear as explicit
-  failures in the archived report instead of being skipped.
+  failures in the archived report instead of being skipped. This report is
+  advisory while those capability gaps remain: its scenario failures do not
+  fail the surrounding Windows job, and CI always uploads the runner and
+  gateway logs.
   The mock verifies public CLI, gateway, driver, lifecycle, and policy wiring;
   it does not claim Windows OS enforcement.
 - Mock MXC E2E validates gateway, CLI, driver, lifecycle, and policy wiring but

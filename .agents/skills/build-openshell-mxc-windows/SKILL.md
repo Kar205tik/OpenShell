@@ -50,6 +50,8 @@ In scope:
 - Building x64 and ARM64 release binaries for `openshell-gateway` and
   `openshell`.
 - Running workspace tests on a native x64 or ARM64 host.
+- Running the complete conformance suite against the mock MXC gateway and
+  reporting unsupported operations without blocking hosted Windows CI.
 - Running focused unsupported-driver contract tests.
 - Running the shipped Ollama and cloud-inference MXC examples against the
   in-process `wxc` mock and a local API stub.
@@ -161,6 +163,7 @@ mise run --skip-tools windows:check:arm64
 mise run --skip-tools windows:build:x64
 mise run --skip-tools windows:build:arm64
 mise run --skip-tools windows:test:x64
+mise run --skip-tools windows:test:conformance:x64
 mise run --skip-tools windows:test:unsupported:x64
 mise run --skip-tools windows:e2e:mxc:inference-mock:x64
 mise run --skip-tools windows:e2e:mxc:provider-mock
@@ -247,12 +250,13 @@ release binaries, and run the inference, provider-credential, OCSF audit, and
 aggregate shipped examples through their mock tasks. Pushes to `main` and
 manual dispatches run the same lint and test commands in a cache-seed job,
 followed by a dependent release-binary build and mock-example job. The seed and
-PR jobs use the same cache namespaces. Merge
-queues do not run this workflow. Main/manual seed and build jobs use job-level
-`continue-on-error: true`; opt-in PR jobs report failures normally. Applying
-the label alone does not start a run: re-run all jobs in the current mirror
-push run, or push a new mirrored commit. The binaries are not uploaded or
-published.
+PR jobs use the same cache namespaces. Merge queues do not run this workflow.
+Main/manual seed and build jobs use job-level `continue-on-error: true`;
+opt-in PR jobs report failures normally, except that the full mock-MXC
+conformance step is advisory on every hosted lane so known capability gaps are
+archived without blocking the job. Applying the label alone does not start a
+run: re-run all jobs in the current mirror push run, or push a new mirrored
+commit. The binaries are not uploaded or published.
 
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
@@ -292,6 +296,8 @@ crypto dependency builds.
 | `windows:build:arm64` | Release-builds `openshell-gateway.exe`, `openshell.exe`, and `openshell-supervisor-relay.exe` for ARM64. |
 | `windows:test:x64` | Runs native x64 workspace tests with `--no-fail-fast`, excluding unsupported Windows packages as top-level workspace targets. |
 | `windows:test:arm64` | Runs native ARM64 workspace tests with `--no-fail-fast` and the same package exclusions. Rejects non-ARM64 hosts. |
+| `windows:test:conformance:x64` | Runs every conformance scenario against the mock MXC gateway on native x64, then exits nonzero if any scenario failed. Hosted CI treats that result as advisory and uploads the complete report. |
+| `windows:test:conformance:arm64` | Runs the same complete mock-MXC report natively on ARM64. Rejects non-ARM64 hosts. Hosted CI treats scenario failures as advisory. |
 | `windows:test:unsupported:x64` | Re-runs focused `openshell-gateway` tests for unsupported Windows driver behavior. |
 | `windows:test:unsupported:arm64` | Re-runs the same focused contracts natively on ARM64. Rejects non-ARM64 hosts. |
 | `windows:test:mxc-real:x64` | Runs the serial, ignored real-`wxc-exec` integration suite natively on x64 through the MSVC wrapper. Rejects non-x64 hosts. |
@@ -356,6 +362,9 @@ When reporting `windows:ci`, distinguish these categories:
 - The focused unsupported-contract re-run.
 - The architecture-matched MXC inference, provider-credential, OCSF audit, and
   aggregate mock tasks and their explicit wiring-only limitation.
+- The complete mock-MXC conformance report, separating passed scenarios from
+  expected capability gaps. Do not report an advisory hosted run as full
+  conformance.
 - Explicit Cargo ignored tests, usually ignored doc examples.
 - Tests hidden by `#[cfg(not(target_os = "windows"))]`; these often appear as
   `running 0 tests`, not as ignored tests.
@@ -373,6 +382,11 @@ Useful log files:
 | `build-aarch64-pc-windows-msvc-release.log` | ARM64 release build output. |
 | `test-x86_64-pc-windows-msvc.log` | Full native x64 workspace test output. |
 | `test-aarch64-pc-windows-msvc.log` | Full native ARM64 workspace test output. |
+| `build-<target>-conformance.log` | Build output for the CLI, gateway, and standalone conformance runner. |
+| `test-<target>-conformance.log` | Complete mock-MXC conformance scenario report. |
+| `test-<target>-conformance.err.log` | Conformance runner standard error. |
+| `test-<target>-conformance-gateway.log` | Mock-MXC gateway standard output. |
+| `test-<target>-conformance-gateway.err.log` | Mock-MXC gateway standard error. |
 | `test-x86_64-pc-windows-msvc-unsupported-*.log` | Focused unsupported-driver contract output. |
 | `test-aarch64-pc-windows-msvc-unsupported-*.log` | Focused native ARM64 contract output. |
 | `test-x86_64-pc-windows-msvc-mxc-real.log` | Native x64 real-MXC integration output. |
