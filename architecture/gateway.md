@@ -1113,11 +1113,9 @@ as normal EOF. The input and output pumps are owned by the exec operation, so
 timeout or response abandonment cannot leave a detached stdin task behind.
 The pumps share polling fairly, and request processing yields cooperatively even
 for ignored resize messages, so sustained input cannot monopolize the operation.
-The CLI keeps piped input in the unary request when the complete encoded
-request fits the gateway's decoder limit, preserving compatibility with older
-gateways. Input up to the CLI's 4 MiB cap uses this stream with bounded frames
-when the unary message would exceed the decoder limit, with or without a PTY.
-The CLI closes the input side at pipe EOF.
+By default, the CLI reads piped input to EOF before starting the command. It keeps that input in the unary request when the complete encoded request fits the gateway's decoder limit, preserving compatibility with older gateways. Input up to the CLI's 4 MiB cap uses this stream with bounded frames when the unary message would exceed the decoder limit, with or without a PTY. The CLI closes the input side at pipe EOF.
+
+With `sandbox exec --stream-stdin`, the CLI starts `ExecSandboxInteractive` before reading stdin to EOF, disables TTY allocation, and sends bounded input frames while draining stdout and stderr separately. The existing 4 MiB total input cap still bounds this CLI path; it does not change stdin handling for arbitrary RPC clients. Exceeding the cap cancels the execution and reports that earlier input may already have been processed. Normal stdin EOF preserves output draining. The CLI consumes the final gRPC status before reporting success and never automatically retries an interrupted execution.
 
 Go and TypeScript interactive-exec helpers distinguish process exit from stream
 completion. They consume the final gRPC status before reporting success and retain

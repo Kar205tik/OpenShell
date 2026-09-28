@@ -418,6 +418,8 @@ Check whether the command ran before retrying work with side effects. Use
 Use `--env` only for non-secret values. Attach credentials to the sandbox with a
 provider instead of passing API keys, tokens, or other secrets to `sandbox exec`.
 
+When a client must read responses before closing stdin, check `openshell sandbox exec --help` for `--stream-stdin`. Use that mode to start the command immediately without a TTY and keep stdout and stderr separate. It conflicts with `--tty`. Total stdin remains limited to 4 MiB; exceeding the limit cancels the command after it may have processed earlier input. Without this flag, piped input is read to EOF and checked before launch. After a stream failure, inspect the command's effects before retrying it.
+
 ### Change attached providers
 
 ```bash
