@@ -20,10 +20,11 @@ smoke test as the portability boundary. In particular:
 - `lifecycle` and the policy advisor tests have additional runtime requirements
   documented in their source modules.
 
-The scenario implementations live in `crates/openshell-conformance` so the
-archive tests and the standalone `openshell-conformance` compatibility runner
-share assertions and cleanup. New installed-artifact CI should use this test
-workspace and select tests with nextest filters.
+The scenario implementations live in the
+[`openshell-conformance` crate](../../../crates/openshell-conformance/README.md)
+so the archive tests and the standalone `openshell-conformance` compatibility
+runner share assertions and cleanup. New installed-artifact CI should use this
+test workspace and select tests with nextest filters.
 
 Set `OPENSHELL_BIN` to the candidate CLI. The selected gateway must already be
 reachable. Runtimes that require an explicit sandbox workload can set
