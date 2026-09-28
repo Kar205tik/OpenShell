@@ -14,7 +14,7 @@ The crate is a scenario library, not the primary CI entrypoint:
 
 | Component | Responsibility |
 |---|---|
-| [`tests/suites/conformance/cli`](../../tests/suites/conformance/README.md) | Wrap exported scenarios as Cargo tests and select them according to runtime capabilities. New installed-artifact CI should use this workspace. |
+| [`tests/suites/conformance/cli`](../../tests/suites/conformance/README.md) | Wrap exported scenarios as Cargo tests. Conformance CI should run the complete workspace; focused selection is for local diagnosis. |
 | `openshell-conformance` | Define portable scenarios and the shared `OpenShellRunner`. |
 | [`openshell-conformance-cli`](../openshell-conformance-cli) | Run registered scenarios manually or for compatibility with existing E2E tooling. |
 

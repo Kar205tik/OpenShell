@@ -133,9 +133,6 @@ async fn create_sandbox(
     if let Some(command) = smoke_command()? {
         args.push("--".to_string());
         args.extend(command);
-    } else {
-        args.push("--from".to_string());
-        args.push("base".to_string());
     }
     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
     let create = runner

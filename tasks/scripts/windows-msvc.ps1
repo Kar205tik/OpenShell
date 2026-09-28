@@ -661,7 +661,7 @@ filesystem_policy:
 
         Invoke-VsCargo `
             -RustTarget $RustTarget `
-            -CargoArgs "cargo nextest run --manifest-path tests/suites/conformance/Cargo.toml --target $RustTarget --test smoke control_plane --no-capture" `
+            -CargoArgs "cargo nextest run --profile ci --manifest-path tests/suites/conformance/Cargo.toml --target $RustTarget --no-capture" `
             -LogName "test-$RustTarget-conformance.log"
     } catch {
         Get-Content -LiteralPath $gatewayLog, $gatewayErrorLog -ErrorAction SilentlyContinue

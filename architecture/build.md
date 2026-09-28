@@ -297,9 +297,9 @@ for explicit publication.
 CLI conformance runs after target provisioning and operates only through the
 configured OpenShell CLI. The archive suite defines the installed-artifact test
 boundary, while `openshell-conformance` provides reusable scenarios and a
-standalone compatibility runner. Smoke coverage separates control-plane
-create/get/list/delete behavior from exec behavior so a runtime can run the
-portable subset matching its advertised capabilities.
+standalone compatibility runner. Scenarios are independently selectable for
+local diagnosis, while conformance CI runs the complete suite so unsupported
+runtime behavior remains visible rather than being silently skipped.
 
 ## Python Wheel Packaging
 

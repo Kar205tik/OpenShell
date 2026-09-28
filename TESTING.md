@@ -150,8 +150,10 @@ Suites:
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
 - CLI conformance (`tests/suites/conformance`) - installed-artifact tests of
   portable public CLI behavior. Smoke coverage is split into independent
-  control-plane and exec tests so each driver runs only the capabilities it
-  implements. Scenario implementations live in `openshell-conformance`; the
+  control-plane and exec tests so failures identify the unsupported operation
+  without hiding later coverage. Conformance CI runs every test; focused
+  filters are for local diagnosis. Scenario implementations live in
+  `openshell-conformance`; the
   standalone `openshell-conformance` binary remains a compatibility runner for
   driver E2E wrappers. See the [suite README](tests/suites/conformance/README.md)
   for scope and selection guidance.
@@ -196,8 +198,7 @@ on how the gateway was installed. Its control-plane test requires
 machine-readable status, creates a uniquely named detached sandbox, verifies it
 is `Ready` through get and paginated list output, deletes it, and verifies its
 name no longer appears. The exec test creates its own sandbox and checks
-`sandbox exec` with a run-specific marker. Drivers without exec support run the
-control-plane test alone. Runtimes that require an explicit workload set
+`sandbox exec` with a run-specific marker. Runtimes that require an explicit workload set
 `OPENSHELL_CONFORMANCE_SMOKE_COMMAND` to a JSON string array; additional create
 options can be supplied through `OPENSHELL_CONFORMANCE_SMOKE_CREATE_ARGS`.
 Sandbox lifecycle, label matrices, VM overlay, and TLS-key permission assertions
