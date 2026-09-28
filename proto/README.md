@@ -81,6 +81,12 @@ identifies the service being exposed.
   not reuse either for a different meaning.
 - Review changes against both the public descriptor closure and durable stored
   protobuf closure described in [the gateway architecture](../architecture/gateway.md#protobuf-api-and-storage-boundaries).
+- Branch CI compares this module, including SDK and extension contracts,
+  against the target branch with Buf's `FILE` breaking policy. To check locally
+  after fetching the target branch, run
+  `PROTO_BREAKING_BASE_REF=origin/main mise run proto:breaking` (replace the ref
+  when the PR targets another branch). The storage-only module is checked by its
+  separate durability tests, not by this API comparison.
 - Regenerate Rust, Python, Go, and TypeScript bindings after contract changes.
   Run `mise run pre-commit`, the affected SDK checks, and relevant server tests
   before submitting the change.

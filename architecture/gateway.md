@@ -679,6 +679,8 @@ Public API compatibility and storage compatibility are reviewed independently:
 
 - Public compatibility is evaluated from public service descriptors and SDK
   generation inputs. Storage-only packages must never enter that closure.
+  Branch CI compares the `proto/` module, including SDK and extension contracts,
+  with the target branch commit under the repository's Buf `FILE` policy.
 - `openshell.storage.v1` is frozen. Its test fingerprint covers message names,
   field numbers, cardinality, scalar wire types, referenced types, map-entry
   shapes, and optional presence. Keep its decoder available and introduce a
