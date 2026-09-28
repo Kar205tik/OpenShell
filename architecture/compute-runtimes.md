@@ -9,10 +9,12 @@ Podman provisions a paired workload and supervisor container using its native
 libpod API. The workload uses `network=none`; the external supervisor alone joins
 the configured network. A per-sandbox named volume carries their mutually
 authenticated gRPC Unix socket, with supervisor credentials kept in its separate
-filesystem. Both containers run as the resolved non-root identity with all
-capabilities dropped. They share only a user namespace for volume ownership,
-not PID, mount, or network namespaces. Podman owns paired lifecycle and health;
-the common protocol owns process, identity, TCP, DNS, and forwarding semantics.
+filesystem. The supervisor and final sandbox runtime run as the resolved non-root
+identity with all capabilities dropped. Only the managed `/sandbox` fallback uses
+a trusted root bootstrap to prepare its driver-owned workspace before dropping
+irreversibly to that identity. The containers do not share PID, mount, or network
+namespaces. Podman owns paired lifecycle and health; the common protocol owns
+process, identity, TCP, DNS, and forwarding semantics.
 
 ## Driver Contract
 
@@ -305,7 +307,7 @@ delete, reconciliation removes the row; otherwise it can remain `Deleting`.
 | Runtime | Best fit | Sandbox boundary | Notes |
 |---|---|---|---|
 | Docker | Local development with Docker available. | Capability-free workload container. | Uses `network_mode=none`; a separate capability-free supervisor container mediates egress and access over a private daemon-local Unix socket volume. |
-| Podman | Existing rootless driver. | Container. | Not converted by this isolation stack. |
+| Podman | Local development with Podman available. | Capability-free workload container. | Uses `network=none`; a separate capability-free supervisor container mediates egress and access over a private Unix socket volume. |
 | Kubernetes | Cluster deployment through Helm. | Capability-free sandbox Pod. | Always creates a namespace-wide empty-egress workload NetworkPolicy and a separate capability-free supervisor Pod over mutually authenticated TLS. It requires an enforcing CNI and trusted sandbox namespace; the Kubernetes API does not attest policy enforcement. |
 | VM | Experimental microVM isolation. | Per-sandbox libkrun or QEMU VM. | The NIC-less guest runs `openshell-sandbox` as PID 1; host `openshell-supervisor` owns gateway networking and reaches the guest over vsock. |
 | Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a custom `compute_drivers = ["<name>"]` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--drivers <name>` with `--compute-driver-socket=<path>`. A launch-time endpoint may use a canonical built-in name to preserve its driver-config key while replacing in-process construction. The gateway connects to an operator-provisioned UDS, snapshots `GetCapabilities`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
@@ -390,7 +392,7 @@ Drivers deliver the two binaries to separate trust domains:
 | Runtime | Delivery model |
 |---|---|
 | Docker | A digest-pinned daemon-local volume supplies `openshell-sandbox`; the companion image runs `openshell-supervisor`. |
-| Podman | Existing driver behavior; not converted by this stack. |
+| Podman | A pinned runtime image supplies `openshell-sandbox`; a separate pinned companion image runs `openshell-supervisor`. |
 | Kubernetes | A non-root init container stages `openshell-sandbox` into a memory volume; a directly managed Pod runs `openshell-supervisor`. |
 | VM | `openshell-sandbox` is embedded in the guest rootfs; a separately digest-checked native `openshell-supervisor` runs on the host. |
 | Extension | Defined by the out-of-tree driver. |
@@ -408,19 +410,45 @@ and supplementary-group set before creating the immutable workload:
 
 - Docker pins the image ID, resolves policy selectors against the image's
   `/etc/passwd` and `/etc/group`, and validates its OCI working directory.
+- Podman pins the image ID, resolves policy selectors against the image's
+  `/etc/passwd` and `/etc/group`, and validates its OCI working directory.
 - Kubernetes uses platform-resolved numeric values, including OpenShift
   namespace ranges.
 - VM uses the configured numeric guest identity.
 
-UID/GID zero and `u32::MAX` are invalid. The sandbox and every child start with
-the resolved identity and zero capability masks; neither process performs an
-in-workload UID transition. Identity-changing policy updates require sandbox
-recreation, while other policy updates remain live.
+UID/GID zero and `u32::MAX` are invalid. Before any untrusted instruction runs,
+the sandbox runtime and every child use the resolved identity with zero
+capability masks. The managed Podman `/sandbox` fallback may start its trusted
+runtime bootstrap as container root with narrowly scoped identity and ownership
+capabilities; it prepares the driver-owned workspace and drops irreversibly to
+the resolved identity before reading bootstrap material or accepting control
+traffic. No untrusted child performs an identity transition. Identity-changing
+policy updates require sandbox recreation, while other policy updates remain
+live.
 
-Docker uses an absolute OCI working directory as the workspace. Empty, root,
-and explicit `/sandbox` values select `/sandbox`; other paths must already
-exist without symlink or reserved-mount collisions and must be usable by the
-resolved identity. Kubernetes and VM use `/sandbox`.
+Docker and Podman resolve OCI `Config.User` and `Config.WorkingDir` from one
+immutable image inspection. Empty, root (`/`), and explicit `/sandbox` working
+directories select the managed `/sandbox` compatibility workspace. A custom
+working directory must be a normalized absolute path outside kernel runtime,
+OpenShell control, and private channel paths. A driver-config mount cannot cover
+the workspace root or one of its parents; mounts nested beneath the root remain
+valid. Image-declared volumes follow the same collision rules. Malformed paths
+and collisions fail before untrusted execution.
+
+Podman mounts its persistent named workspace volume at the resolved custom root
+without `nocopy` or ownership-changing options, retaining Podman's normal
+first-use copy-up from the workload image. The trusted sandbox runtime starts at
+`/` directly as the final non-root identity with no capabilities, validates the
+effective copied-up path, and only then permits untrusted execution. Every path
+component must be a real traversable directory and the root must be writable;
+OpenShell preserves its ownership and mode. Only the `/sandbox` fallback uses
+the root/chown bootstrap and managed-workspace archive.
+
+The separate supervisor receives the resolved path as the logical
+`AgentSpec.workdir` but does not mount or traverse the workload workspace.
+Podman copy-up results can vary with rootless or rootful operation, user
+namespaces, backing filesystems, and SELinux; an unusable effective path fails
+closed. Kubernetes and VM continue to use `/sandbox`.
 
 ### Executable Identity Binding
 

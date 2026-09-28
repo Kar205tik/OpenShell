@@ -185,6 +185,10 @@ pub struct ImageConfig {
     pub user: String,
     #[serde(default)]
     pub env: Vec<String>,
+    #[serde(default)]
+    pub working_dir: String,
+    #[serde(default)]
+    pub volumes: Option<HashMap<String, Value>>,
 }
 
 /// A container summary returned by the list API.
@@ -1158,12 +1162,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inspect_image_reads_immutable_id_and_oci_user() {
+    async fn inspect_image_reads_immutable_id_and_oci_config() {
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "inspect-image",
             vec![StubResponse::new(
                 StatusCode::OK,
-                r#"{"Id":"sha256:immutable","Config":{"User":"app:staff"}}"#,
+                r#"{"Id":"sha256:immutable","Config":{"User":"app:staff","Env":["A=one"],"WorkingDir":"/workspace/project","Volumes":{"/workspace/project/cache":{}}}}"#,
             )],
         );
         let client = PodmanClient::new(socket_path.clone());
@@ -1178,6 +1182,24 @@ mod tests {
             image.config.as_ref().map(|config| config.user.as_str()),
             Some("app:staff")
         );
+        assert_eq!(
+            image.config.as_ref().map(|config| config.env.as_slice()),
+            Some(["A=one".to_string()].as_slice())
+        );
+        assert_eq!(
+            image
+                .config
+                .as_ref()
+                .map(|config| config.working_dir.as_str()),
+            Some("/workspace/project")
+        );
+        assert!(
+            image
+                .config
+                .as_ref()
+                .and_then(|config| config.volumes.as_ref())
+                .is_some_and(|volumes| volumes.contains_key("/workspace/project/cache"))
+        );
         handle.await.expect("stub task should finish");
         assert_eq!(
             request_log
@@ -1186,6 +1208,27 @@ mod tests {
                 .as_slice(),
             ["GET /v5.0.0/libpod/images/example%2Fimage%3Alatest/json"]
         );
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn inspect_image_accepts_null_oci_volumes() {
+        let (socket_path, _request_log, handle) = spawn_podman_stub(
+            "inspect-image-null-volumes",
+            vec![StubResponse::new(
+                StatusCode::OK,
+                r#"{"Id":"sha256:immutable","Config":{"WorkingDir":"/workspace","Volumes":null}}"#,
+            )],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+
+        let image = client
+            .inspect_image("example/image:latest")
+            .await
+            .expect("null OCI volumes should parse");
+
+        assert!(image.config.is_some_and(|config| config.volumes.is_none()));
+        handle.await.expect("stub task should finish");
         let _ = std::fs::remove_file(socket_path);
     }
 

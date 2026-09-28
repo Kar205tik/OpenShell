@@ -678,6 +678,14 @@ Explicit numeric fields may use any UID/GID from `1` through
 Warn users that low IDs can inherit permissions from matching accounts, image
 files, mounted volumes, or devices.
 
+Docker and Podman gateways also use a normalized absolute OCI `WORKDIR` as the
+workspace. Empty, `/`, and explicit `/sandbox` declarations use the managed
+`/sandbox` fallback. Podman mounts its persistent workspace volume at a custom
+workdir and preserves normal first-use image copy-up; it does not repair the
+copied ownership or mode. Make the final non-root identity able to traverse and
+write that directory, and test the image with the target rootless/rootful,
+user-namespace, filesystem, and SELinux configuration.
+
 ### Forward ports
 
 ```bash
