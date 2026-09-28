@@ -1,8 +1,8 @@
 snapshots:
   dev:
-    source-ref: 87929ad13048989f71b21d1374dc83ce433de0da
-    source-sha: 87929ad13048989f71b21d1374dc83ce433de0da
-    version: 0.1.2.dev7
+    source-ref: 6648bd0c290efbc41ba131ee9831ee45cd431f94
+    source-sha: 6648bd0c290efbc41ba131ee9831ee45cd431f94
+    version: 0.1.2.dev8
   latest:
     source-ref: 4ce767fc0cadad773c398e15109c0286f4b7aa30
     source-sha: 4ce767fc0cadad773c398e15109c0286f4b7aa30
