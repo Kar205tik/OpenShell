@@ -194,6 +194,9 @@ exec, SSH, forwarding, and exposed services unavailable. Start reactivates the
 same resource. The gateway requires a fresh supervisor session before a
 starting sandbox returns to `Ready`; stale driver snapshots and supervisor
 sessions cannot promote a `Stopped` row.
+Stop rereads the sandbox after a bounded resource-version conflict and commits
+`Stopping` only while the same sandbox is still `Ready`. This allows concurrent
+status updates without retrying a lifecycle change against a different state.
 
 Runtime credentials are generation-scoped and memory-only after launch. A
 supervisor or Sandbox Runtime process replacement does not resume a running

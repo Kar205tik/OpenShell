@@ -180,6 +180,7 @@ mod traced_driver {
 
 const DELETE_PHASE_CAS_RETRY_LIMIT: usize = 3;
 const START_PHASE_CAS_RETRY_LIMIT: usize = 3;
+const STOP_PHASE_CAS_RETRY_LIMIT: usize = 3;
 const SUPERVISOR_SESSION_CAS_RETRY_LIMIT: usize = 3;
 
 /// Serializes request-side lifecycle mutations for the same stable sandbox ID.
@@ -1320,50 +1321,68 @@ impl ComputeRuntime {
         let sandbox_name = candidate.object_name().to_string();
         let lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
         let global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
-        let current = self
+        let mut current = self
             .store
             .get_message::<Sandbox>(&sandbox_id)
             .await
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
-        if current.object_name() != sandbox_name {
-            return Err(Status::aborted(
-                "sandbox name changed while the stop request was waiting; retry explicitly",
-            ));
-        }
+        let mut attempts = 0;
+        let (previous, stopping) = loop {
+            if current.object_name() != sandbox_name {
+                return Err(Status::aborted(
+                    "sandbox name changed while the stop request was waiting; retry explicitly",
+                ));
+            }
 
-        let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
-        if matches!(phase, SandboxPhase::Stopped | SandboxPhase::Completed)
-            || is_failed_main_process_result(&current)
-        {
-            self.cleanup_stopped_sandbox_sessions(&current)
-                .await
-                .map_err(Status::internal)?;
-            return Ok(current);
-        }
-        if !matches!(phase, SandboxPhase::Ready | SandboxPhase::Stopping) {
-            return Err(Status::failed_precondition(format!(
-                "sandbox must be Ready to stop (current phase: {phase:?})"
-            )));
-        }
+            let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
+            if matches!(phase, SandboxPhase::Stopped | SandboxPhase::Completed)
+                || is_failed_main_process_result(&current)
+            {
+                self.cleanup_stopped_sandbox_sessions(&current)
+                    .await
+                    .map_err(Status::internal)?;
+                return Ok(current);
+            }
+            if !matches!(phase, SandboxPhase::Ready | SandboxPhase::Stopping) {
+                return Err(Status::failed_precondition(format!(
+                    "sandbox must be Ready to stop (current phase: {phase:?})"
+                )));
+            }
+            if phase == SandboxPhase::Stopping {
+                // Acquiring the lifecycle gate proves that no local worker still
+                // owns this transition. Retry the idempotent driver operation.
+                break (current.clone(), current);
+            }
 
-        let (previous, stopping) = if phase == SandboxPhase::Stopping {
-            // Acquiring the lifecycle gate proves that no local worker still
-            // owns this transition. Retry the idempotent driver operation.
-            (current.clone(), current)
-        } else {
             let previous = current.clone();
-            let stopping = self
+            match self
                 .write_lifecycle_phase(
                     &current,
                     SandboxPhase::Stopping,
                     "Stopping",
                     "Sandbox stop requested",
                 )
-                .await?;
-            self.sandbox_index.update_from_sandbox(&stopping);
-            self.sandbox_watch_bus.notify(&sandbox_id);
-            (previous, stopping)
+                .await
+            {
+                Ok(stopping) => {
+                    self.sandbox_index.update_from_sandbox(&stopping);
+                    self.sandbox_watch_bus.notify(&sandbox_id);
+                    break (previous, stopping);
+                }
+                Err(status)
+                    if status.code() == Code::Aborted && attempts < STOP_PHASE_CAS_RETRY_LIMIT =>
+                {
+                    attempts += 1;
+                    current = self
+                        .store
+                        .get_message::<Sandbox>(&sandbox_id)
+                        .await
+                        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+                        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+                }
+                Err(status) => return Err(status),
+            }
         };
         drop(global_guard);
 
