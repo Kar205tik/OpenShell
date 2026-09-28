@@ -24,5 +24,5 @@ WORKDIR /sandbox
 
 EXPOSE 8888
 
-# OpenShell replaces the image command with the sandbox supervisor. The
-# example starts Jupyter after sandbox creation through the Python SDK.
+# The example sets Jupyter as the sandbox's main command when it creates the
+# sandbox; OpenShell does not run the image's default command.

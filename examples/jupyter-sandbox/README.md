@@ -1,46 +1,49 @@
 # Jupyter Sandbox
 
-Launch a Jupyter Server in one OpenShell sandbox, open its local service URL in
-your browser, and submit code to a kernel through the exposed service.
+Build a Jupyter image, launch it as an OpenShell service, then execute a local
+notebook on a kernel inside the sandbox.
 
-## Prerequisites
+Run these commands from `examples/jupyter-sandbox`. The example needs a working
+local OpenShell gateway, Docker, Python 3.11 or later, and
+[uv](https://docs.astral.sh/uv/).
 
-- A working local OpenShell gateway and its gateway configuration
-- Docker to build the Jupyter image
-- Python 3.11 or later and [uv](https://docs.astral.sh/uv/)
-
-## Run
-
-From this directory:
+## 1. Build the container
 
 ```shell
+docker build -t openshell-jupyter-sandbox:local .
 uv venv
 source .venv/bin/activate
-uv pip install -e ../.. pyyaml websocket-client
-docker build -t openshell-jupyter-sandbox:local .
-python demo.py
+uv pip install -e ../.. pyyaml jupyter-server==2.20.0 nbconvert==7.17.1 websocket-client
 ```
 
-The script creates a sandbox and exposes port 8888 as the `jupyter` service. It
-starts a token-authenticated Jupyter Server on the sandbox's loopback address,
-then prints a URL to open in your local browser. Jupyter may take a few seconds
-to start. Keep the script running while you use it; press Enter or Ctrl-C to
-delete the sandbox and its service.
+## 2. Launch the service
 
-The script also creates a Jupyter kernel through the exposed REST API, sends
-this code through the kernel's WebSocket channel, and prints `285`:
-
-```python
-print(sum(i * i for i in range(10)))
+```shell
+python launch.py
 ```
 
-The code runs in a Jupyter kernel inside the sandbox. You can also run code
-interactively by opening the printed URL in your browser.
+The sandbox starts Jupyter as its main command and exposes port 8888 as the
+`jupyter` service. The launcher prints a token-authenticated browser URL and
+waits. Keep it running while you execute the notebook. Press Enter or Ctrl-C
+when done to delete the sandbox and service.
 
-The URL contains a Jupyter token. Treat it as a credential and do not share it.
-The example requires a local gateway; it does not configure remote gateway
-authentication for browser access.
+## 3. Execute the notebook on the remote kernel
 
-Edit the constants at the top of `demo.py` to change the image, policy,
-workspace, gateway, or command. The image must contain Jupyter Server and
-Python, plus the `sandbox` user and group selected by the policy.
+In a second terminal, activate the same virtual environment and run:
+
+```shell
+cd examples/jupyter-sandbox
+source .venv/bin/activate
+export JUPYTER_CONFIG_PATH="$PWD"
+jupyter nbconvert --execute --to notebook demo.ipynb
+```
+
+Open `demo.nbconvert.ipynb` locally to see the cell output, `285`. The notebook
+file and executed result stay on your computer; the kernel runs in the sandbox.
+
+The launcher writes a mode-restricted `.jupyter-service.json` with the service
+URL and token. `jupyter_nbconvert_config.py` uses it to direct nbconvert's
+kernel manager to the service and authenticate the WebSocket connection. Both
+files must be used from this directory, and `JUPYTER_CONFIG_PATH` tells
+nbconvert where to find the config. The launcher removes the connection
+file when it exits. Treat the printed URL as a credential.
