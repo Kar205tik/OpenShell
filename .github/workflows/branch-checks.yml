@@ -1,6 +1,8 @@
 name: Branch Checks
 
 on:
+  merge_group:
+    types: [checks_requested]
   push:
     branches:
       - "pull-request/[0-9]+"
@@ -29,7 +31,7 @@ jobs:
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - id: gate
         uses: ./.github/actions/pr-gate
@@ -39,13 +41,14 @@ jobs:
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Mark workspace as safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -63,13 +66,14 @@ jobs:
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install tools
         run: mise install --locked
@@ -77,65 +81,273 @@ jobs:
       - name: Check license headers
         run: mise run license:check
 
-  rust:
-    name: Rust (${{ matrix.runner }})
+  cargo-deny:
+    name: Cargo Deny
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: nix develop .#devShells.x86_64-linux.default -c bash -euo pipefail {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: openshell
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Check dependencies
+        run: cargo deny check licenses bans sources
+
+  rust-format:
+    name: Rust format
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Format
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path e2e/rust/Cargo.toml --all -- --check
+          cargo fmt --manifest-path examples/governance-interceptor/Cargo.toml --all -- --check
+          cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all -- --check
+
+  cargo-lockfiles:
+    name: Cargo lockfiles
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Verify Cargo lockfiles
+        shell: nix develop -c bash -euo pipefail {0}
+        run: tasks/scripts/check-cargo-lockfiles.sh
+
+  rust-lint:
+    name: Rust lint (${{ matrix.system }})
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-amd64-cpu8, linux-arm64-cpu8]
+        include:
+          - runner: linux-amd64-cpu8
+            system: x86_64-linux
+          - runner: linux-arm64-cpu8
+            system: aarch64-linux
+          - runner: macos-15-xlarge
+            system: aarch64-darwin
     runs-on: ${{ matrix.runner }}
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      SCCACHE_GHA_VERSION: branch-checks-rust-${{ matrix.runner }}
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Configure GHA sccache backend
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
-
-      - name: Install tools
-        run: mise install --locked
-
-      - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+      - uses: ./.github/actions/setup-nix
         with:
-          # Keep branch-check caches partitioned by runner architecture; lint
-          # and test intentionally share the same job-local target directory.
-          shared-key: rust-checks-${{ matrix.runner }}
-          # Preserve compiled artifacts from failed lint/test runs so the next
-          # push to the same PR branch does not start from a cold cache.
-          cache-on-failure: "true"
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - name: Format
-        run: mise run rust:format:check
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: rust-checks-v2
+          save-cache: "false"
 
       - name: Lint
-        run: mise run rust:lint
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path examples/governance-interceptor/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets -- -D warnings
+
+  rust-test:
+    name: Rust test (${{ matrix.system }})
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: linux-amd64-cpu8
+            system: x86_64-linux
+          - runner: linux-arm64-cpu8
+            system: aarch64-linux
+          - runner: macos-15-xlarge
+            system: aarch64-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: rust-checks-v2
+          save-cache: "true"
 
       - name: Test
-        run: mise run test:rust
-
-      - name: Verify telemetry can be compiled out
-        run: mise run rust:verify:telemetry-off
-
-      - name: sccache stats
-        if: always()
+        shell: nix develop -c bash -euo pipefail {0}
+        env:
+          OPENSHELL_TELEMETRY_ENABLED: "false"
         run: |
-          set +e
-          stats_bin="${SCCACHE_PATH:-sccache}"
-          "$stats_bin" --show-stats
-          status=$?
-          if [ "$status" -ne 0 ]; then
-            echo "::warning::sccache stats unavailable (exit $status)"
+          cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support
+          cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
+
+  rust-build-modes:
+    name: Rust build modes (${{ matrix.system }})
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: linux-amd64-cpu8
+            system: x86_64-linux
+          - runner: linux-arm64-cpu8
+            system: aarch64-linux
+          - runner: macos-15-xlarge
+            system: aarch64-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: rust-checks-v2
+          save-cache: "false"
+
+      - name: Verify build modes
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
+          cargo build --locked -p openshell-gateway --bin openshell-gateway
+          tasks/scripts/verify-telemetry-compiled-out.sh present target/debug/openshell-gateway
+          cargo build --locked -p openshell-gateway --bin openshell-gateway --no-default-features --features defaults-without-telemetry
+          tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-gateway
+          cargo build --locked -p openshell-supervisor --bin openshell-supervisor --no-default-features --features defaults-without-telemetry
+          tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-supervisor
+          cargo check --locked -p openshell-supervisor --all-targets --no-default-features --features system-ca-roots
+
+      - name: Verify system CA roots dependency boundary
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
+          cargo tree --locked -p openshell-supervisor --prefix none --no-default-features --features system-ca-roots > /tmp/openshell-supervisor-dependencies.txt
+          if grep -Eq '^(webpki-roots|webpki-root-certs) v' /tmp/openshell-supervisor-dependencies.txt; then
+            echo "ERROR: bundled Mozilla roots found in system CA roots build" >&2
+            cat /tmp/openshell-supervisor-dependencies.txt >&2
+            exit 1
           fi
-          exit 0
+
+      - name: Verify standalone prover dependency boundary
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
+          cargo tree --locked -p openshell-prover-cli --edges normal --prefix none > /tmp/openshell-prover-dependencies.txt
+          if grep -Eq '^(openshell-(cli|server|sdk|bootstrap|tui|providers|core|policy)) v' /tmp/openshell-prover-dependencies.txt; then
+            echo "ERROR: standalone prover includes an OpenShell control-plane dependency" >&2
+            cat /tmp/openshell-prover-dependencies.txt >&2
+            exit 1
+          fi
+
+  rust-feature-alias:
+    name: Rust feature alias
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: rust-checks-v2
+          save-cache: "false"
+
+      - name: Verify defaults-without-telemetry feature alias
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
+          tasks/scripts/verify-defaults-without-telemetry.sh
+          git diff --exit-code HEAD -- ':(glob)**/Cargo.lock'
+
+  rust-gateway-core-features:
+    name: Rust gateway core features
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: rust-checks-v2
+          save-cache: "false"
+
+      - name: Verify core gateway compute-driver feature sets
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
+          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features
+          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker
+          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-kubernetes
+          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-podman
+
+  rust-gateway-extended-features:
+    name: Rust gateway extended features
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: rust-checks-v2
+          save-cache: "false"
+
+      - name: Verify extended gateway compute-driver feature sets
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
+          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-vm
+          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-mxc
+          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker,compute-driver-vm
 
   python:
     name: Python (${{ matrix.runner }})
@@ -146,13 +358,14 @@ jobs:
       matrix:
         runner: [linux-amd64-cpu8, linux-arm64-cpu8]
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install tools
         run: mise install --locked
@@ -172,21 +385,76 @@ jobs:
       - name: Test
         run: mise run test:python
 
-  markdown:
-    name: Markdown
+      - name: Test local gateway configuration helpers
+        run: |
+          bash tasks/scripts/test-gateway-pull-policy.sh
+          bash tasks/scripts/test-gateway-config.sh
+  go:
+    name: Go SDK
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Lint, build, test, proto-check
+        run: mise run go:ci
+
+  markdown:
+    name: Markdown
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install tools
         run: mise install --locked
 
       - name: Lint
         run: mise run markdown:lint
+
+  sdk-typescript:
+    name: TypeScript SDK
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Check TypeScript SDK
+        run: mise run sdk:ts:ci
+
+      # Exercise the full release publish path (version stamp, dist-tag,
+      # prepublishOnly, tarball) without uploading. Uses the off-tag dev
+      # version, which validates the prerelease dist-tag branch too.
+      - name: Verify publishable artifact (dry-run)
+        env:
+          OPENSHELL_NPM_PUBLISH_ARGS: --dry-run
+        run: |
+          OPENSHELL_NPM_VERSION="$(uv run python tasks/scripts/release.py get-version --npm)" \
+            mise run sdk:ts:publish

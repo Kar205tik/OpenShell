@@ -8,7 +8,7 @@
 //! principals for every method outside this supervisor-to-gateway allowlist;
 //! handlers still perform same-sandbox checks on request bodies.
 //!
-//! The allowlist is derived from per-handler `#[rpc_auth(...)]` annotations:
+//! The allowlist is derived from proto-level `(authorization)` annotations:
 //! a method is callable by a sandbox principal when its declared auth mode is
 //! `sandbox` or `dual`.
 
@@ -26,11 +26,12 @@ mod tests {
             "/openshell.v1.OpenShell/ConnectSupervisor"
         ));
         assert!(is_sandbox_callable("/openshell.v1.OpenShell/RelayStream"));
+        assert!(!is_sandbox_callable("/openshell.v1.OpenShell/PeerRelay"));
         assert!(is_sandbox_callable(
             "/openshell.v1.OpenShell/GetSandboxConfig"
         ));
         assert!(is_sandbox_callable(
-            "/openshell.inference.v1.Inference/GetInferenceBundle"
+            "/openshell.v1.OpenShell/ExchangeProviderSubjectToken"
         ));
     }
 
@@ -42,17 +43,13 @@ mod tests {
         assert!(!is_sandbox_callable(
             "/openshell.v1.OpenShell/DeleteSandbox"
         ));
+        assert!(!is_sandbox_callable("/openshell.v1.OpenShell/StopSandbox"));
+        assert!(!is_sandbox_callable("/openshell.v1.OpenShell/StartSandbox"));
         assert!(!is_sandbox_callable(
             "/openshell.v1.OpenShell/CreateProvider"
         ));
         assert!(!is_sandbox_callable(
             "/openshell.v1.OpenShell/ApproveDraftChunk"
-        ));
-        assert!(!is_sandbox_callable(
-            "/openshell.inference.v1.Inference/GetClusterInference"
-        ));
-        assert!(!is_sandbox_callable(
-            "/openshell.inference.v1.Inference/SetClusterInference"
         ));
     }
 }

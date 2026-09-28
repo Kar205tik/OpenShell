@@ -7,7 +7,7 @@ your local machine through port forwarding.
 ## Prerequisites
 
 - A running OpenShell gateway (`mise run gateway:docker` for local development)
-- Docker daemon running
+- Docker or Podman running, matching the gateway driver
 
 ## What's in this example
 
@@ -18,17 +18,27 @@ your local machine through port forwarding.
 
 ## Quick start
 
-### 1. Create a sandbox from the Dockerfile with port forwarding
+### 1. Build the image and create a sandbox with port forwarding
 
 ```bash
+# Docker gateway
+docker build -t openshell-byoc:latest examples/bring-your-own-container
 openshell sandbox create \
-    --from examples/bring-your-own-container/Dockerfile \
+    --from openshell-byoc:latest \
+    --forward 8080 \
+    -- python /sandbox/app.py
+
+# Podman gateway
+podman build -t localhost/openshell-byoc:latest examples/bring-your-own-container
+openshell sandbox create \
+    --from localhost/openshell-byoc:latest \
     --forward 8080 \
     -- python /sandbox/app.py
 ```
 
-The `--from` flag accepts a Dockerfile path. The CLI builds the image,
-pushes it into the cluster, and creates the sandbox in one step.
+Build the Dockerfile with the container engine used by your local gateway
+before creating the sandbox, then pass its image reference to `--from`. For a
+remote gateway, push the image to a registry that the gateway can pull from.
 
 The `--forward 8080` flag opens an SSH tunnel so `localhost:8080` on your
 machine reaches the REST API inside the sandbox.
@@ -59,16 +69,16 @@ key requirements are:
 - **Pass your start command explicitly** — use `-- <command>` on the CLI.
   The image's `CMD` / `ENTRYPOINT` is replaced by the sandbox supervisor
   at runtime.
-- **Create a `sandbox` user** (uid/gid 1000660000) for non-root execution.
-  Use a high UID (1000000000+) to avoid conflicts with host users when running
-  without user namespace remapping.
-- **Make your application workdir writable by `sandbox`**. This example creates
-  `/sandbox` with `sandbox:sandbox` ownership before copying `app.py`.
+- **Declare a non-root OCI `USER`** for Docker and Podman. Use a named account
+  such as `app`, a numeric UID with a passwd entry that supplies its primary
+  GID, or a numeric pair such as `1500:1500`. You can instead set both
+  `process.run_as_user` and `process.run_as_group` explicitly in policy.
+- **Prepare `/sandbox` as the workspace.** Until OCI working-directory support
+  is added, create `/sandbox` and make it writable by the selected identity.
+  The example does this with `install -d -o app -g app /sandbox`.
 - **Install `iproute2`** for full network namespace isolation.
 - **Use a standard Linux base image** — distroless and `FROM scratch`
   images are not supported.
-
-TODO(#70): Remove the sandbox user note once custom images are secure by default without requiring manual setup.
 
 ## How it works
 

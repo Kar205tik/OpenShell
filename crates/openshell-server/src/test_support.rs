@@ -3,15 +3,27 @@
 
 //! Test fixtures for exercising gateway integration points.
 
+use crate::ServerState;
+use crate::auth::identity::{Identity, IdentityProvider};
+use crate::auth::principal::{Principal, UserPrincipal};
+use crate::compute::{new_test_runtime, new_test_runtime_for_driver};
+use crate::persistence::Store;
+use crate::sandbox_index::SandboxIndex;
+use crate::sandbox_watch::SandboxWatchBus;
+use crate::supervisor_session::SupervisorSessionRegistry;
+use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, stream};
+use openshell_core::Config;
 #[cfg(unix)]
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DriverSandbox, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
-    GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest,
-    StopSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
-    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_server::ComputeDriver,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverSandbox, EnsureWorkspaceRequest,
+    EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
+    GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest,
+    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
+    compute_driver_server::ComputeDriver,
 };
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -29,6 +41,55 @@ use tokio::task::JoinHandle;
 use tonic::{Request, Response, Status};
 
 type WatchStream = Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
+
+/// Build a real in-memory gateway service backed by the requested test compute driver.
+///
+/// This fixture is intentionally narrow: integration tests can exercise the public
+/// gRPC service without exposing the gateway's internal state construction details.
+pub async fn gateway_service_with_driver(driver_name: &str) -> crate::OpenShellService {
+    let store = Arc::new(
+        Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("in-memory gateway store should open"),
+    );
+    crate::ensure_default_workspace(&store)
+        .await
+        .expect("default workspace should be created");
+    let compute = if driver_name == "test" {
+        new_test_runtime(store.clone()).await
+    } else {
+        new_test_runtime_for_driver(store.clone(), driver_name).await
+    };
+    let state = Arc::new(ServerState::new(
+        Config::new(None)
+            .with_database_url("sqlite::memory:?cache=shared")
+            .with_credential_drivers(["test-static"]),
+        store,
+        compute,
+        SandboxIndex::new(),
+        SandboxWatchBus::new(),
+        TracingLogBus::new(),
+        Arc::new(SupervisorSessionRegistry::new()),
+        None,
+    ));
+    crate::OpenShellService::new(state)
+}
+
+/// Tonic interceptor that authenticates integration-test requests as the dev user.
+pub fn authenticate_as_dev_user(mut request: Request<()>) -> Result<Request<()>, Status> {
+    request
+        .extensions_mut()
+        .insert(Principal::User(UserPrincipal {
+            identity: Identity {
+                subject: "dev-user".to_string(),
+                display_name: None,
+                roles: vec!["openshell-admin".to_string(), "openshell-user".to_string()],
+                scopes: vec![],
+                provider: IdentityProvider::Oidc,
+            },
+        }));
+    Ok(request)
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FakeComputeDriverCall {
@@ -48,6 +109,10 @@ pub enum FakeComputeDriverCall {
         sandbox_id: String,
         sandbox_name: String,
     },
+    StartSandbox {
+        sandbox_id: String,
+        sandbox_name: String,
+    },
     DeleteSandbox {
         sandbox_id: String,
         sandbox_name: String,
@@ -62,11 +127,10 @@ pub struct FakeComputeDriver {
 
 #[derive(Debug)]
 struct FakeComputeDriverState {
-    driver_name: String,
-    driver_version: String,
-    default_image: String,
+    capabilities: GetCapabilitiesResponse,
     sandboxes: HashMap<String, DriverSandbox>,
     calls: Vec<FakeComputeDriverCall>,
+    traceparents: Vec<String>,
 }
 
 impl Default for FakeComputeDriver {
@@ -80,30 +144,54 @@ impl FakeComputeDriver {
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(FakeComputeDriverState {
-                driver_name: "fake-compute-driver".to_string(),
-                driver_version: "test".to_string(),
-                default_image: "openshell/sandbox:test".to_string(),
+                capabilities: GetCapabilitiesResponse {
+                    resource_admission_policy:
+                        openshell_core::resource_admission::DriverAdmissionConfig::default()
+                            .acknowledgement(),
+                    driver_name: "fake-compute-driver".to_string(),
+                    driver_version: "test".to_string(),
+                    default_image: "openshell/sandbox:test".to_string(),
+                    gateway_manages_lifecycle: false,
+                    supports_sandbox_authentication: false,
+                    driver_reports_runtime_readiness: false,
+                    resource_capabilities: None,
+                    rootfs_tar_staging_dir: String::new(),
+                    rootfs_tar_max_bytes: 0,
+                    extension: Some(openshell_core::extension_protocol::extension_metadata(
+                        openshell_core::extension_protocol::ExtensionFamily::Compute,
+                        "openshell/fake-compute-driver",
+                        "test",
+                        [],
+                    )),
+                },
                 sandboxes: HashMap::new(),
                 calls: Vec::new(),
+                traceparents: Vec::new(),
             })),
         }
     }
 
     #[must_use]
     pub fn with_driver_name(self, driver_name: impl Into<String>) -> Self {
-        self.with_state(|state| state.driver_name = driver_name.into());
+        self.with_state(|state| state.capabilities.driver_name = driver_name.into());
         self
     }
 
     #[must_use]
     pub fn with_driver_version(self, driver_version: impl Into<String>) -> Self {
-        self.with_state(|state| state.driver_version = driver_version.into());
+        self.with_state(|state| state.capabilities.driver_version = driver_version.into());
         self
     }
 
     #[must_use]
     pub fn with_default_image(self, default_image: impl Into<String>) -> Self {
-        self.with_state(|state| state.default_image = default_image.into());
+        self.with_state(|state| state.capabilities.default_image = default_image.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_gateway_manages_lifecycle(self) -> Self {
+        self.with_state(|state| state.capabilities.gateway_manages_lifecycle = true);
         self
     }
 
@@ -112,8 +200,17 @@ impl FakeComputeDriver {
         self.with_state(|state| state.calls.clone())
     }
 
+    #[must_use]
+    pub fn traceparents(&self) -> Vec<String> {
+        self.with_state(|state| state.traceparents.clone())
+    }
+
     pub fn clear_calls(&self) {
         self.with_state(|state| state.calls.clear());
+    }
+
+    pub fn set_admission_acknowledgement(&self, acknowledgement: String) {
+        self.with_state(|state| state.capabilities.resource_admission_policy = acknowledgement);
     }
 
     #[cfg(unix)]
@@ -139,6 +236,14 @@ impl FakeComputeDriver {
             .lock()
             .expect("fake compute driver state poisoned");
         f(&mut state)
+    }
+
+    fn record_traceparent(&self, metadata: &tonic::metadata::MetadataMap) {
+        let traceparent = metadata
+            .get("traceparent")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        self.with_state(|state| state.traceparents.extend(traceparent));
     }
 }
 
@@ -177,19 +282,26 @@ impl Stream for UnixIncoming {
 
 #[tonic::async_trait]
 impl ComputeDriver for FakeComputeDriver {
+    async fn authenticate_sandbox(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>, Status>
+    {
+        Err(Status::unimplemented(
+            "fake driver does not authenticate sandbox credentials",
+        ))
+    }
+
     type WatchSandboxesStream = WatchStream;
 
     async fn get_capabilities(
         &self,
-        _request: Request<GetCapabilitiesRequest>,
+        request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
+        self.record_traceparent(request.metadata());
         let response = self.with_state(|state| {
             state.calls.push(FakeComputeDriverCall::GetCapabilities);
-            GetCapabilitiesResponse {
-                driver_name: state.driver_name.clone(),
-                driver_version: state.driver_version.clone(),
-                default_image: state.default_image.clone(),
-            }
+            state.capabilities.clone()
         });
         Ok(Response::new(response))
     }
@@ -198,11 +310,14 @@ impl ComputeDriver for FakeComputeDriver {
         &self,
         request: Request<ValidateSandboxCreateRequest>,
     ) -> Result<Response<ValidateSandboxCreateResponse>, Status> {
-        let sandbox = request.into_inner().sandbox;
+        self.record_traceparent(request.metadata());
+        let request = request.into_inner();
         self.with_state(|state| {
             state
                 .calls
-                .push(FakeComputeDriverCall::ValidateSandboxCreate { sandbox });
+                .push(FakeComputeDriverCall::ValidateSandboxCreate {
+                    sandbox: request.sandbox,
+                });
         });
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
@@ -211,19 +326,19 @@ impl ComputeDriver for FakeComputeDriver {
         &self,
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<GetSandboxResponse>, Status> {
+        self.record_traceparent(request.metadata());
         let request = request.into_inner();
         let sandbox = self.with_state(|state| {
             state.calls.push(FakeComputeDriverCall::GetSandbox {
                 sandbox_id: request.sandbox_id.clone(),
-                sandbox_name: request.sandbox_name.clone(),
+                sandbox_name: request.name.clone(),
             });
             state
                 .sandboxes
                 .values()
                 .find(|sandbox| {
                     (!request.sandbox_id.is_empty() && sandbox.id == request.sandbox_id)
-                        || (!request.sandbox_name.is_empty()
-                            && sandbox.name == request.sandbox_name)
+                        || (!request.name.is_empty() && sandbox.name == request.name)
                 })
                 .cloned()
         });
@@ -235,8 +350,9 @@ impl ComputeDriver for FakeComputeDriver {
 
     async fn list_sandboxes(
         &self,
-        _request: Request<ListSandboxesRequest>,
+        request: Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
+        self.record_traceparent(request.metadata());
         let sandboxes = self.with_state(|state| {
             state.calls.push(FakeComputeDriverCall::ListSandboxes);
             state.sandboxes.values().cloned().collect()
@@ -248,7 +364,9 @@ impl ComputeDriver for FakeComputeDriver {
         &self,
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<CreateSandboxResponse>, Status> {
-        let sandbox = request.into_inner().sandbox;
+        self.record_traceparent(request.metadata());
+        let request = request.into_inner();
+        let sandbox = request.sandbox;
         self.with_state(|state| {
             if let Some(sandbox) = sandbox.as_ref() {
                 state.sandboxes.insert(sandbox.id.clone(), sandbox.clone());
@@ -257,38 +375,55 @@ impl ComputeDriver for FakeComputeDriver {
                 .calls
                 .push(FakeComputeDriverCall::CreateSandbox { sandbox });
         });
-        Ok(Response::new(CreateSandboxResponse {}))
+        Ok(Response::new(CreateSandboxResponse::default()))
     }
 
     async fn stop_sandbox(
         &self,
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
+        self.record_traceparent(request.metadata());
         let request = request.into_inner();
         self.with_state(|state| {
             state.calls.push(FakeComputeDriverCall::StopSandbox {
                 sandbox_id: request.sandbox_id,
-                sandbox_name: request.sandbox_name,
+                sandbox_name: request.name,
             });
         });
         Ok(Response::new(StopSandboxResponse {}))
+    }
+
+    async fn start_sandbox(
+        &self,
+        request: Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        self.record_traceparent(request.metadata());
+        let request = request.into_inner();
+        self.with_state(|state| {
+            state.calls.push(FakeComputeDriverCall::StartSandbox {
+                sandbox_id: request.sandbox_id,
+                sandbox_name: request.name,
+            });
+        });
+        Ok(Response::new(StartSandboxResponse::default()))
     }
 
     async fn delete_sandbox(
         &self,
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
+        self.record_traceparent(request.metadata());
         let request = request.into_inner();
         let deleted = self.with_state(|state| {
             state.calls.push(FakeComputeDriverCall::DeleteSandbox {
                 sandbox_id: request.sandbox_id.clone(),
-                sandbox_name: request.sandbox_name.clone(),
+                sandbox_name: request.name.clone(),
             });
             if request.sandbox_id.is_empty() {
                 let Some(id) = state
                     .sandboxes
                     .iter()
-                    .find(|(_, sandbox)| sandbox.name == request.sandbox_name)
+                    .find(|(_, sandbox)| sandbox.name == request.name)
                     .map(|(id, _)| id.clone())
                 else {
                     return false;
@@ -303,9 +438,24 @@ impl ComputeDriver for FakeComputeDriver {
 
     async fn watch_sandboxes(
         &self,
-        _request: Request<WatchSandboxesRequest>,
+        request: Request<WatchSandboxesRequest>,
     ) -> Result<Response<Self::WatchSandboxesStream>, Status> {
+        self.record_traceparent(request.metadata());
         self.with_state(|state| state.calls.push(FakeComputeDriverCall::WatchSandboxes));
         Ok(Response::new(Box::pin(stream::empty())))
+    }
+
+    async fn ensure_workspace(
+        &self,
+        _request: Request<EnsureWorkspaceRequest>,
+    ) -> Result<Response<EnsureWorkspaceResponse>, Status> {
+        Ok(Response::new(EnsureWorkspaceResponse {}))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: Request<DeleteWorkspaceRequest>,
+    ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
+        Ok(Response::new(DeleteWorkspaceResponse {}))
     }
 }

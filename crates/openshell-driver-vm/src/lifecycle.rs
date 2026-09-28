@@ -18,7 +18,7 @@ use crate::runtime::VmBackend;
 /// gateway), so a guest cannot self-activate an extension. This contract
 /// lives with the lifecycle framework that consumes it rather than in the
 /// shared settings registry.
-pub const SANDBOX_EXTENSION_LABEL_PREFIX: &str = "openshell.io/extension.";
+pub const SANDBOX_EXTENSION_LABEL_PREFIX: &str = "openshell.ai/extension.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchAbortReason {
@@ -32,6 +32,8 @@ pub enum LaunchAbortReason {
     /// opportunity to release host resources they allocated in
     /// [`LifecycleExtension::before_launch`].
     ProcessExited,
+    /// The gateway intentionally stopped the sandbox while retaining disk state.
+    Stopped,
 }
 
 #[derive(Debug, Clone)]
@@ -106,9 +108,6 @@ pub enum BackendFeature {
     /// QEMU-only and currently rejected for non-GPU sandboxes pending the
     /// non-GPU QEMU launch path landing.
     PciPassthrough,
-    /// Extension needs a host TAP device wired into the guest. Currently
-    /// QEMU-only (libkrun does not expose a TAP transport).
-    TapNetworking,
 }
 
 impl BackendFeature {
@@ -118,7 +117,6 @@ impl BackendFeature {
             Self::ExternalKernelImage => "external-kernel-image",
             Self::GuestInitDropins => "guest-init-dropins",
             Self::PciPassthrough => "pci-passthrough",
-            Self::TapNetworking => "tap-networking",
         }
     }
 
@@ -128,10 +126,7 @@ impl BackendFeature {
     /// exists.
     #[must_use]
     pub fn requires_qemu(self) -> bool {
-        matches!(
-            self,
-            Self::ExternalKernelImage | Self::PciPassthrough | Self::TapNetworking
-        )
+        matches!(self, Self::ExternalKernelImage | Self::PciPassthrough)
     }
 }
 
@@ -224,12 +219,7 @@ pub struct LaunchPlan {
     pub kernel_profile: Option<String>,
     pub kernel_image: Option<PathBuf>,
     pub gpu_bdf: Option<String>,
-    pub tap_device: Option<String>,
-    pub guest_ip: Option<String>,
-    pub host_ip: Option<String>,
     pub vsock_cid: Option<u32>,
-    pub guest_mac: Option<String>,
-    pub gateway_port: Option<u16>,
     pub guest_init_dropins: Vec<GuestInitDropin>,
     pub env: Vec<String>,
 }
@@ -294,7 +284,7 @@ pub enum ExtensionActivation {
 ///    (kernel profile, guest init drop-ins, etc.). Called before the driver
 ///    has resolved the final backend.
 /// 2. Driver resolves [`LaunchPlan::backend`] from declared requirements
-///    and allocates backend-specific host resources (subnet, tap, vsock).
+///    and allocates backend-specific host resources such as a vsock CID.
 /// 3. [`before_launch`](Self::before_launch) — perform host-side
 ///    side effects with the resolved plan in hand, optionally append
 ///    additional guest env via [`LaunchPlan::env`].
@@ -351,7 +341,7 @@ pub trait LifecycleExtension: std::fmt::Debug + Send + Sync {
     /// At this point [`LaunchPlan::backend`],
     /// [`LaunchPlan::required_backends`], and
     /// [`LaunchPlan::required_backend_features`] are finalized and any
-    /// backend-specific host resources (subnet, tap, vsock) have been
+    /// backend-specific host resources have been
     /// allocated. This hook is the right place to bind PCI devices, set
     /// up filesystem state, or otherwise prepare the host.
     ///
@@ -550,12 +540,22 @@ impl LifecycleExtensionRegistry {
             .collect()
     }
 
+    #[tracing::instrument(
+        name = "vm.configure_launch",
+        skip_all,
+        fields(
+            otel.name = "vm.configure_launch",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox.id,
+        )
+    )]
     pub async fn configure_launch(
         &self,
         sandbox: &Sandbox,
         state_dir: &Path,
         plan: &mut LaunchPlan,
     ) -> LifecycleResult<()> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         for ext in self.active_for(sandbox) {
             let descriptor = ext.descriptor();
             for backend in descriptor.required_backends {
@@ -585,19 +585,29 @@ impl LifecycleExtensionRegistry {
                     .map(|p| p.display().to_string()),
             );
         }
-        Ok(())
+        span_status.finish(Ok(()))
     }
 
+    #[tracing::instrument(
+        name = "vm.before_launch",
+        skip_all,
+        fields(
+            otel.name = "vm.before_launch",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox.id,
+        )
+    )]
     pub async fn before_launch(
         &self,
         sandbox: &Sandbox,
         state_dir: &Path,
         plan: &mut LaunchPlan,
     ) -> LifecycleResult<()> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         for ext in self.active_for(sandbox) {
             ext.before_launch(sandbox, state_dir, plan).await?;
         }
-        Ok(())
+        span_status.finish(Ok(()))
     }
 
     pub async fn after_launch_failed(
@@ -931,12 +941,7 @@ mod tests {
             kernel_profile: None,
             kernel_image: None,
             gpu_bdf: None,
-            tap_device: None,
-            guest_ip: None,
-            host_ip: None,
             vsock_cid: None,
-            guest_mac: None,
-            gateway_port: None,
             guest_init_dropins: Vec::new(),
             env: Vec::new(),
         }

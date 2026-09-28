@@ -8,6 +8,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+# shellcheck source=tasks/scripts/build-env.sh
+source "${SCRIPT_DIR}/build-env.sh"
+
 usage() {
   echo "Usage: stage-prebuilt-binaries.sh <gateway|sandbox|supervisor|supervisor-output|all>" >&2
 }
@@ -22,21 +25,18 @@ normalize_arch() {
 
 target_triple() {
   local libc=${2:-gnu}
+  local suffix
+  case "$libc" in
+    musl) suffix=musl ;;
+    gnu) suffix=gnu ;;
+    *)
+      echo "unsupported libc: $libc" >&2
+      exit 1
+      ;;
+  esac
   case "$1" in
-    amd64)
-      if [[ "$libc" == "musl" ]]; then
-        echo "x86_64-unknown-linux-musl"
-      else
-        echo "x86_64-unknown-linux-gnu"
-      fi
-      ;;
-    arm64)
-      if [[ "$libc" == "musl" ]]; then
-        echo "aarch64-unknown-linux-musl"
-      else
-        echo "aarch64-unknown-linux-gnu"
-      fi
-      ;;
+    amd64) echo "x86_64-unknown-linux-${suffix}" ;;
+    arm64) echo "aarch64-unknown-linux-${suffix}" ;;
     *)
       echo "unsupported architecture: $1" >&2
       exit 1
@@ -87,11 +87,14 @@ components_for_target() {
     gateway)
       echo "gateway"
       ;;
-    sandbox|supervisor|supervisor-output)
+    sandbox)
+      echo "sandbox"
+      ;;
+    supervisor|supervisor-output)
       echo "supervisor"
       ;;
     all)
-      echo "gateway supervisor"
+      echo "gateway sandbox supervisor"
       ;;
     *)
       usage
@@ -103,14 +106,19 @@ components_for_target() {
 resolve_component() {
   case "$1" in
     gateway)
-      crate=openshell-server
+      crate=openshell-gateway
       binary=openshell-gateway
       target_libc=gnu
       ;;
-    supervisor)
+    sandbox)
       crate=openshell-sandbox
       binary=openshell-sandbox
       target_libc=musl
+      ;;
+    supervisor)
+      crate=openshell-supervisor
+      binary=openshell-supervisor
+      target_libc=gnu
       ;;
     *)
       echo "unsupported binary component: $1" >&2
@@ -128,7 +136,9 @@ patch_workspace_version() {
   cargo_toml_backup="$(mktemp)"
   cp "$cargo_toml" "$cargo_toml_backup"
   restore_cargo_toml=1
-  sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' "$cargo_toml"
+  sed -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' \
+    "$cargo_toml" >"${cargo_toml}.updated"
+  mv "${cargo_toml}.updated" "$cargo_toml"
 }
 
 restore_workspace_version() {
@@ -144,11 +154,14 @@ build_component_for_arch() {
   local target
   local stage
   local features
-  local cargo_subcommand
+  local -a cargo_subcommand
+  local -a cargo_env
   local build_target
   local current_host_os
   local current_host_arch
   local binary_path
+  local cargo_output_dir
+  local build_rustflags
 
   resolve_component "$component"
   target="$(target_triple "$arch" "$target_libc")"
@@ -161,9 +174,11 @@ build_component_for_arch() {
   current_host_arch="$(host_arch)"
 
   cargo_subcommand=(cargo build)
+  cargo_env=()
   build_target="$target"
+  build_rustflags="${RUSTFLAGS:-}"
 
-  if [[ "$component" == "gateway" ]]; then
+  if [[ "$target_libc" == "gnu" ]]; then
     if has_cargo_zigbuild; then
       cargo_subcommand=(cargo zigbuild)
       build_target="${target}.2.28"
@@ -184,7 +199,14 @@ build_component_for_arch() {
     fi
   fi
 
-  echo "Building ${binary} for linux/${arch} (${build_target})..."
+  if [[ "${OPENSHELL_AUDITABLE:-0}" == "1" ]]; then
+    cargo_subcommand=("${cargo_subcommand[0]}" auditable "${cargo_subcommand[@]:1}")
+    # mise.toml injects RUSTC_WRAPPER=sccache. Unset it after mise constructs
+    # the environment so it cannot wrap cargo-auditable's workspace wrapper.
+    cargo_env=(env -u RUSTC_WRAPPER)
+  fi
+
+  echo "Building ${binary} for linux/${arch} (${build_target}, libc: ${target_libc})..."
   mise x -- rustup target add "$target" >/dev/null 2>&1 || true
 
   args=(
@@ -199,18 +221,24 @@ build_component_for_arch() {
 
   (
     cd "$ROOT"
-    if [[ "$component" == "gateway" ]]; then
+    if [[ "$target_libc" == "gnu" ]]; then
       eval "$("$SCRIPT_DIR/setup-zig-cc-wrapper.sh" "$build_target" "$build_target" "$ROOT/target/zig-gnu-wrapper/$arch")"
     fi
     if [[ -n "${OPENSHELL_CARGO_VERSION:-}" ]]; then
       export GIT_DIR=/nonexistent
     fi
-    CARGO_INCREMENTAL=0 mise x -- "${cargo_subcommand[@]}" "${args[@]}"
+    if [[ -n "$build_rustflags" ]]; then
+      export RUSTFLAGS="$build_rustflags"
+    fi
+    CARGO_INCREMENTAL=0 mise x -- ${cargo_env[@]+"${cargo_env[@]}"} "${cargo_subcommand[@]}" "${args[@]}"
   )
 
-  binary_path="${ROOT}/target/${target}/release/${binary}"
-  if [[ "$component" == "gateway" ]]; then
+  cargo_output_dir="$(cd "$ROOT" && mise x -- cargo metadata --format-version=1 --no-deps | jq -er '.target_directory')"
+  binary_path="${cargo_output_dir}/${target}/release/${binary}"
+  if [[ "$target_libc" == "gnu" ]]; then
     "$SCRIPT_DIR/verify-glibc-symbols.sh" 2.28 "$binary_path"
+  else
+    "$SCRIPT_DIR/verify-static-binary.sh" "$binary_path"
   fi
 
   mkdir -p "$stage"
@@ -227,8 +255,21 @@ if [[ "$#" -gt 0 ]]; then
   exit 1
 fi
 
+case "${OPENSHELL_AUDITABLE:-0}" in
+  0|1) ;;
+  *)
+    echo "unsupported OPENSHELL_AUDITABLE: ${OPENSHELL_AUDITABLE} (expected 0 or 1)" >&2
+    exit 1
+    ;;
+esac
+
 restore_cargo_toml=0
 trap restore_workspace_version EXIT
+
+# Raise the open-file limit before any host cargo-zigbuild cross-compile. This
+# single chokepoint covers the docker, podman, and all docker:*/multiarch host
+# staging paths. No-op on Linux and when cargo-zigbuild is absent.
+ensure_build_nofile_limit
 
 patch_workspace_version
 

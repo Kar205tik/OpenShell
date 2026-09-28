@@ -65,11 +65,11 @@ On first start, the gateway automatically generates:
 
 - A self-signed PKI bundle (CA, server cert, client cert) for mTLS
 
-> **Note:** The RPM default configuration binds to `0.0.0.0:17670` so
-> Podman sandbox containers can reach the gateway over the host network
-> bridge. Mutual TLS (mTLS) is enabled automatically on first start,
-> requiring a valid client certificate for every connection. See
-> CONFIGURATION.md for details.
+> **Note:** The primary gateway listener uses the loopback default,
+> `127.0.0.1:17670`. Host-networked Podman supervisors use this same listener.
+> Mutual TLS (mTLS) is
+> enabled automatically on first start, requiring a valid client certificate
+> for every connection. See CONFIGURATION.md for details.
 
 Verify the service is running:
 
@@ -144,13 +144,15 @@ openshell provider create --name openai --type openai \
 openshell provider list
 ```
 
-## Configure inference routing (optional)
+## Configure provider-backed inference (optional)
 
-To route inference requests through a specific provider and model:
+To grant a sandbox access to a model provider:
 
 ```shell
-openshell inference set --provider openai --model gpt-4
-openshell inference get
+openshell sandbox provider attach <sandbox> openai
+
+# Configure the workload to call the provider's native endpoint and select
+# the model in the client.
 ```
 
 ## Next steps

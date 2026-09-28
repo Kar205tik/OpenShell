@@ -11,6 +11,11 @@ persisted sandbox spec environment map.
 
 from __future__ import annotations
 
+import json
+import socket
+import subprocess
+import sys
+import textwrap
 import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
@@ -23,7 +28,7 @@ from openshell._proto import datamodel_pb2, openshell_pb2, sandbox_pb2
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-    from openshell import Sandbox, SandboxClient
+    from openshell import Sandbox, SandboxClient, WorkspaceClient
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +44,7 @@ def _is_placeholder_for_env_key(value: str, key: str) -> bool:
     token = value.removeprefix(prefix)
     if token == value:
         return False
-    return token.startswith("v") and token.endswith(f"_{key}")
+    return token.startswith(("v", "s")) and token.endswith(f"_{key}")
 
 
 def _default_policy() -> sandbox_pb2.SandboxPolicy:
@@ -70,16 +75,19 @@ def provider(
     name: str,
     provider_type: str,
     credentials: dict[str, str],
+    profile_workspace: str = "",
 ) -> Iterator[str]:
     """Create a provider for the duration of the block, then delete it."""
     _delete_provider(stub, name)
     stub.CreateProvider(
         openshell_pb2.CreateProviderRequest(
+            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             provider=datamodel_pb2.Provider(
                 metadata=datamodel_pb2.ObjectMeta(name=name),
                 type=provider_type,
                 credentials=credentials,
-            )
+                profile_workspace=profile_workspace,
+            ),
         )
     )
     try:
@@ -91,12 +99,189 @@ def provider(
 def _delete_provider(stub: object, name: str) -> None:
     """Delete a provider, ignoring not-found errors."""
     try:
-        stub.DeleteProvider(openshell_pb2.DeleteProviderRequest(name=name))
+        stub.DeleteProvider(
+            openshell_pb2.DeleteProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                name=name,
+            )
+        )
     except grpc.RpcError as exc:
         if hasattr(exc, "code") and exc.code() == grpc.StatusCode.NOT_FOUND:
             pass
         else:
             raise
+
+
+def _delete_provider_profile(stub: object, profile_id: str) -> None:
+    """Delete a provider profile, ignoring not-found errors."""
+    try:
+        stub.DeleteProviderProfile(
+            openshell_pb2.DeleteProviderProfileRequest(
+                id=profile_id,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+            )
+        )
+    except grpc.RpcError as exc:
+        if hasattr(exc, "code") and exc.code() == grpc.StatusCode.NOT_FOUND:
+            pass
+        else:
+            raise
+
+
+@contextmanager
+def imported_provider_profile(
+    stub: object,
+    *,
+    profile: openshell_pb2.ProviderProfile,
+    source: str,
+) -> Iterator[str]:
+    """Import a workspace-scoped provider profile for the duration of the block."""
+    _delete_provider_profile(stub, profile.id)
+    response = stub.ImportProviderProfiles(
+        openshell_pb2.ImportProviderProfilesRequest(
+            profiles=[
+                openshell_pb2.ProviderProfileImportItem(
+                    profile=profile,
+                    source=source,
+                )
+            ],
+            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+        )
+    )
+    assert response.imported, f"profile import failed: {response.diagnostics!r}"
+    try:
+        yield profile.id
+    finally:
+        _delete_provider_profile(stub, profile.id)
+
+
+def _native_inference_profile(
+    *,
+    profile_id: str,
+    env_var: str,
+    port: int,
+    rules: list[sandbox_pb2.L7Rule],
+    auth_style: str = "bearer",
+    header_name: str = "authorization",
+) -> openshell_pb2.ProviderProfile:
+    return openshell_pb2.ProviderProfile(
+        id=profile_id,
+        display_name=f"{profile_id} display",
+        description="E2E imported inference profile fixture",
+        category=openshell_pb2.PROVIDER_PROFILE_CATEGORY_INFERENCE,
+        inference_capable=True,
+        credentials=[
+            openshell_pb2.ProviderProfileCredential(
+                name="api_key",
+                description="API key",
+                env_vars=[env_var],
+                required=True,
+                auth_style=auth_style,
+                header_name=header_name,
+            )
+        ],
+        endpoints=[
+            sandbox_pb2.NetworkEndpoint(
+                host="host.openshell.internal",
+                port=port,
+                protocol="rest",
+                tls=sandbox_pb2.NETWORK_TLS_MODE_UNSPECIFIED,
+                enforcement=sandbox_pb2.NETWORK_ENFORCEMENT_MODE_ENFORCE,
+                rules=rules,
+                allowed_ips=[
+                    "10.0.0.0/8",
+                    "172.16.0.0/12",
+                    "192.168.0.0/16",
+                    "fc00::/7",
+                ],
+            )
+        ],
+        binaries=[
+            sandbox_pb2.NetworkBinary(path="/usr/bin/python*"),
+            sandbox_pb2.NetworkBinary(path="/usr/local/bin/python*"),
+            sandbox_pb2.NetworkBinary(path="/sandbox/.uv/python/**/python*"),
+        ],
+    )
+
+
+@contextmanager
+def native_endpoint_server() -> Iterator[int]:
+    """Start a small host-side HTTP fixture that echoes auth and request data."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+
+    script = textwrap.dedent(
+        """
+        import json
+        import sys
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        PORT = int(sys.argv[1])
+
+        class Handler(BaseHTTPRequestHandler):
+            def _reply(self):
+                content_length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(content_length) if content_length else b""
+                payload = {
+                    "method": self.command,
+                    "path": self.path,
+                    "authorization": self.headers.get("Authorization"),
+                    "x_api_key": self.headers.get("x-api-key"),
+                    "body": body.decode("utf-8"),
+                }
+                encoded = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def do_GET(self):
+                self._reply()
+
+            def do_POST(self):
+                self._reply()
+
+            def log_message(self, fmt, *args):
+                pass
+
+        ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+        """
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script, str(port)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            stdout, stderr = proc.communicate(timeout=5)
+            raise RuntimeError(
+                "native endpoint fixture exited early: "
+                f"stdout={stdout!r} stderr={stderr!r}"
+            )
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                break
+        except OSError:
+            time.sleep(0.2)
+    else:
+        proc.kill()
+        stdout, stderr = proc.communicate(timeout=5)
+        raise RuntimeError(
+            "native endpoint fixture did not become ready: "
+            f"stdout={stdout!r} stderr={stderr!r}"
+        )
+
+    try:
+        yield port
+    finally:
+        proc.kill()
+        proc.communicate(timeout=5)
 
 
 # ===========================================================================
@@ -112,7 +297,7 @@ def test_provider_credentials_available_as_env_vars(
     with provider(
         sandbox_client._stub,
         name="e2e-test-provider-env",
-        provider_type="claude",
+        provider_type="claude-code",
         credentials={"ANTHROPIC_API_KEY": "sk-e2e-test-key-12345"},
     ) as provider_name:
         spec = datamodel_pb2.SandboxSpec(
@@ -133,38 +318,98 @@ def test_provider_credentials_available_as_env_vars(
             assert value != "sk-e2e-test-key-12345"
 
 
-def test_generic_provider_credentials_available_as_env_vars(
+def test_profileless_provider_creation_is_rejected(
+    sandbox_client: SandboxClient,
+) -> None:
+    """New providers must reference a built-in or imported profile."""
+    with pytest.raises(grpc.RpcError) as exc_info:
+        sandbox_client._stub.CreateProvider(
+            openshell_pb2.CreateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                provider=datamodel_pb2.Provider(
+                    metadata=datamodel_pb2.ObjectMeta(
+                        name="e2e-test-profileless-provider"
+                    ),
+                    type="generic",
+                    credentials={"CUSTOM_SERVICE_TOKEN": "token-generic-123"},
+                ),
+            )
+        )
+    assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "provider profile 'generic' was not found" in exc_info.value.details()
+
+
+def test_endpointless_profile_credentials_fail_closed_without_policy_binding(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
 ) -> None:
-    """Generic provider env vars are placeholders, not raw secrets."""
+    """Endpointless profile credentials are withheld without an explicit binding."""
     with provider(
         sandbox_client._stub,
-        name="e2e-test-generic-provider-env",
-        provider_type="generic",
-        credentials={
-            "CUSTOM_SERVICE_TOKEN": "token-generic-123",
-            "CUSTOM_SERVICE_URL": "https://internal.example.test/api",
-        },
+        name="e2e-test-google-cloud-without-policy-binding",
+        provider_type="google-cloud",
+        credentials={"GCP_ADC_ACCESS_TOKEN": "gcp-e2e-token"},
     ) as provider_name:
         spec = datamodel_pb2.SandboxSpec(
             policy=_default_policy(),
             providers=[provider_name],
         )
 
-        def read_generic_env_vars() -> str:
+        def read_gcp_token() -> str:
             import os
 
-            token = os.environ.get("CUSTOM_SERVICE_TOKEN", "NOT_SET")
-            url = os.environ.get("CUSTOM_SERVICE_URL", "NOT_SET")
-            return f"{token}|{url}"
+            return os.environ.get("GCP_ADC_ACCESS_TOKEN", "NOT_SET")
 
         with sandbox(spec=spec, delete_on_exit=True) as sb:
-            result = sb.exec_python(read_generic_env_vars)
+            result = sb.exec_python(read_gcp_token)
             assert result.exit_code == 0, result.stderr
-            token, url = result.stdout.strip().split("|")
-            assert _is_placeholder_for_env_key(token, "CUSTOM_SERVICE_TOKEN")
-            assert _is_placeholder_for_env_key(url, "CUSTOM_SERVICE_URL")
+            assert result.stdout.strip() == "NOT_SET"
+
+
+def test_endpointless_profile_credentials_use_explicit_policy_binding(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    """An endpointless profile emits credentials only with an explicit binding."""
+    with provider(
+        sandbox_client._stub,
+        name="e2e-test-google-cloud-policy-binding",
+        provider_type="google-cloud",
+        credentials={"GCP_ADC_ACCESS_TOKEN": "gcp-e2e-token"},
+    ) as provider_name:
+        policy = _default_policy()
+        policy.network_policies["gcp_storage"].CopyFrom(
+            sandbox_pb2.NetworkPolicyRule(
+                name="gcp_storage",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host="storage.googleapis.com",
+                        port=443,
+                        protocol="rest",
+                        access=sandbox_pb2.NETWORK_ACCESS_PRESET_FULL,
+                        credential_binding=sandbox_pb2.NetworkCredentialBinding(
+                            provider=provider_name
+                        ),
+                    )
+                ],
+            )
+        )
+        spec = datamodel_pb2.SandboxSpec(
+            policy=policy,
+            providers=[provider_name],
+        )
+
+        def read_gcp_token() -> str:
+            import os
+
+            return os.environ.get("GCP_ADC_ACCESS_TOKEN", "NOT_SET")
+
+        with sandbox(spec=spec, delete_on_exit=True) as sb:
+            result = sb.exec_python(read_gcp_token)
+            assert result.exit_code == 0, result.stderr
+            assert _is_placeholder_for_env_key(
+                result.stdout.strip(), "GCP_ADC_ACCESS_TOKEN"
+            )
 
 
 def test_nvidia_provider_injects_nvidia_api_key_env_var(
@@ -191,9 +436,7 @@ def test_nvidia_provider_injects_nvidia_api_key_env_var(
         with sandbox(spec=spec, delete_on_exit=True) as sb:
             result = sb.exec_python(read_nvidia_key)
             assert result.exit_code == 0, result.stderr
-            assert _is_placeholder_for_env_key(
-                result.stdout.strip(), "NVIDIA_API_KEY"
-            )
+            assert _is_placeholder_for_env_key(result.stdout.strip(), "NVIDIA_API_KEY")
 
 
 def test_attach_detach_updates_credentials_for_later_exec_launches(
@@ -207,15 +450,15 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
     with provider(
         stub,
         name=provider_name,
-        provider_type="generic",
-        credentials={"CUSTOM_ATTACH_TOKEN": "token-attach-detach"},
+        provider_type="nvidia",
+        credentials={"NVIDIA_API_KEY": "token-attach-detach"},
     ):
         spec = datamodel_pb2.SandboxSpec(policy=_default_policy(), providers=[])
 
         def read_attach_token() -> str:
             import os
 
-            return os.environ.get("CUSTOM_ATTACH_TOKEN", "NOT_SET")
+            return os.environ.get("NVIDIA_API_KEY", "NOT_SET")
 
         def exec_token(sb: Sandbox) -> str:
             result = sb.exec_python(read_attach_token)
@@ -230,7 +473,7 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
                 if expected == "NOT_SET":
                     matched = last == expected
                 else:
-                    matched = _is_placeholder_for_env_key(last, "CUSTOM_ATTACH_TOKEN")
+                    matched = _is_placeholder_for_env_key(last, "NVIDIA_API_KEY")
                 if matched:
                     return
                 time.sleep(2)
@@ -242,19 +485,25 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
             try:
                 stub.AttachSandboxProvider(
                     openshell_pb2.AttachSandboxProviderRequest(
-                        sandbox_name=sb.sandbox.name,
-                        provider_name=provider_name,
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            workspace="default"
+                        ),
+                        sandbox=sb.sandbox.name,
+                        provider=provider_name,
                     )
                 )
                 wait_for_token(
                     sb,
-                    "openshell:resolve:env:CUSTOM_ATTACH_TOKEN",
+                    "openshell:resolve:env:NVIDIA_API_KEY",
                 )
 
                 stub.DetachSandboxProvider(
                     openshell_pb2.DetachSandboxProviderRequest(
-                        sandbox_name=sb.sandbox.name,
-                        provider_name=provider_name,
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            workspace="default"
+                        ),
+                        sandbox=sb.sandbox.name,
+                        provider=provider_name,
                     )
                 )
                 wait_for_token(sb, "NOT_SET")
@@ -262,13 +511,192 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
                 try:
                     stub.DetachSandboxProvider(
                         openshell_pb2.DetachSandboxProviderRequest(
-                            sandbox_name=sb.sandbox.name,
-                            provider_name=provider_name,
+                            workspace_scope=datamodel_pb2.WorkspaceSelector(
+                                workspace="default"
+                            ),
+                            sandbox=sb.sandbox.name,
+                            provider=provider_name,
                         )
                     )
                 except grpc.RpcError as exc:
                     if exc.code() != grpc.StatusCode.NOT_FOUND:
                         raise
+
+
+def test_imported_openai_profile_allows_native_endpoint_with_attached_provider(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    """Imported fixture profiles should support native OpenAI-style access."""
+    stub = sandbox_client._stub
+    profile_id = f"e2e-native-openai-{int(time.time() * 1000)}"
+    provider_name = f"{profile_id}-provider"
+    secret = "sk-native-openai-secret"
+
+    profile = _native_inference_profile(
+        profile_id=profile_id,
+        env_var="OPENAI_API_KEY",
+        port=0,
+        rules=[
+            sandbox_pb2.L7Rule(
+                allow=sandbox_pb2.L7Allow(
+                    method="POST",
+                    path="/v1/chat/completions",
+                )
+            )
+        ],
+    )
+
+    def call_native_openai(host: str, port: int) -> str:
+        import json
+        import os
+        import urllib.error
+        import urllib.request
+
+        body = json.dumps(
+            {
+                "model": "fixture-openai-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            }
+        ).encode()
+        request = urllib.request.Request(
+            f"http://{host}:{port}/v1/chat/completions",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.read().decode()
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(
+                f"native OpenAI request failed with {exc.code}: "
+                f"{exc.read().decode(errors='replace')}"
+            ) from exc
+
+    with native_endpoint_server() as port:
+        profile.endpoints[0].port = port
+        with imported_provider_profile(
+            stub,
+            profile=profile,
+            source=f"{profile_id}.yaml",
+        ):
+            with provider(
+                stub,
+                name=provider_name,
+                provider_type=profile_id,
+                credentials={"OPENAI_API_KEY": secret},
+                profile_workspace="default",
+            ) as attached_provider:
+                spec = datamodel_pb2.SandboxSpec(
+                    policy=_default_policy(),
+                    providers=[attached_provider],
+                )
+                with sandbox(spec=spec, delete_on_exit=True) as sb:
+                    result = sb.exec_python(
+                        call_native_openai,
+                        args=("host.openshell.internal", port),
+                        timeout_seconds=60,
+                    )
+                    assert result.exit_code == 0, result.stderr
+                    payload = json.loads(result.stdout)
+                    body = json.loads(payload["body"])
+                    assert payload["method"] == "POST"
+                    assert payload["path"] == "/v1/chat/completions"
+                    assert payload["authorization"] == f"Bearer {secret}"
+                    assert body["model"] == "fixture-openai-model"
+
+
+def test_imported_anthropic_profile_allows_native_endpoint_with_attached_provider(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    stub = sandbox_client._stub
+    profile_id = f"e2e-native-anthropic-{int(time.time() * 1000)}"
+    provider_name = f"{profile_id}-provider"
+    secret = "sk-native-anthropic-secret"
+
+    profile = _native_inference_profile(
+        profile_id=profile_id,
+        env_var="ANTHROPIC_API_KEY",
+        port=0,
+        rules=[
+            sandbox_pb2.L7Rule(
+                allow=sandbox_pb2.L7Allow(
+                    method="POST",
+                    path="/v1/messages",
+                )
+            )
+        ],
+        auth_style="header",
+        header_name="x-api-key",
+    )
+
+    def call_native_anthropic(host: str, port: int) -> str:
+        import json
+        import os
+        import urllib.error
+        import urllib.request
+
+        body = json.dumps(
+            {
+                "model": "fixture-anthropic-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            }
+        ).encode()
+        request = urllib.request.Request(
+            f"http://{host}:{port}/v1/messages",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.read().decode()
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(
+                f"native Anthropic request failed with {exc.code}: "
+                f"{exc.read().decode(errors='replace')}"
+            ) from exc
+
+    with native_endpoint_server() as port:
+        profile.endpoints[0].port = port
+        with imported_provider_profile(
+            stub,
+            profile=profile,
+            source=f"{profile_id}.yaml",
+        ):
+            with provider(
+                stub,
+                name=provider_name,
+                provider_type=profile_id,
+                credentials={"ANTHROPIC_API_KEY": secret},
+                profile_workspace="default",
+            ) as attached_provider:
+                spec = datamodel_pb2.SandboxSpec(
+                    policy=_default_policy(),
+                    providers=[attached_provider],
+                )
+                with sandbox(spec=spec, delete_on_exit=True) as sb:
+                    native_result = sb.exec_python(
+                        call_native_anthropic,
+                        args=("host.openshell.internal", port),
+                        timeout_seconds=60,
+                    )
+                    assert native_result.exit_code == 0, native_result.stderr
+                    payload = json.loads(native_result.stdout)
+                    body = json.loads(payload["body"])
+                    assert payload["method"] == "POST"
+                    assert payload["path"] == "/v1/messages"
+                    assert payload["x_api_key"] == secret
+                    assert body["model"] == "fixture-anthropic-model"
 
 
 # ===========================================================================
@@ -285,7 +713,7 @@ def test_create_sandbox_rejects_unknown_provider(
         providers=["nonexistent-provider-xyz"],
     )
     with pytest.raises(grpc.RpcError) as exc_info:
-        sandbox_client.create(spec=spec)
+        sandbox_client.create(workspace="default", spec=spec)
 
     assert exc_info.value.code() == grpc.StatusCode.FAILED_PRECONDITION
     assert "nonexistent-provider-xyz" in (exc_info.value.details() or "")
@@ -299,7 +727,7 @@ def test_credentials_not_in_persisted_spec_environment(
     with provider(
         sandbox_client._stub,
         name="e2e-test-no-persist",
-        provider_type="claude",
+        provider_type="claude-code",
         credentials={"ANTHROPIC_API_KEY": "sk-should-not-persist"},
     ) as provider_name:
         spec = datamodel_pb2.SandboxSpec(
@@ -309,7 +737,12 @@ def test_credentials_not_in_persisted_spec_environment(
 
         with sandbox(spec=spec, delete_on_exit=True) as sb:
             fetched = sandbox_client._stub.GetSandbox(
-                openshell_pb2.GetSandboxRequest(name=sb.sandbox.name)
+                openshell_pb2.GetSandboxRequest(
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(
+                        workspace="default"
+                    ),
+                    name=sb.sandbox.name,
+                )
             )
             persisted_env = dict(fetched.sandbox.spec.environment)
             assert "ANTHROPIC_API_KEY" not in persisted_env, (
@@ -333,26 +766,37 @@ def test_update_provider_preserves_unset_credentials_and_config(
     try:
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
-                    type="generic",
-                    credentials={"KEY_A": "val-a", "KEY_B": "val-b"},
+                    type="codex",
+                    credentials={
+                        "CODEX_AUTH_ACCESS_TOKEN": "val-a",
+                        "CODEX_AUTH_REFRESH_TOKEN": "val-b",
+                        "CODEX_AUTH_ACCOUNT_ID": "account-id",
+                    },
                     config={"BASE_URL": "https://example.com"},
-                )
+                ),
             )
         )
 
         stub.UpdateProvider(
             openshell_pb2.UpdateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="",
-                    credentials={"KEY_A": "rotated-a"},
-                )
+                    credentials={"CODEX_AUTH_ACCESS_TOKEN": "rotated-a"},
+                ),
             )
         )
 
-        got = stub.GetProvider(openshell_pb2.GetProviderRequest(name=name))
+        got = stub.GetProvider(
+            openshell_pb2.GetProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                name=name,
+            )
+        )
         p = got.provider
         # Credential keys are preserved but values are redacted.
         assert len(p.credentials) > 0, "credential keys should be preserved"
@@ -378,25 +822,32 @@ def test_update_provider_empty_maps_preserves_all(
     try:
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
-                    type="generic",
-                    credentials={"TOKEN": "secret"},
+                    type="openai",
+                    credentials={"OPENAI_API_KEY": "secret"},
                     config={"URL": "https://api.example.com"},
-                )
+                ),
             )
         )
 
         stub.UpdateProvider(
             openshell_pb2.UpdateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="",
-                )
+                ),
             )
         )
 
-        got = stub.GetProvider(openshell_pb2.GetProviderRequest(name=name))
+        got = stub.GetProvider(
+            openshell_pb2.GetProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                name=name,
+            )
+        )
         p = got.provider
         # Credential keys are preserved but values are redacted.
         assert len(p.credentials) > 0, "credential keys should be preserved"
@@ -420,26 +871,33 @@ def test_update_provider_merges_config_preserves_credentials(
     try:
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
-                    type="generic",
-                    credentials={"API_KEY": "original-key"},
+                    type="openai",
+                    credentials={"OPENAI_API_KEY": "original-key"},
                     config={"ENDPOINT": "https://old.example.com"},
-                )
+                ),
             )
         )
 
         stub.UpdateProvider(
             openshell_pb2.UpdateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="",
                     config={"ENDPOINT": "https://new.example.com"},
-                )
+                ),
             )
         )
 
-        got = stub.GetProvider(openshell_pb2.GetProviderRequest(name=name))
+        got = stub.GetProvider(
+            openshell_pb2.GetProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                name=name,
+            )
+        )
         p = got.provider
         # Credential keys are preserved but values are redacted.
         assert len(p.credentials) > 0, "credential keys should be preserved"
@@ -463,24 +921,243 @@ def test_update_provider_rejects_type_change(
     try:
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
-                    type="generic",
-                    credentials={"KEY": "val"},
-                )
+                    type="openai",
+                    credentials={"OPENAI_API_KEY": "val"},
+                ),
             )
         )
 
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.UpdateProvider(
                 openshell_pb2.UpdateProviderRequest(
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(
+                        workspace="default"
+                    ),
                     provider=datamodel_pb2.Provider(
                         metadata=datamodel_pb2.ObjectMeta(name=name),
                         type="nvidia",
-                    )
+                    ),
                 )
             )
         assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
         assert "type cannot be changed" in exc_info.value.details()
     finally:
         _delete_provider(stub, name)
+
+
+# ===========================================================================
+# Tests: git transport network policy
+# ===========================================================================
+
+
+def test_github_provider_allows_https_git_clone(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    """Built-in github provider permits anonymous HTTPS clone/fetch (#1769).
+
+    Git smart HTTP clone/fetch issues a POST to ``*/git-upload-pack``. The
+    read-only preset (GET/HEAD/OPTIONS) denied that POST, so ``git clone`` over
+    HTTPS failed. Attaching the github provider composes its network policy onto
+    the sandbox, exercising provider attachment, effective-policy composition,
+    TLS interception, and real git behavior end to end. git delegates HTTPS to a
+    ``git-remote-https`` helper whose ancestor is ``/usr/bin/git``, so the
+    profile's git binary covers it via ancestor matching.
+    """
+    with provider(
+        sandbox_client._stub,
+        name="e2e-test-github-clone",
+        provider_type="github",
+        # A required credential value is needed to create the provider, but an
+        # anonymous clone of a public repo never uses it: git only sends the
+        # token when a credential helper is configured.
+        credentials={"GITHUB_TOKEN": "e2e-placeholder-unused"},
+    ) as provider_name:
+        # git opens /dev/null O_RDWR, so it must be read-write; the shared
+        # _default_policy only grants /dev/urandom. Everything else (binaries,
+        # CA bundle, clone target) is covered by the standard allowlist.
+        policy = _default_policy()
+        policy.filesystem.read_write.append("/dev/null")
+        spec = datamodel_pb2.SandboxSpec(
+            policy=policy,
+            providers=[provider_name],
+        )
+
+        with sandbox(spec=spec, delete_on_exit=True) as sb:
+            clone = sb.exec(
+                [
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    "https://github.com/octocat/Hello-World.git",
+                    "/tmp/hello-world",
+                ],
+                timeout_seconds=120,
+            )
+            assert clone.exit_code == 0, (
+                "git clone over HTTPS should succeed with the github provider "
+                f"attached; stdout={clone.stdout!r} stderr={clone.stderr!r}"
+            )
+
+            # A completed clone materializes .git/HEAD, proving ref discovery
+            # (GET) and upload-pack (POST) both succeeded, not just a handshake.
+            head = sb.exec(["cat", "/tmp/hello-world/.git/HEAD"])
+            assert head.exit_code == 0, (
+                f"cloned repo is missing .git/HEAD; stderr={head.stderr!r}"
+            )
+
+
+# ===========================================================================
+# Tests: provider profile platform vs workspace scope isolation
+# ===========================================================================
+
+
+def test_provider_profile_platform_vs_workspace_isolation(
+    sandbox_client: "SandboxClient",
+) -> None:
+    """Platform-scoped profiles are visible in workspace listings; workspace profiles are not visible in platform listings."""
+    stub = sandbox_client._stub
+    platform_id = "e2e-platform-profile"
+    workspace_id = "e2e-workspace-profile"
+
+    def _make_profile(profile_id: str) -> openshell_pb2.ProviderProfileImportItem:
+        return openshell_pb2.ProviderProfileImportItem(
+            profile=openshell_pb2.ProviderProfile(
+                id=profile_id,
+                display_name=f"{profile_id} display",
+                category=openshell_pb2.PROVIDER_PROFILE_CATEGORY_OTHER,
+            ),
+            source=f"{profile_id}.yaml",
+        )
+
+    def _cleanup() -> None:
+        for pid, ws in [(platform_id, ""), (workspace_id, "default")]:
+            try:
+                request = openshell_pb2.DeleteProviderProfileRequest(id=pid)
+                if ws:
+                    request.workspace_scope.workspace = ws
+                stub.DeleteProviderProfile(request)
+            except grpc.RpcError:
+                pass
+
+    _cleanup()
+    try:
+        resp = stub.ImportProviderProfiles(
+            openshell_pb2.ImportProviderProfilesRequest(
+                profiles=[_make_profile(platform_id)],
+            )
+        )
+        assert resp.imported, "platform-scoped import should succeed"
+
+        resp = stub.ImportProviderProfiles(
+            openshell_pb2.ImportProviderProfilesRequest(
+                profiles=[_make_profile(workspace_id)],
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+            )
+        )
+        assert resp.imported, "workspace-scoped import should succeed"
+
+        platform_list = stub.ListProviderProfiles(
+            openshell_pb2.ListProviderProfilesRequest(page_size=200)
+        )
+        platform_ids = [p.id for p in platform_list.profiles]
+        assert platform_id in platform_ids, (
+            "platform profile should appear in platform list"
+        )
+        assert workspace_id not in platform_ids, (
+            "workspace profile should NOT appear in platform list"
+        )
+
+        workspace_list = stub.ListProviderProfiles(
+            openshell_pb2.ListProviderProfilesRequest(
+                page_size=200,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+            )
+        )
+        workspace_ids = [p.id for p in workspace_list.profiles]
+        assert workspace_id in workspace_ids, (
+            "workspace profile should appear in workspace list"
+        )
+        assert platform_id in workspace_ids, (
+            "platform profile should appear in workspace list (visible as fallback)"
+        )
+    finally:
+        _cleanup()
+
+
+def test_cross_workspace_profile_ids_do_not_collide(
+    sandbox_client: "SandboxClient",
+    workspace_client: "WorkspaceClient",
+) -> None:
+    """Same profile ID in two workspaces must not cause a catalog collision."""
+    import contextlib
+    import uuid
+
+    stub = sandbox_client._stub
+    profile_id = f"e2e-xws-{uuid.uuid4().hex[:8]}"
+    ws_a = f"ws-a-{uuid.uuid4().hex[:8]}"
+    ws_b = f"ws-b-{uuid.uuid4().hex[:8]}"
+
+    def _make_profile() -> openshell_pb2.ProviderProfileImportItem:
+        return openshell_pb2.ProviderProfileImportItem(
+            profile=openshell_pb2.ProviderProfile(
+                id=profile_id,
+                display_name=f"{profile_id} display",
+                category=openshell_pb2.PROVIDER_PROFILE_CATEGORY_OTHER,
+            ),
+            source=f"{profile_id}.yaml",
+        )
+
+    workspace_client.create(ws_a)
+    workspace_client.create(ws_b)
+    try:
+        resp_a = stub.ImportProviderProfiles(
+            openshell_pb2.ImportProviderProfilesRequest(
+                profiles=[_make_profile()],
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws_a),
+            )
+        )
+        assert resp_a.imported, "import into ws-a should succeed"
+
+        resp_b = stub.ImportProviderProfiles(
+            openshell_pb2.ImportProviderProfilesRequest(
+                profiles=[_make_profile()],
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws_b),
+            )
+        )
+        assert resp_b.imported, "import into ws-b should succeed"
+
+        list_a = stub.ListProviderProfiles(
+            openshell_pb2.ListProviderProfilesRequest(
+                page_size=200,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws_a),
+            )
+        )
+        assert any(p.id == profile_id for p in list_a.profiles), (
+            "profile should appear in ws-a"
+        )
+
+        list_b = stub.ListProviderProfiles(
+            openshell_pb2.ListProviderProfilesRequest(
+                page_size=200,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws_b),
+            )
+        )
+        assert any(p.id == profile_id for p in list_b.profiles), (
+            "profile should appear in ws-b"
+        )
+    finally:
+        for ws in [ws_a, ws_b]:
+            with contextlib.suppress(Exception):
+                stub.DeleteProviderProfile(
+                    openshell_pb2.DeleteProviderProfileRequest(
+                        id=profile_id,
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws),
+                    )
+                )
+            with contextlib.suppress(Exception):
+                workspace_client.delete(ws)

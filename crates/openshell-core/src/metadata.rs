@@ -6,8 +6,8 @@
 //! These traits provide uniform access to `ObjectMeta` fields across all resource types.
 
 use crate::proto::{
-    InferenceRoute, ObjectForTest, Provider, Sandbox, SandboxStatus, ServiceEndpoint, SshSession,
-    StoredProviderCredentialRefreshState, StoredProviderProfile,
+    ObjectForTest, Provider, Sandbox, SandboxStatus, SandboxWorkloadTemplate, ServiceEndpoint,
+    SshSession, Workspace, WorkspaceMember,
 };
 use std::collections::HashMap;
 
@@ -34,6 +34,12 @@ pub trait SetResourceVersion {
 /// Provides read access to the object's current resource version.
 pub trait GetResourceVersion {
     fn get_resource_version(&self) -> u64;
+}
+
+/// Provides access to the object's workspace for persistence scoping.
+pub trait ObjectWorkspace {
+    fn object_workspace(&self) -> &str;
+    fn requires_workspace() -> bool;
 }
 
 // Implementations for Sandbox
@@ -69,6 +75,15 @@ impl GetResourceVersion for Sandbox {
     }
 }
 
+impl ObjectWorkspace for Sandbox {
+    fn object_workspace(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
+    }
+    fn requires_workspace() -> bool {
+        true
+    }
+}
+
 impl Sandbox {
     pub fn phase(&self) -> i32 {
         self.status.as_ref().map_or(0, |s| s.phase)
@@ -86,6 +101,92 @@ impl Sandbox {
         self.status
             .get_or_insert_with(SandboxStatus::default)
             .current_policy_version = version;
+    }
+}
+
+// Implementations for SandboxWorkloadTemplate
+impl ObjectId for SandboxWorkloadTemplate {
+    fn object_id(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.id.as_str())
+    }
+}
+
+impl ObjectName for SandboxWorkloadTemplate {
+    fn object_name(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.name.as_str())
+    }
+}
+
+impl ObjectLabels for SandboxWorkloadTemplate {
+    fn object_labels(&self) -> Option<HashMap<String, String>> {
+        self.metadata.as_ref().map(|m| m.labels.clone())
+    }
+}
+
+impl SetResourceVersion for SandboxWorkloadTemplate {
+    fn set_resource_version(&mut self, version: u64) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.resource_version = version;
+        }
+    }
+}
+
+impl GetResourceVersion for SandboxWorkloadTemplate {
+    fn get_resource_version(&self) -> u64 {
+        self.metadata.as_ref().map_or(0, |m| m.resource_version)
+    }
+}
+
+impl ObjectWorkspace for SandboxWorkloadTemplate {
+    fn object_workspace(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
+    }
+
+    fn requires_workspace() -> bool {
+        true
+    }
+}
+
+// Implementations for Workspace
+impl ObjectId for Workspace {
+    fn object_id(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.id.as_str())
+    }
+}
+
+impl ObjectName for Workspace {
+    fn object_name(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.name.as_str())
+    }
+}
+
+impl ObjectLabels for Workspace {
+    fn object_labels(&self) -> Option<HashMap<String, String>> {
+        self.metadata.as_ref().map(|m| m.labels.clone())
+    }
+}
+
+impl SetResourceVersion for Workspace {
+    fn set_resource_version(&mut self, version: u64) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.resource_version = version;
+        }
+    }
+}
+
+impl GetResourceVersion for Workspace {
+    fn get_resource_version(&self) -> u64 {
+        self.metadata.as_ref().map_or(0, |m| m.resource_version)
+    }
+}
+
+impl ObjectWorkspace for Workspace {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn object_workspace(&self) -> &str {
+        ""
+    }
+    fn requires_workspace() -> bool {
+        false
     }
 }
 
@@ -122,69 +223,12 @@ impl GetResourceVersion for Provider {
     }
 }
 
-// Implementations for StoredProviderProfile
-impl ObjectId for StoredProviderProfile {
-    fn object_id(&self) -> &str {
-        self.metadata.as_ref().map_or("", |m| m.id.as_str())
+impl ObjectWorkspace for Provider {
+    fn object_workspace(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
     }
-}
-
-impl ObjectName for StoredProviderProfile {
-    fn object_name(&self) -> &str {
-        self.metadata.as_ref().map_or("", |m| m.name.as_str())
-    }
-}
-
-impl ObjectLabels for StoredProviderProfile {
-    fn object_labels(&self) -> Option<HashMap<String, String>> {
-        self.metadata.as_ref().map(|m| m.labels.clone())
-    }
-}
-
-impl SetResourceVersion for StoredProviderProfile {
-    fn set_resource_version(&mut self, version: u64) {
-        if let Some(meta) = self.metadata.as_mut() {
-            meta.resource_version = version;
-        }
-    }
-}
-
-impl GetResourceVersion for StoredProviderProfile {
-    fn get_resource_version(&self) -> u64 {
-        self.metadata.as_ref().map_or(0, |m| m.resource_version)
-    }
-}
-
-// Implementations for StoredProviderCredentialRefreshState
-impl ObjectId for StoredProviderCredentialRefreshState {
-    fn object_id(&self) -> &str {
-        self.metadata.as_ref().map_or("", |m| m.id.as_str())
-    }
-}
-
-impl ObjectName for StoredProviderCredentialRefreshState {
-    fn object_name(&self) -> &str {
-        self.metadata.as_ref().map_or("", |m| m.name.as_str())
-    }
-}
-
-impl ObjectLabels for StoredProviderCredentialRefreshState {
-    fn object_labels(&self) -> Option<HashMap<String, String>> {
-        self.metadata.as_ref().map(|m| m.labels.clone())
-    }
-}
-
-impl SetResourceVersion for StoredProviderCredentialRefreshState {
-    fn set_resource_version(&mut self, version: u64) {
-        if let Some(meta) = self.metadata.as_mut() {
-            meta.resource_version = version;
-        }
-    }
-}
-
-impl GetResourceVersion for StoredProviderCredentialRefreshState {
-    fn get_resource_version(&self) -> u64 {
-        self.metadata.as_ref().map_or(0, |m| m.resource_version)
+    fn requires_workspace() -> bool {
+        true
     }
 }
 
@@ -221,6 +265,15 @@ impl GetResourceVersion for SshSession {
     }
 }
 
+impl ObjectWorkspace for SshSession {
+    fn object_workspace(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
+    }
+    fn requires_workspace() -> bool {
+        true
+    }
+}
+
 // Implementations for ServiceEndpoint
 impl ObjectId for ServiceEndpoint {
     fn object_id(&self) -> &str {
@@ -254,26 +307,35 @@ impl GetResourceVersion for ServiceEndpoint {
     }
 }
 
-// Implementations for InferenceRoute
-impl ObjectId for InferenceRoute {
+impl ObjectWorkspace for ServiceEndpoint {
+    fn object_workspace(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
+    }
+    fn requires_workspace() -> bool {
+        true
+    }
+}
+
+// Implementations for WorkspaceMember
+impl ObjectId for WorkspaceMember {
     fn object_id(&self) -> &str {
         self.metadata.as_ref().map_or("", |m| m.id.as_str())
     }
 }
 
-impl ObjectName for InferenceRoute {
+impl ObjectName for WorkspaceMember {
     fn object_name(&self) -> &str {
         self.metadata.as_ref().map_or("", |m| m.name.as_str())
     }
 }
 
-impl ObjectLabels for InferenceRoute {
+impl ObjectLabels for WorkspaceMember {
     fn object_labels(&self) -> Option<HashMap<String, String>> {
         self.metadata.as_ref().map(|m| m.labels.clone())
     }
 }
 
-impl SetResourceVersion for InferenceRoute {
+impl SetResourceVersion for WorkspaceMember {
     fn set_resource_version(&mut self, version: u64) {
         if let Some(meta) = self.metadata.as_mut() {
             meta.resource_version = version;
@@ -281,9 +343,18 @@ impl SetResourceVersion for InferenceRoute {
     }
 }
 
-impl GetResourceVersion for InferenceRoute {
+impl GetResourceVersion for WorkspaceMember {
     fn get_resource_version(&self) -> u64 {
         self.metadata.as_ref().map_or(0, |m| m.resource_version)
+    }
+}
+
+impl ObjectWorkspace for WorkspaceMember {
+    fn object_workspace(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
+    }
+    fn requires_workspace() -> bool {
+        true
     }
 }
 
@@ -316,5 +387,15 @@ impl GetResourceVersion for ObjectForTest {
     fn get_resource_version(&self) -> u64 {
         // ObjectForTest doesn't have metadata
         0
+    }
+}
+
+impl ObjectWorkspace for ObjectForTest {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn object_workspace(&self) -> &str {
+        ""
+    }
+    fn requires_workspace() -> bool {
+        false
     }
 }

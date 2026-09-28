@@ -4,20 +4,23 @@
 //! Request validation helpers for the gRPC service.
 //!
 //! All functions in this module are pure — they take proto types or primitives
-//! and return `Result<(), Status>`.  No server state is required.
+//! and return validated values or `Status` errors. No server state is required.
 
 #![allow(clippy::result_large_err)] // Validation returns Result<_, Status>
 
 use openshell_core::proto::{
-    ExecSandboxRequest, Provider, SandboxPolicy as ProtoSandboxPolicy, SandboxTemplate,
+    CredentialHandle, ExecSandboxRequest, Provider, SandboxPolicy as ProtoSandboxPolicy,
+    SandboxSpec, SandboxTemplate,
 };
+use openshell_core::rpc_error::invalid_argument;
 use prost::Message;
 use tonic::Status;
 
 use super::{
-    MAX_ENVIRONMENT_ENTRIES, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN, MAX_NAME_LEN,
-    MAX_POLICY_SIZE, MAX_PROVIDER_CONFIG_ENTRIES, MAX_PROVIDER_CREDENTIALS_ENTRIES,
-    MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS, MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN,
+    MAX_ENVIRONMENT_ENTRIES, MAX_LABEL_SELECTOR_PAIRS, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN,
+    MAX_MAP_VALUE_LEN, MAX_METADATA_ANNOTATIONS_ENTRIES, MAX_NAME_LEN, MAX_POLICY_SIZE,
+    MAX_PROVIDER_CONFIG_ENTRIES, MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN,
+    MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN,
     MAX_TEMPLATE_STRUCT_SIZE,
 };
 
@@ -31,39 +34,50 @@ pub(super) const MAX_EXEC_COMMAND_ARGS: usize = 1024;
 pub(super) const MAX_EXEC_ARG_LEN: usize = 32 * 1024; // 32 KiB
 /// Maximum length of the workdir field (bytes).
 pub(super) const MAX_EXEC_WORKDIR_LEN: usize = 4096;
+/// Maximum number of entries in the canonical main-process argv.
+pub(super) const MAX_MAIN_PROCESS_ARGS: usize = 256;
+/// Maximum aggregate byte size of the canonical main-process argv.
+pub(super) const MAX_MAIN_PROCESS_ARGV_SIZE: usize = 256 * 1024;
 
 /// Validate exec request size limits and field-specific character constraints.
 ///
 /// Command arguments only reject NUL (newlines are valid for inline scripts).
 /// Environment values and workdir reject both NUL and newlines.
 pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(), Status> {
+    if req.sandbox.is_empty() {
+        return Err(Status::invalid_argument("sandbox is required"));
+    }
     if req.command.len() > MAX_EXEC_COMMAND_ARGS {
-        return Err(Status::invalid_argument(format!(
-            "command array exceeds {MAX_EXEC_COMMAND_ARGS} argument limit"
-        )));
+        return Err(invalid_argument(
+            "command",
+            format!("command array exceeds {MAX_EXEC_COMMAND_ARGS} argument limit"),
+        ));
     }
     for (i, arg) in req.command.iter().enumerate() {
         if arg.len() > MAX_EXEC_ARG_LEN {
-            return Err(Status::invalid_argument(format!(
-                "command argument {i} exceeds {MAX_EXEC_ARG_LEN} byte limit"
-            )));
+            return Err(invalid_argument(
+                &format!("command[{i}]"),
+                format!("command argument {i} exceeds {MAX_EXEC_ARG_LEN} byte limit"),
+            ));
         }
-        reject_null_char(arg, &format!("command argument {i}"))?;
+        reject_null_char(arg, &format!("command[{i}]"))?;
     }
     for (key, value) in &req.environment {
         if value.len() > MAX_EXEC_ARG_LEN {
-            return Err(Status::invalid_argument(format!(
-                "environment value for '{key}' exceeds {MAX_EXEC_ARG_LEN} byte limit"
-            )));
+            return Err(invalid_argument(
+                "environment",
+                format!("environment value for '{key}' exceeds {MAX_EXEC_ARG_LEN} byte limit"),
+            ));
         }
-        reject_control_chars(value, &format!("environment value for '{key}'"))?;
+        reject_control_chars(value, "environment")?;
     }
     validate_exec_env_entries(&req.environment, "environment")?;
     if !req.workdir.is_empty() {
         if req.workdir.len() > MAX_EXEC_WORKDIR_LEN {
-            return Err(Status::invalid_argument(format!(
-                "workdir exceeds {MAX_EXEC_WORKDIR_LEN} byte limit"
-            )));
+            return Err(invalid_argument(
+                "workdir",
+                format!("workdir exceeds {MAX_EXEC_WORKDIR_LEN} byte limit"),
+            ));
         }
         reject_control_chars(&req.workdir, "workdir")?;
     }
@@ -80,9 +94,10 @@ pub(super) fn reject_control_chars(value: &str, field_name: &str) -> Result<(), 
 /// Reject null bytes in a user-supplied value.
 pub(super) fn reject_null_char(value: &str, field_name: &str) -> Result<(), Status> {
     if value.bytes().any(|b| b == 0) {
-        return Err(Status::invalid_argument(format!(
-            "{field_name} contains null bytes"
-        )));
+        return Err(invalid_argument(
+            field_name,
+            format!("{field_name} contains null bytes"),
+        ));
     }
     Ok(())
 }
@@ -90,9 +105,56 @@ pub(super) fn reject_null_char(value: &str, field_name: &str) -> Result<(), Stat
 /// Reject newline and carriage return characters in a user-supplied value.
 pub(super) fn reject_newline_chars(value: &str, field_name: &str) -> Result<(), Status> {
     if value.bytes().any(|b| b == b'\n' || b == b'\r') {
-        return Err(Status::invalid_argument(format!(
-            "{field_name} contains newline or carriage return characters"
-        )));
+        return Err(invalid_argument(
+            field_name,
+            format!("{field_name} contains newline or carriage return characters"),
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// DNS-1123 label validation
+// ---------------------------------------------------------------------------
+
+/// Validate that a string conforms to DNS-1123 label rules: lowercase
+/// alphanumeric and hyphens, no leading/trailing hyphens, no consecutive
+/// hyphens, max 63 characters. `field` is used in error messages.
+///
+/// Empty names are allowed (the caller decides whether empty is valid).
+pub(super) fn validate_dns1123_label(name: &str, field: &str) -> Result<(), Status> {
+    if name.is_empty() {
+        return Ok(());
+    }
+    if name.len() > MAX_NAME_LEN {
+        return Err(invalid_argument(
+            field,
+            format!(
+                "{field} exceeds maximum length ({} > {MAX_NAME_LEN})",
+                name.len()
+            ),
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(invalid_argument(
+            field,
+            format!("{field} must contain only lowercase alphanumeric characters or hyphens"),
+        ));
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        return Err(invalid_argument(
+            field,
+            format!("{field} must not start or end with a hyphen"),
+        ));
+    }
+    if name.contains("--") {
+        return Err(invalid_argument(
+            field,
+            format!("{field} must not contain consecutive hyphens"),
+        ));
     }
     Ok(())
 }
@@ -104,32 +166,22 @@ pub(super) fn reject_newline_chars(value: &str, field_name: &str) -> Result<(), 
 /// Validate field sizes on a `CreateSandboxRequest` before persisting.
 ///
 /// Returns `INVALID_ARGUMENT` on the first field that exceeds its limit.
-pub(super) fn validate_sandbox_spec(
-    name: &str,
-    spec: &openshell_core::proto::SandboxSpec,
-) -> Result<(), Status> {
+pub(super) fn validate_sandbox_spec(name: &str, spec: &SandboxSpec) -> Result<(), Status> {
     // --- request.name ---
-    if name.len() > MAX_NAME_LEN {
-        return Err(Status::invalid_argument(format!(
-            "name exceeds maximum length ({} > {MAX_NAME_LEN})",
-            name.len()
-        )));
-    }
+    validate_sandbox_name(name)?;
 
     // --- spec.providers ---
-    if spec.providers.len() > MAX_PROVIDERS {
-        return Err(Status::invalid_argument(format!(
-            "providers list exceeds maximum ({} > {MAX_PROVIDERS})",
-            spec.providers.len()
-        )));
-    }
+    validate_sandbox_provider_count(spec)?;
 
     // --- spec.log_level ---
     if spec.log_level.len() > MAX_LOG_LEVEL_LEN {
-        return Err(Status::invalid_argument(format!(
-            "log_level exceeds maximum length ({} > {MAX_LOG_LEVEL_LEN})",
-            spec.log_level.len()
-        )));
+        return Err(invalid_argument(
+            "spec.log_level",
+            format!(
+                "log_level exceeds maximum length ({} > {MAX_LOG_LEVEL_LEN})",
+                spec.log_level.len()
+            ),
+        ));
     }
 
     // --- spec.environment ---
@@ -151,22 +203,108 @@ pub(super) fn validate_sandbox_spec(
     // --- spec.resource_requirements.gpu ---
     validate_gpu_request_fields(spec)?;
 
+    if !spec.command.is_empty() {
+        validate_main_process_command(&spec.command)?;
+    }
+
     // --- spec.policy serialized size ---
+    validate_sandbox_policy_size(spec)?;
+
+    Ok(())
+}
+
+pub(super) fn validate_sandbox_governance_spec(
+    name: &str,
+    spec: &SandboxSpec,
+) -> Result<(), Status> {
+    validate_sandbox_name(name)?;
+    validate_sandbox_provider_count(spec)?;
+    if !spec.command.is_empty() {
+        validate_main_process_command(&spec.command)?;
+    }
+    validate_sandbox_policy_size(spec)?;
+    Ok(())
+}
+
+fn validate_sandbox_name(name: &str) -> Result<(), Status> {
+    if !name.is_empty() && name.len() > MAX_ROUTABLE_NAME_LEN {
+        return Err(invalid_argument(
+            "name",
+            format!(
+                "name exceeds maximum length ({} > {MAX_ROUTABLE_NAME_LEN})",
+                name.len()
+            ),
+        ));
+    }
+    validate_dns1123_label(name, "name")
+}
+
+fn validate_sandbox_provider_count(spec: &SandboxSpec) -> Result<(), Status> {
+    if spec.providers.len() > MAX_PROVIDERS {
+        return Err(invalid_argument(
+            "spec.providers",
+            format!(
+                "providers list exceeds maximum ({} > {MAX_PROVIDERS})",
+                spec.providers.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sandbox_policy_size(spec: &SandboxSpec) -> Result<(), Status> {
     if let Some(ref policy) = spec.policy {
         let size = policy.encoded_len();
         if size > MAX_POLICY_SIZE {
-            return Err(Status::invalid_argument(format!(
-                "policy serialized size exceeds maximum ({size} > {MAX_POLICY_SIZE})"
-            )));
+            return Err(invalid_argument(
+                "spec.policy",
+                format!("policy serialized size exceeds maximum ({size} > {MAX_POLICY_SIZE})"),
+            ));
         }
     }
 
     Ok(())
 }
 
-fn validate_gpu_request_fields(spec: &openshell_core::proto::SandboxSpec) -> Result<(), Status> {
+fn validate_main_process_command(command: &[String]) -> Result<(), Status> {
+    if command.len() > MAX_MAIN_PROCESS_ARGS {
+        return Err(invalid_argument(
+            "spec.command",
+            format!("spec.command exceeds {MAX_MAIN_PROCESS_ARGS} argument limit"),
+        ));
+    }
+    if command[0].is_empty() {
+        return Err(invalid_argument(
+            "spec.command[0]",
+            "spec.command[0] must not be empty",
+        ));
+    }
+    let argv_size: usize = command.iter().map(String::len).sum();
+    if argv_size > MAX_MAIN_PROCESS_ARGV_SIZE {
+        return Err(invalid_argument(
+            "spec.command",
+            format!("spec.command total size exceeds {MAX_MAIN_PROCESS_ARGV_SIZE} byte limit"),
+        ));
+    }
+    for (index, argument) in command.iter().enumerate() {
+        if argument.len() > MAX_EXEC_ARG_LEN {
+            return Err(invalid_argument(
+                &format!("spec.command[{index}]"),
+                format!("spec.command[{index}] exceeds {MAX_EXEC_ARG_LEN} byte limit"),
+            ));
+        }
+        reject_null_char(argument, &format!("spec.command[{index}]"))?;
+    }
+
+    Ok(())
+}
+
+fn validate_gpu_request_fields(spec: &SandboxSpec) -> Result<(), Status> {
     if openshell_core::gpu::sandbox_gpu_count(spec.resource_requirements.as_ref()) == Some(0) {
-        return Err(Status::invalid_argument("gpu count must be greater than 0"));
+        return Err(invalid_argument(
+            "spec.resource_requirements.gpu.count",
+            "gpu count must be greater than 0",
+        ));
     }
 
     Ok(())
@@ -176,15 +314,18 @@ fn validate_gpu_request_fields(spec: &openshell_core::proto::SandboxSpec) -> Res
 fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
     // String fields.
     for (field, value) in [
-        ("template.image", &tmpl.image),
-        ("template.runtime_class_name", &tmpl.runtime_class_name),
-        ("template.agent_socket", &tmpl.agent_socket),
+        ("spec.template.image", &tmpl.image),
+        ("spec.template.runtime_class_name", &tmpl.runtime_class_name),
+        ("spec.template.agent_socket", &tmpl.agent_socket),
     ] {
         if value.len() > MAX_TEMPLATE_STRING_LEN {
-            return Err(Status::invalid_argument(format!(
-                "{field} exceeds maximum length ({} > {MAX_TEMPLATE_STRING_LEN})",
-                value.len()
-            )));
+            return Err(invalid_argument(
+                field,
+                format!(
+                    "{field} exceeds maximum length ({} > {MAX_TEMPLATE_STRING_LEN})",
+                    value.len()
+                ),
+            ));
         }
     }
 
@@ -194,41 +335,75 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
         MAX_TEMPLATE_MAP_ENTRIES,
         MAX_MAP_KEY_LEN,
         MAX_MAP_VALUE_LEN,
-        "template.labels",
+        "spec.template.labels",
     )?;
     validate_string_map(
         &tmpl.annotations,
         MAX_TEMPLATE_MAP_ENTRIES,
         MAX_MAP_KEY_LEN,
         MAX_MAP_VALUE_LEN,
-        "template.annotations",
+        "spec.template.annotations",
     )?;
     validate_string_map(
         &tmpl.environment,
         MAX_TEMPLATE_MAP_ENTRIES,
         MAX_MAP_KEY_LEN,
         MAX_MAP_VALUE_LEN,
-        "template.environment",
+        "spec.template.environment",
     )?;
 
     // Struct fields (serialized size).
     if let Some(ref s) = tmpl.resources {
         let size = s.encoded_len();
         if size > MAX_TEMPLATE_STRUCT_SIZE {
-            return Err(Status::invalid_argument(format!(
-                "template.resources serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
-            )));
+            return Err(invalid_argument(
+                "spec.template.resources",
+                format!(
+                    "template.resources serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
+                ),
+            ));
         }
     }
     if let Some(ref s) = tmpl.driver_config {
         let size = s.encoded_len();
         if size > MAX_TEMPLATE_STRUCT_SIZE {
-            return Err(Status::invalid_argument(format!(
-                "template.driver_config serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
-            )));
+            return Err(invalid_argument(
+                "spec.template.driver_config",
+                format!(
+                    "template.driver_config serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
+                ),
+            ));
         }
+        reject_gateway_owned_driver_config_keys(s)?;
     }
 
+    Ok(())
+}
+
+/// `driver_config` fields the gateway resolves and writes itself.
+///
+/// A caller who could set these would hand a raw host path straight to a
+/// privileged compute driver. Clients name a staging token instead, and the
+/// gateway substitutes the path it allocated.
+const GATEWAY_OWNED_DRIVER_CONFIG_KEYS: &[&str] = &["rootfs_tar_path"];
+
+fn reject_gateway_owned_driver_config_keys(config: &prost_types::Struct) -> Result<(), Status> {
+    for (driver_name, value) in &config.fields {
+        let Some(prost_types::value::Kind::StructValue(driver_config)) = value.kind.as_ref() else {
+            continue;
+        };
+        for key in GATEWAY_OWNED_DRIVER_CONFIG_KEYS {
+            if driver_config.fields.contains_key(*key) {
+                return Err(invalid_argument(
+                    "spec.template.driver_config",
+                    format!(
+                        "template.driver_config.{driver_name}.{key} is set by the gateway \
+                     and cannot be supplied by the caller"
+                    ),
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -241,24 +416,55 @@ pub(super) fn validate_string_map(
     field_name: &str,
 ) -> Result<(), Status> {
     if map.len() > max_entries {
-        return Err(Status::invalid_argument(format!(
-            "{field_name} exceeds maximum entries ({} > {max_entries})",
-            map.len()
-        )));
+        return Err(invalid_argument(
+            field_name,
+            format!(
+                "{field_name} exceeds maximum entries ({} > {max_entries})",
+                map.len()
+            ),
+        ));
     }
     for (key, value) in map {
         if key.len() > max_key_len {
-            return Err(Status::invalid_argument(format!(
-                "{field_name} key exceeds maximum length ({} > {max_key_len})",
-                key.len()
-            )));
+            return Err(invalid_argument(
+                field_name,
+                format!(
+                    "{field_name} key exceeds maximum length ({} > {max_key_len})",
+                    key.len()
+                ),
+            ));
         }
         if value.len() > max_value_len {
-            return Err(Status::invalid_argument(format!(
-                "{field_name} value exceeds maximum length ({} > {max_value_len})",
-                value.len()
-            )));
+            return Err(invalid_argument(
+                field_name,
+                format!(
+                    "{field_name} value exceeds maximum length ({} > {max_value_len})",
+                    value.len()
+                ),
+            ));
         }
+    }
+    Ok(())
+}
+
+/// Validate object annotations.
+///
+/// Annotation keys use the same qualified-key shape as labels. Annotation
+/// values are opaque metadata and use the normal string-map size limits rather
+/// than Kubernetes label value limits.
+pub(super) fn validate_annotations(
+    annotations: &std::collections::HashMap<String, String>,
+    field_name: &str,
+) -> Result<(), Status> {
+    validate_string_map(
+        annotations,
+        MAX_METADATA_ANNOTATIONS_ENTRIES,
+        MAX_MAP_KEY_LEN,
+        MAX_MAP_VALUE_LEN,
+        field_name,
+    )?;
+    for key in annotations.keys() {
+        validate_label_key(key)?;
     }
     Ok(())
 }
@@ -279,9 +485,12 @@ fn validate_env_entries(
 ) -> Result<(), Status> {
     let total_size: usize = map.iter().map(|(k, v)| k.len() + v.len()).sum();
     if total_size > MAX_ENV_SERIALIZED_SIZE {
-        return Err(Status::invalid_argument(format!(
-            "{field_name} total size exceeds {MAX_ENV_SERIALIZED_SIZE} byte limit ({total_size} bytes)"
-        )));
+        return Err(invalid_argument(
+            field_name,
+            format!(
+                "{field_name} total size exceeds {MAX_ENV_SERIALIZED_SIZE} byte limit ({total_size} bytes)"
+            ),
+        ));
     }
     validate_env_entries_inner(map, field_name, &[])
 }
@@ -300,16 +509,18 @@ fn validate_env_entries_inner(
 ) -> Result<(), Status> {
     for (key, value) in map {
         if !super::provider::is_valid_env_key(key) {
-            return Err(Status::invalid_argument(format!(
-                "{field_name} keys must match ^[A-Za-z_][A-Za-z0-9_]*$; got '{key}'"
-            )));
+            return Err(invalid_argument(
+                field_name,
+                format!("{field_name} keys must match ^[A-Za-z_][A-Za-z0-9_]*$; got '{key}'"),
+            ));
         }
         if key.starts_with("OPENSHELL_") && !allowed_openshell_keys.contains(&key.as_str()) {
-            return Err(Status::invalid_argument(format!(
-                "{field_name} keys starting with OPENSHELL_ are reserved; got '{key}'"
-            )));
+            return Err(invalid_argument(
+                field_name,
+                format!("{field_name} keys starting with OPENSHELL_ are reserved; got '{key}'"),
+            ));
         }
-        reject_control_chars(value, &format!("{field_name} value for '{key}'"))?;
+        reject_control_chars(value, field_name)?;
     }
     Ok(())
 }
@@ -322,15 +533,19 @@ fn validate_env_entries_inner(
 pub(super) fn validate_provider_fields(provider: &Provider) -> Result<(), Status> {
     let name_len = provider.metadata.as_ref().map_or(0, |m| m.name.len());
     if name_len > MAX_NAME_LEN {
-        return Err(Status::invalid_argument(format!(
-            "provider.name exceeds maximum length ({name_len} > {MAX_NAME_LEN})"
-        )));
+        return Err(invalid_argument(
+            "provider.metadata.name",
+            format!("provider.name exceeds maximum length ({name_len} > {MAX_NAME_LEN})"),
+        ));
     }
     if provider.r#type.len() > MAX_PROVIDER_TYPE_LEN {
-        return Err(Status::invalid_argument(format!(
-            "provider.type exceeds maximum length ({} > {MAX_PROVIDER_TYPE_LEN})",
-            provider.r#type.len()
-        )));
+        return Err(invalid_argument(
+            "provider.type",
+            format!(
+                "provider.type exceeds maximum length ({} > {MAX_PROVIDER_TYPE_LEN})",
+                provider.r#type.len()
+            ),
+        ));
     }
     validate_provider_mutable_fields(provider)
 }
@@ -350,6 +565,8 @@ pub(super) fn validate_provider_mutable_fields(provider: &Provider) -> Result<()
         MAX_MAP_VALUE_LEN,
         "provider.credentials",
     )?;
+    validate_provider_credential_handles(&provider.credential_handles)?;
+    validate_provider_credential_sources(provider)?;
     validate_string_map(
         &provider.config,
         MAX_PROVIDER_CONFIG_ENTRIES,
@@ -357,26 +574,142 @@ pub(super) fn validate_provider_mutable_fields(provider: &Provider) -> Result<()
         MAX_MAP_VALUE_LEN,
         "provider.config",
     )?;
-    if provider.credential_expires_at_ms.len() > MAX_PROVIDER_CREDENTIALS_ENTRIES {
-        return Err(Status::invalid_argument(format!(
-            "provider.credential_expires_at_ms exceeds maximum entries ({} > {MAX_PROVIDER_CREDENTIALS_ENTRIES})",
-            provider.credential_expires_at_ms.len()
-        )));
+    if provider.credential_expiration_times.len() > MAX_PROVIDER_CREDENTIALS_ENTRIES {
+        return Err(invalid_argument(
+            "provider.credential_expiration_times",
+            format!(
+                "provider.credential_expiration_times exceeds maximum entries ({} > {MAX_PROVIDER_CREDENTIALS_ENTRIES})",
+                provider.credential_expiration_times.len()
+            ),
+        ));
     }
-    for (key, value) in &provider.credential_expires_at_ms {
+    for (key, value) in &provider.credential_expiration_times {
         if key.len() > MAX_MAP_KEY_LEN {
-            return Err(Status::invalid_argument(format!(
-                "provider.credential_expires_at_ms key exceeds maximum length ({} > {MAX_MAP_KEY_LEN})",
-                key.len()
-            )));
+            return Err(invalid_argument(
+                "provider.credential_expiration_times",
+                format!(
+                    "provider.credential_expiration_times key exceeds maximum length ({} > {MAX_MAP_KEY_LEN})",
+                    key.len()
+                ),
+            ));
         }
-        if *value < 0 {
-            return Err(Status::invalid_argument(
-                "provider.credential_expires_at_ms value must be greater than or equal to 0",
+        openshell_core::time::validate_timestamp(value).map_err(|error| {
+            invalid_argument("provider.credential_expiration_times", error.to_string())
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_provider_credential_sources(provider: &Provider) -> Result<(), Status> {
+    let total_credentials = provider.credentials.len() + provider.credential_handles.len();
+    if total_credentials > MAX_PROVIDER_CREDENTIALS_ENTRIES {
+        return Err(invalid_argument(
+            "provider.credentials",
+            format!(
+                "provider credential sources exceed maximum entries ({total_credentials} > {MAX_PROVIDER_CREDENTIALS_ENTRIES})"
+            ),
+        ));
+    }
+
+    for key in provider.credential_handles.keys() {
+        if provider.credentials.contains_key(key) {
+            return Err(invalid_argument(
+                "provider.credential_handles",
+                format!(
+                    "provider credential key '{key}' cannot be present in both provider.credentials and provider.credential_handles"
+                ),
             ));
         }
     }
     Ok(())
+}
+
+fn validate_provider_credential_handles(
+    credential_handles: &std::collections::HashMap<String, CredentialHandle>,
+) -> Result<(), Status> {
+    if credential_handles.len() > MAX_PROVIDER_CREDENTIALS_ENTRIES {
+        return Err(invalid_argument(
+            "provider.credential_handles",
+            format!(
+                "provider.credential_handles exceeds maximum entries ({} > {MAX_PROVIDER_CREDENTIALS_ENTRIES})",
+                credential_handles.len()
+            ),
+        ));
+    }
+
+    for (credential_key, handle) in credential_handles {
+        if credential_key.len() > MAX_MAP_KEY_LEN {
+            return Err(invalid_argument(
+                "provider.credential_handles",
+                format!(
+                    "provider.credential_handles key exceeds maximum length ({} > {MAX_MAP_KEY_LEN})",
+                    credential_key.len()
+                ),
+            ));
+        }
+        if !super::provider::is_valid_env_key(credential_key) {
+            return Err(invalid_argument(
+                "provider.credential_handles",
+                format!(
+                    "provider.credential_handles keys must match ^[A-Za-z_][A-Za-z0-9_]*$; got '{credential_key}'"
+                ),
+            ));
+        }
+        validate_credential_handle(
+            handle,
+            &format!("provider.credential_handles['{credential_key}']"),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_credential_handle(handle: &CredentialHandle, field_name: &str) -> Result<(), Status> {
+    validate_required_credential_handle_string(&handle.driver, field_name, "driver")?;
+    validate_required_credential_handle_string(&handle.handle, field_name, "handle")?;
+    validate_string_map(
+        &handle.metadata,
+        MAX_PROVIDER_CONFIG_ENTRIES,
+        MAX_MAP_KEY_LEN,
+        MAX_MAP_VALUE_LEN,
+        &format!("{field_name}.metadata"),
+    )?;
+    for (key, value) in &handle.metadata {
+        reject_control_chars(key, &format!("{field_name}.metadata"))?;
+        reject_control_chars(value, &format!("{field_name}.metadata"))?;
+    }
+    Ok(())
+}
+
+fn validate_required_credential_handle_string(
+    value: &str,
+    field_name: &str,
+    component: &str,
+) -> Result<(), Status> {
+    if value.trim().is_empty() {
+        return Err(invalid_argument(
+            &format!("{field_name}.{component}"),
+            format!("{field_name}.{component} is required"),
+        ));
+    }
+    validate_optional_credential_handle_string(value, field_name, component)
+}
+
+fn validate_optional_credential_handle_string(
+    value: &str,
+    field_name: &str,
+    component: &str,
+) -> Result<(), Status> {
+    if value.len() > MAX_MAP_VALUE_LEN {
+        return Err(invalid_argument(
+            &format!("{field_name}.{component}"),
+            format!(
+                "{field_name}.{component} exceeds maximum length ({} > {MAX_MAP_VALUE_LEN})",
+                value.len()
+            ),
+        ));
+    }
+    reject_control_chars(value, &format!("{field_name}.{component}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -556,10 +889,17 @@ pub(super) fn validate_label_selector(selector: &str) -> Result<(), Status> {
         return Ok(());
     }
 
+    let mut count = 0usize;
     for pair in selector.split(',') {
         let pair = pair.trim();
         if pair.is_empty() {
             continue;
+        }
+        count += 1;
+        if count > MAX_LABEL_SELECTOR_PAIRS {
+            return Err(Status::invalid_argument(format!(
+                "label selector exceeds {MAX_LABEL_SELECTOR_PAIRS} pair limit"
+            )));
         }
 
         let parts: Vec<&str> = pair.splitn(2, '=').collect();
@@ -622,6 +962,11 @@ pub(super) fn validate_object_metadata(
         validate_label_value(value)?;
     }
 
+    validate_annotations(
+        &metadata.annotations,
+        &format!("{resource_type}.metadata.annotations"),
+    )?;
+
     Ok(())
 }
 
@@ -642,6 +987,19 @@ pub(super) fn validate_policy_safety(policy: &ProtoSandboxPolicy) -> Result<(), 
         )));
     }
     Ok(())
+}
+
+/// Validate a policy and return the canonical value safe to hash and persist.
+///
+/// Validation runs before canonicalization so sorting cannot hide duplicate or
+/// unsupported MCP revisions. Callers must use the returned value because the
+/// input may carry an equivalent but noncanonical revision order.
+pub(super) fn validate_and_canonicalize_policy(
+    policy: ProtoSandboxPolicy,
+) -> Result<ProtoSandboxPolicy, Status> {
+    openshell_policy::validate_and_canonicalize_sandbox_policy(policy).map_err(|error| {
+        Status::invalid_argument(format!("policy contains unsafe content: {error}"))
+    })
 }
 
 /// Validate that user-authored policy does not use provider-derived rule keys.
@@ -768,8 +1126,47 @@ pub(super) fn level_matches(log_level: &str, min_level: &str) -> bool {
 mod tests {
     use super::*;
     use openshell_core::proto::SandboxSpec;
+    use openshell_core::rpc_error::StatusExt;
     use std::collections::HashMap;
     use tonic::Code;
+
+    #[test]
+    fn sandbox_and_exec_validation_return_wire_field_paths() {
+        let cases = [
+            (
+                validate_sandbox_spec("UPPER", &SandboxSpec::default()).unwrap_err(),
+                "name",
+            ),
+            (
+                validate_sandbox_spec(
+                    "",
+                    &SandboxSpec {
+                        command: vec![String::new()],
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err(),
+                "spec.command[0]",
+            ),
+            (
+                validate_exec_request_fields(&ExecSandboxRequest {
+                    sandbox: "sandbox".into(),
+                    command: vec!["a\0b".into()],
+                    ..Default::default()
+                })
+                .unwrap_err(),
+                "command[0]",
+            ),
+        ];
+        for (status, field) in cases {
+            assert_eq!(status.code(), Code::InvalidArgument);
+            let details = status.get_error_details();
+            assert_eq!(
+                details.bad_request().unwrap().field_violations[0].field,
+                field
+            );
+        }
+    }
 
     use crate::grpc::{
         MAX_ENVIRONMENT_ENTRIES, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN,
@@ -831,17 +1228,50 @@ mod tests {
     }
 
     #[test]
+    fn validate_sandbox_spec_accepts_exact_main_process_argv() {
+        let spec = SandboxSpec {
+            command: vec!["/bin/sh".into(), "-c".into(), "printf 'a b'".into()],
+            tty: false,
+            ..Default::default()
+        };
+        validate_sandbox_spec("", &spec).unwrap();
+    }
+
+    #[test]
     fn validate_sandbox_spec_accepts_at_limit_name() {
-        let name = "a".repeat(MAX_NAME_LEN);
+        let name = "a".repeat(MAX_ROUTABLE_NAME_LEN);
         assert!(validate_sandbox_spec(&name, &default_spec()).is_ok());
     }
 
     #[test]
     fn validate_sandbox_spec_rejects_over_limit_name() {
-        let name = "a".repeat(MAX_NAME_LEN + 1);
+        let name = "a".repeat(MAX_ROUTABLE_NAME_LEN + 1);
         let err = validate_sandbox_spec(&name, &default_spec()).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("name"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_uppercase_name() {
+        let err = validate_sandbox_spec("MySandbox", &default_spec()).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_leading_hyphen_name() {
+        let err = validate_sandbox_spec("-sandbox", &default_spec()).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_consecutive_hyphens_name() {
+        let err = validate_sandbox_spec("my--sandbox", &default_spec()).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn validate_sandbox_spec_accepts_single_hyphens_name() {
+        assert!(validate_sandbox_spec("my-sandbox", &default_spec()).is_ok());
     }
 
     #[test]
@@ -1046,7 +1476,8 @@ mod tests {
     #[test]
     fn validate_exec_request_rejects_reserved_env_key() {
         let req = ExecSandboxRequest {
-            sandbox_id: "id".to_string(),
+            sandbox: "id".to_string(),
+            workspace_scope: None,
             command: vec!["echo".to_string()],
             environment: std::iter::once(("OPENSHELL_SANDBOX_ID".to_string(), "evil".to_string()))
                 .collect(),
@@ -1063,7 +1494,8 @@ mod tests {
     #[test]
     fn validate_exec_request_allows_pyfunc_helper_key() {
         let req = ExecSandboxRequest {
-            sandbox_id: "id".to_string(),
+            sandbox: "id".to_string(),
+            workspace_scope: None,
             command: vec!["python".to_string()],
             environment: std::iter::once(("OPENSHELL_PYFUNC_B64".to_string(), "data".to_string()))
                 .collect(),
@@ -1140,6 +1572,18 @@ mod tests {
         std::iter::once(("KEY".to_string(), "val".to_string())).collect()
     }
 
+    fn one_credential_handle() -> HashMap<String, CredentialHandle> {
+        std::iter::once((
+            "API_KEY".to_string(),
+            CredentialHandle {
+                driver: "kubernetes-secrets".to_string(),
+                handle: "v1:openshell:provider-secret".to_string(),
+                metadata: HashMap::new(),
+            },
+        ))
+        .collect()
+    }
+
     fn make_test_provider(
         name: &str,
         provider_type: &str,
@@ -1150,14 +1594,19 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
                 name: name.to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: String::new(),
+                deletion_time: None,
             }),
             r#type: provider_type.to_string(),
             credentials,
             config,
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
+            profile_workspace: "default".to_string(),
+            credential_handles: HashMap::new(),
         }
     }
 
@@ -1170,6 +1619,72 @@ mod tests {
             std::iter::once(("endpoint".to_string(), "https://example.com".to_string())).collect(),
         );
         assert!(validate_provider_fields(&provider).is_ok());
+    }
+
+    #[test]
+    fn validate_provider_fields_accepts_credential_handles() {
+        let mut provider =
+            make_test_provider("my-provider", "claude", HashMap::new(), HashMap::new());
+        provider.credential_handles = one_credential_handle();
+
+        assert!(validate_provider_fields(&provider).is_ok());
+    }
+
+    #[test]
+    fn validate_provider_fields_rejects_duplicate_inline_and_referenced_key() {
+        let mut provider = make_test_provider(
+            "my-provider",
+            "claude",
+            std::iter::once(("API_KEY".to_string(), "inline".to_string())).collect(),
+            HashMap::new(),
+        );
+        provider.credential_handles = one_credential_handle();
+
+        let err = validate_provider_fields(&provider).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("provider.credentials"));
+        assert!(err.message().contains("provider.credential_handles"));
+    }
+
+    #[test]
+    fn validate_provider_fields_rejects_too_many_combined_credential_sources() {
+        let refs: HashMap<String, CredentialHandle> = (0..MAX_PROVIDER_CREDENTIALS_ENTRIES)
+            .map(|i| {
+                (
+                    format!("REF_{i}"),
+                    CredentialHandle {
+                        driver: "test".to_string(),
+                        handle: format!("handle-{i}"),
+                        metadata: HashMap::new(),
+                    },
+                )
+            })
+            .collect();
+        let mut provider = make_test_provider("ok", "claude", one_credential(), HashMap::new());
+        provider.credential_handles = refs;
+
+        let err = validate_provider_fields(&provider).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("credential sources"));
+    }
+
+    #[test]
+    fn validate_provider_fields_rejects_credential_handle_missing_handle() {
+        let mut provider =
+            make_test_provider("my-provider", "claude", HashMap::new(), HashMap::new());
+        provider.credential_handles = std::iter::once((
+            "API_KEY".to_string(),
+            CredentialHandle {
+                driver: "test".to_string(),
+                handle: String::new(),
+                metadata: HashMap::new(),
+            },
+        ))
+        .collect();
+
+        let err = validate_provider_fields(&provider).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("handle is required"));
     }
 
     #[test]
@@ -1539,6 +2054,22 @@ mod tests {
         assert!(err.message().contains("exceeds 63 characters"));
     }
 
+    #[test]
+    fn validate_label_selector_rejects_too_many_pairs() {
+        let pairs: Vec<String> = (0..65).map(|i| format!("k{i}=v{i}")).collect();
+        let selector = pairs.join(",");
+        let err = validate_label_selector(&selector).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("64 pair limit"));
+    }
+
+    #[test]
+    fn validate_label_selector_accepts_max_pairs() {
+        let pairs: Vec<String> = (0..64).map(|i| format!("k{i}=v{i}")).collect();
+        let selector = pairs.join(",");
+        assert!(validate_label_selector(&selector).is_ok());
+    }
+
     // ---- Policy safety ----
 
     #[test]
@@ -1625,6 +2156,58 @@ mod tests {
         let err = validate_policy_safety(&policy).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("TLD wildcard"));
+    }
+
+    #[test]
+    fn validate_policy_safety_reports_unknown_enforcement() {
+        use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
+
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "github_api".into(),
+            NetworkPolicyRule {
+                name: "github-api-readonly".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.github.com".into(),
+                    port: 443,
+                    protocol: "rest".into(),
+                    enforcement: 99,
+                    access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let err = validate_policy_safety(&policy).unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("endpoint 0"));
+        assert!(err.message().contains("unknown enforcement enum value 99"));
+    }
+
+    #[test]
+    fn validate_policy_safety_rejects_invalid_middleware_before_acceptance() {
+        use openshell_core::proto::{MiddlewareEndpointSelector, NetworkMiddlewareConfig};
+
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_middlewares.insert(
+            "redactor".into(),
+            NetworkMiddlewareConfig {
+                middleware: "openshell/regex".into(),
+                on_error: "maybe".into(),
+                endpoints: Some(MiddlewareEndpointSelector {
+                    include: vec!["api[.example.com".into()],
+                    exclude: Vec::new(),
+                }),
+                ..Default::default()
+            },
+        );
+
+        let err = validate_policy_safety(&policy).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("invalid on_error"));
+        assert!(err.message().contains("invalid host pattern"));
     }
 
     #[test]
@@ -1818,7 +2401,8 @@ mod tests {
     #[test]
     fn validate_exec_allows_newlines_in_command_args() {
         let req = ExecSandboxRequest {
-            sandbox_id: "test".to_string(),
+            sandbox: "test".to_string(),
+            workspace_scope: None,
             command: vec![
                 "python3".to_string(),
                 "-c".to_string(),
@@ -1832,7 +2416,8 @@ mod tests {
     #[test]
     fn validate_exec_still_rejects_null_bytes_in_command_args() {
         let req = ExecSandboxRequest {
-            sandbox_id: "test".to_string(),
+            sandbox: "test".to_string(),
+            workspace_scope: None,
             command: vec!["echo".to_string(), "hello\x00world".to_string()],
             ..Default::default()
         };
@@ -1843,7 +2428,8 @@ mod tests {
     #[test]
     fn validate_exec_still_rejects_newlines_in_workdir() {
         let req = ExecSandboxRequest {
-            sandbox_id: "test".to_string(),
+            sandbox: "test".to_string(),
+            workspace_scope: None,
             command: vec!["ls".to_string()],
             workdir: "/tmp\nmalicious".to_string(),
             ..Default::default()
@@ -1855,7 +2441,8 @@ mod tests {
     #[test]
     fn validate_exec_still_rejects_newlines_in_env_values() {
         let req = ExecSandboxRequest {
-            sandbox_id: "test".to_string(),
+            sandbox: "test".to_string(),
+            workspace_scope: None,
             command: vec!["ls".to_string()],
             environment: std::iter::once(("VAR".to_string(), "val\nmalicious".to_string()))
                 .collect(),
@@ -1863,5 +2450,44 @@ mod tests {
         };
         let err = validate_exec_request_fields(&req).unwrap_err();
         assert!(err.message().contains("newline"));
+    }
+
+    fn driver_config(json: &str) -> prost_types::Struct {
+        let serde_json::Value::Object(fields) =
+            serde_json::from_str::<serde_json::Value>(json).expect("valid json")
+        else {
+            panic!("driver_config test input must be a JSON object");
+        };
+        openshell_core::proto_struct::json_object_to_struct(fields).expect("encodable")
+    }
+
+    /// The security boundary: only the gateway may name a host path for the
+    /// compute driver. A direct API request that supplies one is refused.
+    #[test]
+    fn rejects_caller_supplied_rootfs_tar_path() {
+        for json in [
+            r#"{"vm":{"rootfs_tar_path":"/etc/passwd"}}"#,
+            r#"{"vm":{"rootfs_tar_path":"/dev/zero"}}"#,
+            // Driver-agnostic: no driver block may carry a gateway-owned key.
+            r#"{"docker":{"rootfs_tar_path":"/etc/shadow"}}"#,
+        ] {
+            let err = reject_gateway_owned_driver_config_keys(&driver_config(json))
+                .expect_err("a caller-supplied rootfs_tar_path must be rejected");
+            assert_eq!(err.code(), Code::InvalidArgument, "{json}: {err}");
+            assert!(err.message().contains("rootfs_tar_path"), "{json}: {err}");
+        }
+    }
+
+    #[test]
+    fn accepts_driver_config_without_gateway_owned_keys() {
+        for json in [
+            r#"{"vm":{"rootfs_tar_staging_token":"tok-abc"}}"#,
+            r#"{"vm":{"gpu_device_ids":["0000:2d:00.0"]}}"#,
+            r#"{"kubernetes":{"pod":{"nodeName":"gpu-1"}}}"#,
+            r"{}",
+        ] {
+            reject_gateway_owned_driver_config_keys(&driver_config(json))
+                .unwrap_or_else(|err| panic!("{json} should be accepted: {err}"));
+        }
     }
 }

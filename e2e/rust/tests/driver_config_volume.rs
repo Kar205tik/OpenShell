@@ -7,6 +7,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bollard::Docker;
@@ -16,13 +17,30 @@ use bollard::query_parameters::{
     RemoveVolumeOptionsBuilder, StartContainerOptions, WaitContainerOptions,
 };
 use futures_util::TryStreamExt;
+#[cfg(feature = "e2e-docker")]
+use openshell_e2e::harness::container::ImageGuard;
 use openshell_e2e::harness::container::e2e_driver;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use serde_json::{Map, Value};
 
-const TEST_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest";
+const TEST_IMAGE: &str = "nvcr.io/nvidia/base/ubuntu:24.04";
 const VOLUME_TARGET: &str = "/sandbox/e2e-volume";
 const BIND_TARGET: &str = "/sandbox/e2e-bind";
+#[cfg(feature = "e2e-docker")]
+const OCI_VOLUME_TARGET: &str = "/workspace/project/e2e-volume";
+#[cfg(feature = "e2e-docker")]
+const OCI_USER_DOCKERFILE: &str = r#"FROM public.ecr.aws/docker/library/python:3.13-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace/project
+RUN chown 2234:2235 .
+USER 2234:2235
+CMD ["sleep", "infinity"]
+"#;
+
+static NEXT_VOLUME_ID: AtomicU64 = AtomicU64::new(0);
 
 struct VolumeGuard {
     docker: Docker,
@@ -78,7 +96,6 @@ async fn sandbox_mounts_existing_driver_config_volume() {
         volume.name
     );
     let mut sandbox = SandboxGuard::create(&[
-        "--no-keep",
         "--driver-config-json",
         &driver_config,
         "--",
@@ -99,6 +116,77 @@ async fn sandbox_mounts_existing_driver_config_volume() {
     verify_volume(&volume)
         .await
         .expect("verify sandbox wrote to named test volume");
+}
+
+#[tokio::test]
+#[cfg(feature = "e2e-docker")]
+async fn oci_workspace_preparation_skips_nested_volume_ownership() {
+    let driver = e2e_driver().expect("OPENSHELL_E2E_DRIVER must be set by the e2e wrapper");
+    assert!(
+        driver == "docker",
+        "OCI workspace mount e2e requires docker, got {driver}"
+    );
+
+    let volume = VolumeGuard::create(&driver)
+        .await
+        .expect("create named test volume");
+    seed_volume(&volume).await.expect("seed named test volume");
+
+    let image_context = tempfile::tempdir().expect("create OCI image context");
+    let dockerfile = image_context.path().join("Dockerfile");
+    fs::write(&dockerfile, OCI_USER_DOCKERFILE).expect("write OCI image Dockerfile");
+    let image = ImageGuard::build(
+        &format!("{driver}-oci-user"),
+        &dockerfile,
+        image_context.path(),
+    )
+    .expect("build OCI-user image with selected container engine");
+
+    let driver_config = format!(
+        r#"{{"{driver}":{{"mounts":[{{"type":"volume","source":"{}","target":"{OCI_VOLUME_TARGET}","read_only":false}}]}}}}"#,
+        volume.name
+    );
+    let mut sandbox = SandboxGuard::create_keep_with_args(
+        &[
+            "--from",
+            image.tag(),
+            "--driver-config-json",
+            &driver_config,
+            "--no-tty",
+        ],
+        &[
+            "sh",
+            "-lc",
+            "set -eu; test \"$(id -u):$(id -g)\" = 2234:2235; \
+             test \"$(pwd -P)\" = /workspace/project; test \"$HOME\" = /workspace/project; \
+             test \"$(stat -c %u:%g /workspace/project/e2e-volume/input.txt)\" = 0:0; \
+             touch direct-write; echo Ready; sleep infinity",
+        ],
+        "Ready",
+    )
+    .await
+    .expect("create OCI-user sandbox with nested volume");
+
+    let ssh_output = sandbox
+        .exec(&[
+            "sh",
+            "-lc",
+            "set -eu; test \"$(pwd -P)\" = /workspace/project; \
+             test \"$HOME\" = /workspace/project; \
+             test \"$(stat -c %u:%g /workspace/project/e2e-volume/input.txt)\" = 0:0; \
+             touch ssh-write; echo nested-mount-owner-ok",
+        ])
+        .await
+        .expect("SSH child should preserve nested volume ownership");
+    assert!(
+        ssh_output.contains("nested-mount-owner-ok"),
+        "expected nested mount ownership marker:\n{ssh_output}"
+    );
+
+    sandbox.cleanup().await;
+    verify_volume_ownership(&volume)
+        .await
+        .expect("nested volume ownership should remain unchanged");
 }
 
 #[tokio::test]
@@ -126,7 +214,8 @@ async fn sandbox_mounts_enabled_driver_config_bind() {
         "type": "bind",
         "source": bind_source,
         "target": BIND_TARGET,
-        "read_only": false
+        "read_only": false,
+        "selinux_label": "private"
     });
     let driver_config = driver_config_mount_json(&driver, &bind_mount);
     // Host bind mounts are explicitly unsafe: this test validates driver mount
@@ -134,7 +223,6 @@ async fn sandbox_mounts_enabled_driver_config_bind() {
     let policy = write_bind_mount_policy().expect("write bind mount policy");
     let policy_path = policy.path().to_str().expect("policy path must be utf-8");
     let mut sandbox = SandboxGuard::create(&[
-        "--no-keep",
         "--policy",
         policy_path,
         "--driver-config-json",
@@ -163,10 +251,20 @@ fn write_bind_mount_policy() -> Result<tempfile::NamedTempFile, String> {
     let mut file =
         tempfile::NamedTempFile::new().map_err(|err| format!("create bind policy: {err}"))?;
     file.write_all(
-        br"version: 1
+        br#"version: 1
 
 filesystem_policy:
   include_workdir: false
+  read_only:
+    - "/bin"
+    - "/dev"
+    - "/etc"
+    - "/lib"
+    - "/proc"
+    - "/usr"
+  read_write:
+    - "/sandbox/e2e-bind"
+    - "/tmp"
 
 landlock:
   compatibility: best_effort
@@ -174,7 +272,7 @@ landlock:
 process:
   run_as_user: sandbox
   run_as_group: sandbox
-",
+"#,
     )
     .map_err(|err| format!("write bind policy: {err}"))?;
     Ok(file)
@@ -202,6 +300,23 @@ async fn verify_volume(volume: &VolumeGuard) -> Result<(), String> {
     if !output.contains("volume-ok") {
         return Err(format!(
             "volume verification did not print expected marker:\n{output}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "e2e-docker")]
+async fn verify_volume_ownership(volume: &VolumeGuard) -> Result<(), String> {
+    let output = run_volume_container(
+        volume,
+        "verify-owner",
+        true,
+        "set -eu; test \"$(stat -c %u:%g /vol/input.txt)\" = 0:0; echo owner-ok",
+    )
+    .await?;
+    if !output.contains("owner-ok") {
+        return Err(format!(
+            "volume ownership verification did not print expected marker:\n{output}"
         ));
     }
     Ok(())
@@ -355,7 +470,7 @@ async fn connect_container_api(driver: &str) -> Result<Docker, String> {
         "docker" => Docker::connect_with_local_defaults()
             .map_err(|err| format!("connect to Docker API: {err}"))?,
         "podman" => {
-            let socket = podman_socket_path();
+            let socket = podman_socket_path()?;
             let socket_display = socket.display().to_string();
             Docker::connect_with_unix(
                 socket
@@ -375,36 +490,11 @@ async fn connect_container_api(driver: &str) -> Result<Docker, String> {
     Ok(docker)
 }
 
-fn podman_socket_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("OPENSHELL_PODMAN_SOCKET") {
-        return PathBuf::from(path);
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var_os("HOME").unwrap_or_default();
-        PathBuf::from(home).join(".local/share/containers/podman/machine/podman.sock")
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::env::var_os("XDG_RUNTIME_DIR").map_or_else(
-            || {
-                let uid = std::process::Command::new("id")
-                    .arg("-u")
-                    .output()
-                    .ok()
-                    .and_then(|output| {
-                        String::from_utf8(output.stdout)
-                            .ok()
-                            .map(|value| value.trim().to_string())
-                    })
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| "1000".to_string());
-                PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"))
-            },
-            |xdg| PathBuf::from(xdg).join("podman/podman.sock"),
-        )
-    }
+fn podman_socket_path() -> Result<PathBuf, String> {
+    let path = std::env::var_os("OPENSHELL_PODMAN_SOCKET").ok_or_else(|| {
+        "OPENSHELL_PODMAN_SOCKET must be set by e2e/with-podman-gateway.sh".to_string()
+    })?;
+    Ok(PathBuf::from(path))
 }
 
 fn unique_volume_name(driver: &str) -> String {
@@ -412,8 +502,9 @@ fn unique_volume_name(driver: &str) -> String {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after Unix epoch")
         .as_nanos();
+    let sequence = NEXT_VOLUME_ID.fetch_add(1, Ordering::Relaxed);
     format!(
-        "openshell-e2e-driver-config-volume-{driver}-{}-{nanos}",
+        "openshell-e2e-driver-config-volume-{driver}-{}-{nanos}-{sequence}",
         std::process::id()
     )
 }

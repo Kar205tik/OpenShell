@@ -10,8 +10,9 @@
 
 pub mod graphql;
 pub(crate) mod http;
-pub mod inference;
 pub mod jsonrpc;
+pub(crate) mod mcp;
+pub(crate) mod middleware;
 pub mod path;
 pub mod provider;
 pub mod relay;
@@ -20,33 +21,49 @@ pub mod tls;
 pub(crate) mod token_grant_injection;
 pub(crate) mod websocket;
 
-/// Application-layer protocol for L7 inspection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum L7Protocol {
-    Rest,
-    Websocket,
-    Graphql,
-    Sql,
-    JsonRpc,
-    Mcp,
-}
+use openshell_core::endpoint_status::{
+    EndpointObservationContext, EndpointObservationHandle, EndpointObservationSender,
+    EndpointResult,
+};
+use openshell_core::mcp::McpProtocolVersion;
+pub use openshell_policy::L7Protocol;
+use openshell_policy::{
+    L7EndpointFields, validate_endpoint_modes, validate_explicit_tcp_additional_fields,
+    validate_l7_endpoint_semantics,
+};
+use std::sync::{Arc, Mutex};
 
-impl L7Protocol {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "rest" => Some(Self::Rest),
-            "websocket" => Some(Self::Websocket),
-            "graphql" => Some(Self::Graphql),
-            "sql" => Some(Self::Sql),
-            "json-rpc" => Some(Self::JsonRpc),
-            "mcp" => Some(Self::Mcp),
-            _ => None,
-        }
-    }
+use crate::opa::PolicyGenerationGuard;
 
-    pub fn is_jsonrpc_family(self) -> bool {
-        matches!(self, Self::JsonRpc | Self::Mcp)
+pub(crate) fn build_credential_endpoint_mismatch_finding(
+    policy_name: &str,
+    host: &str,
+    protocol: Option<&str>,
+    message: &str,
+) -> openshell_ocsf::OcsfEvent {
+    use openshell_ocsf::{
+        ActionId, ActivityId, DetectionFindingBuilder, DispositionId, FindingInfo, SeverityId,
+    };
+
+    let mut evidence = vec![("policy", policy_name), ("host", host)];
+    if let Some(protocol) = protocol {
+        evidence.push(("protocol", protocol));
     }
+    evidence.push(("disposition", "denied"));
+
+    DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::High)
+        .is_alert(true)
+        .finding_info(FindingInfo::new(
+            "openshell.provider_credential.endpoint_mismatch",
+            "Provider credential used at an unauthorized endpoint",
+        ))
+        .evidence_pairs(&evidence)
+        .message(message)
+        .build()
 }
 
 /// TLS handling mode for proxy connections.
@@ -99,6 +116,17 @@ pub enum EnforcementMode {
 #[derive(Debug, Clone)]
 pub struct L7EndpointConfig {
     pub protocol: L7Protocol,
+    /// Opaque endpoint identity derived from the matched policy endpoint.
+    ///
+    /// The value is added to the supervisor's internal OPA data and carried
+    /// through path selection unchanged. It is never derived from the concrete
+    /// request host because that host may have matched a wildcard selector.
+    pub endpoint_id: String,
+    /// Hash of the complete canonical policy that supplied this endpoint.
+    ///
+    /// Internal OPA metadata binds a selected endpoint to its observation
+    /// inventory even while policy activation and inventory publication overlap.
+    pub policy_hash: String,
     /// Optional endpoint-level HTTP path glob used to select between L7
     /// protocols that share the same host:port.
     pub path: String,
@@ -111,6 +139,10 @@ pub struct L7EndpointConfig {
     /// MCP-only strict validation for tools/call params.name. Defaults to true
     /// for MCP endpoints and is ignored by other JSON-RPC-family protocols.
     pub mcp_strict_tool_names: bool,
+    /// Canonical MCP protocol revisions allowed by this endpoint.
+    ///
+    /// Non-MCP endpoints always carry an empty list.
+    pub mcp_versions: Vec<McpProtocolVersion>,
     /// When true, percent-encoded `/` (`%2F`) is preserved in path segments
     /// rather than rejected at the parser. Needed by upstreams like GitLab
     /// that embed `%2F` in namespaced project paths. Defaults to false.
@@ -121,6 +153,10 @@ pub struct L7EndpointConfig {
     /// Opt-in rewrite of credential placeholders in supported textual REST
     /// request bodies before forwarding upstream.
     pub request_body_credential_rewrite: bool,
+    /// Explicit opt-in to credential-bearing traffic that cannot be inspected.
+    pub allow_uninspected_credentials: bool,
+    /// Internal gateway-derived credential provenance for this endpoint.
+    pub provider_credentialed: bool,
     /// When true, client-to-server GraphQL-over-WebSocket operation messages
     /// are classified with the same operation policy used by GraphQL-over-HTTP.
     pub websocket_graphql_policy: bool,
@@ -132,6 +168,102 @@ pub struct L7EndpointConfig {
     /// AWS region override for `SigV4` signing. When set, takes precedence
     /// over hostname-based region extraction.
     pub signing_region: String,
+}
+
+/// Report the first network result for a selected tool endpoint.
+///
+/// Clones share the same pending handle, so only the first terminal result is
+/// accepted. The lock is never held across an await, and reporting remains
+/// nonblocking because the core sender uses a bounded `try_send` path.
+#[derive(Clone)]
+pub(crate) struct EndpointObserver {
+    sender: EndpointObservationSender,
+    observation: Arc<Mutex<Option<EndpointObservationHandle>>>,
+    uses_provider_credentials: bool,
+    policy_generation: Option<PolicyGenerationGuard>,
+}
+
+impl EndpointObserver {
+    /// Bind a selected endpoint to authority captured before request-state lookup.
+    ///
+    /// Selection, provider material, and observation authority must describe the
+    /// same installation. A stale policy selection never acquires a new epoch.
+    pub(crate) fn begin_captured(
+        sender: Option<&EndpointObservationSender>,
+        config: &L7EndpointConfig,
+        context: Option<&EndpointObservationContext>,
+        provider_revision: Option<u64>,
+        guard: Option<&PolicyGenerationGuard>,
+    ) -> Option<Self> {
+        if config.protocol != L7Protocol::Mcp
+            || config.endpoint_id.is_empty()
+            || config.policy_hash.is_empty()
+        {
+            // Only internal metadata from a complete MCP policy identifies
+            // the endpoint and configuration whose result can be published.
+            return None;
+        }
+        if guard.is_some_and(PolicyGenerationGuard::is_stale) {
+            // Equal policy hashes can recur after a reload; the pinned guard
+            // prevents an earlier selection from becoming current again.
+            return None;
+        }
+        let sender = sender?.clone();
+        let observation = sender.begin_captured(
+            context?,
+            config.endpoint_id.clone(),
+            &config.policy_hash,
+            provider_revision,
+        )?;
+        Some(Self {
+            sender,
+            observation: Arc::new(Mutex::new(Some(observation))),
+            uses_provider_credentials: config.provider_credentialed,
+            policy_generation: guard.cloned(),
+        })
+    }
+
+    /// Capture and bind an observation synchronously for isolated unit fixtures.
+    #[cfg(test)]
+    pub(crate) fn begin(
+        sender: Option<&EndpointObservationSender>,
+        config: &L7EndpointConfig,
+    ) -> Option<Self> {
+        let context = sender.and_then(EndpointObservationSender::capture);
+        Self::begin_captured(sender, config, context.as_ref(), None, None)
+    }
+
+    /// Report the first terminal exchange result, dropping later attempts.
+    pub(crate) fn observe(&self, result: EndpointResult) {
+        let Ok(mut pending) = self.observation.lock() else {
+            // Status reporting cannot interrupt traffic if another observer panicked.
+            return;
+        };
+        let Some(observation) = pending.take() else {
+            // Another clone already reported the result for this exchange.
+            return;
+        };
+        if self
+            .policy_generation
+            .as_ref()
+            .is_some_and(PolicyGenerationGuard::is_stale)
+        {
+            // The request may finish after its policy was replaced but before
+            // the replacement inventory arrives. Its old result cannot fill
+            // that activation gap, including a return to equal policy values.
+            return;
+        }
+        let _accepted = self.sender.try_observe(observation, result);
+    }
+
+    /// Report an endpoint mismatch or an unavailable provider credential.
+    pub(crate) fn observe_credential_failure(&self, endpoint_mismatch: bool) {
+        if endpoint_mismatch {
+            self.observe(EndpointResult::PolicyDenied);
+        } else if self.uses_provider_credentials {
+            self.observe(EndpointResult::CredentialUnavailable);
+        }
+    }
 }
 
 /// Result of an L7 policy decision for a single request.
@@ -160,43 +292,29 @@ pub struct L7RequestInfo {
 /// Parse an L7 endpoint config from a regorus Value (returned by Rego query).
 ///
 /// The value is expected to be the raw endpoint object from the Rego data,
-/// containing fields: `protocol`, optionally `tls`, `enforcement`.
+/// containing fields: `protocol`, optionally `tls`, `enforcement`, and the
+/// canonical `mcp_versions` array for MCP endpoints.
 pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     let protocol_val = get_object_str(val, "protocol")?;
     let protocol = L7Protocol::parse(&protocol_val)?;
 
-    let tls = match get_object_str(val, "tls").as_deref() {
-        Some("skip") => TlsMode::Skip,
-        Some("terminate") => {
-            let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(openshell_ocsf::ActivityId::Other)
-                .severity(openshell_ocsf::SeverityId::Medium)
-                .message(
-                    "'tls: terminate' is deprecated; TLS termination is now automatic. \
-                     Use 'tls: skip' to explicitly disable. This field will be removed in a future version.",
-                )
-                .build();
-            openshell_ocsf::ocsf_emit!(event);
-            TlsMode::Auto
-        }
-        Some("passthrough") => {
-            let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(openshell_ocsf::ActivityId::Other)
-                .severity(openshell_ocsf::SeverityId::Medium)
-                .message(
-                    "'tls: passthrough' is deprecated; TLS termination is now automatic. \
-                     Use 'tls: skip' to explicitly disable. This field will be removed in a future version.",
-                )
-                .build();
-            openshell_ocsf::ocsf_emit!(event);
-            TlsMode::Auto
-        }
-        _ => TlsMode::Auto,
+    let tls_value = get_object_str(val, "tls").unwrap_or_default();
+    let enforcement_value = get_object_str(val, "enforcement").unwrap_or_default();
+    let access_value = get_object_str(val, "access").unwrap_or_default();
+    if !validate_endpoint_modes(&tls_value, &enforcement_value, &access_value).is_empty() {
+        return None;
+    }
+
+    let tls = match tls_value.as_str() {
+        "skip" => TlsMode::Skip,
+        "" => TlsMode::Auto,
+        _ => unreachable!("endpoint modes were validated above"),
     };
 
-    let enforcement = match get_object_str(val, "enforcement").as_deref() {
-        Some("enforce") => EnforcementMode::Enforce,
-        _ => EnforcementMode::Audit,
+    let enforcement = match enforcement_value.as_str() {
+        "enforce" => EnforcementMode::Enforce,
+        "" | "audit" => EnforcementMode::Audit,
+        _ => unreachable!("endpoint modes were validated above"),
     };
 
     let allow_encoded_slash = get_object_bool(val, "allow_encoded_slash").unwrap_or(false);
@@ -204,6 +322,11 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         get_object_bool(val, "websocket_credential_rewrite").unwrap_or(false);
     let request_body_credential_rewrite =
         get_object_bool(val, "request_body_credential_rewrite").unwrap_or(false);
+    let allow_uninspected_credentials =
+        get_object_bool(val, "allow_uninspected_credentials").unwrap_or(false);
+    let provider_credentialed = get_object_bool(val, "provider_credentialed").unwrap_or(false);
+    let endpoint_id = get_object_str(val, "endpoint_id").unwrap_or_default();
+    let policy_hash = get_object_str(val, "policy_hash").unwrap_or_default();
     let websocket_graphql_policy =
         protocol == L7Protocol::Websocket && endpoint_has_graphql_policy(val);
     let graphql_max_body_bytes = get_object_u64(val, "graphql_max_body_bytes")
@@ -216,15 +339,21 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         .unwrap_or(jsonrpc::DEFAULT_MAX_BODY_BYTES);
     let mcp_strict_tool_names = protocol == L7Protocol::Mcp
         && get_object_bool(val, "mcp_strict_tool_names").unwrap_or(true);
+    let mcp_versions = if protocol == L7Protocol::Mcp {
+        parse_canonical_mcp_versions(val)?
+    } else {
+        Vec::new()
+    };
 
     let credential_signing = match get_object_str(val, "credential_signing").as_deref() {
         Some("sigv4") => CredentialSigning::SigV4,
         Some("sigv4:body") => CredentialSigning::SigV4Body,
         Some("sigv4:no_body") => CredentialSigning::SigV4NoBody,
         Some(other) if !other.is_empty() => {
-            let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(openshell_ocsf::ActivityId::Other)
+            let event = openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(openshell_ocsf::SeverityId::High)
+                .status(openshell_ocsf::StatusId::Failure)
+                .state(openshell_ocsf::StateId::Disabled, "invalid")
                 .message(format!(
                     "rejecting endpoint: unrecognized credential_signing value {other:?}"
                 ))
@@ -239,9 +368,10 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     let signing_region = get_object_str(val, "signing_region").unwrap_or_default();
 
     if credential_signing.is_sigv4() && signing_service.is_empty() {
-        let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(openshell_ocsf::ActivityId::Other)
+        let event = openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
             .severity(openshell_ocsf::SeverityId::High)
+            .status(openshell_ocsf::StatusId::Failure)
+            .state(openshell_ocsf::StateId::Disabled, "invalid")
             .message("rejecting endpoint: credential_signing requires signing_service".to_string())
             .build();
         openshell_ocsf::ocsf_emit!(event);
@@ -250,20 +380,43 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
 
     Some(L7EndpointConfig {
         protocol,
+        endpoint_id,
+        policy_hash,
         path: get_object_str(val, "path").unwrap_or_default(),
         tls,
         enforcement,
         graphql_max_body_bytes,
         json_rpc_max_body_bytes,
         mcp_strict_tool_names,
+        mcp_versions,
         allow_encoded_slash,
         websocket_credential_rewrite,
         request_body_credential_rewrite,
+        allow_uninspected_credentials,
+        provider_credentialed,
         websocket_graphql_policy,
         credential_signing,
         signing_service,
         signing_region,
     })
+}
+
+pub(crate) fn emit_uninspected_credential_finding(host: &str, policy_name: &str, surface: &str) {
+    let event = openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .severity(openshell_ocsf::SeverityId::High)
+        .finding_info(openshell_ocsf::FindingInfo::new(
+            "openshell.credentials.traffic_uninspectable",
+            "Credential-bearing traffic cannot be inspected",
+        ))
+        .evidence_pairs(&[
+            ("policy", policy_name),
+            ("host", host),
+            ("surface", surface),
+            ("disposition", "denied"),
+        ])
+        .message("Uninspected credential-bearing traffic denied")
+        .build();
+    openshell_ocsf::ocsf_emit!(event);
 }
 
 impl L7EndpointConfig {
@@ -278,19 +431,14 @@ impl L7EndpointConfig {
             self.path.chars().filter(|c| *c != '*').count()
         }
     }
+
+    pub fn deny_uninspected_body_credentials(&self, has_resolver: bool) -> bool {
+        !self.allow_uninspected_credentials && (self.provider_credentialed || has_resolver)
+    }
 }
 
 pub fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
-    if pattern.is_empty() || pattern == "**" || pattern == "/**" {
-        return true;
-    }
-    if pattern == path {
-        return true;
-    }
-    if let Some(prefix) = pattern.strip_suffix("/**") {
-        return path == prefix || path.starts_with(&format!("{prefix}/"));
-    }
-    glob::Pattern::new(pattern).is_ok_and(|glob| glob.matches(path))
+    openshell_core::endpoint_path::matches(pattern, path)
 }
 
 /// Parse the `tls` field from an endpoint config, independent of L7 protocol.
@@ -300,8 +448,35 @@ pub fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
 pub fn parse_tls_mode(val: &regorus::Value) -> TlsMode {
     match get_object_str(val, "tls").as_deref() {
         Some("skip") => TlsMode::Skip,
-        // "terminate" and "passthrough" are deprecated aliases (logged by parse_l7_config); fall through to Auto.
         _ => TlsMode::Auto,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EndpointCredentialGuard {
+    pub provider_credentialed: bool,
+    pub allow_uninspected_credentials: bool,
+    pub has_l7_protocol: bool,
+    pub tls: TlsMode,
+}
+
+impl EndpointCredentialGuard {
+    pub fn blocks_uninspected(self) -> bool {
+        self.provider_credentialed && !self.allow_uninspected_credentials
+    }
+
+    pub fn blocks_connect(self) -> bool {
+        self.blocks_uninspected() && (!self.has_l7_protocol || self.tls == TlsMode::Skip)
+    }
+}
+
+pub fn parse_endpoint_credential_guard(val: &regorus::Value) -> EndpointCredentialGuard {
+    EndpointCredentialGuard {
+        provider_credentialed: get_object_bool(val, "provider_credentialed").unwrap_or(false),
+        allow_uninspected_credentials: get_object_bool(val, "allow_uninspected_credentials")
+            .unwrap_or(false),
+        has_l7_protocol: get_object_str(val, "protocol").is_some(),
+        tls: parse_tls_mode(val),
     }
 }
 
@@ -342,6 +517,27 @@ fn get_object_str(val: &regorus::Value, key: &str) -> Option<String> {
         },
         _ => None,
     }
+}
+
+fn parse_canonical_mcp_versions(val: &regorus::Value) -> Option<Vec<McpProtocolVersion>> {
+    let regorus::Value::Array(values) = get_object_value(val, "mcp_versions")? else {
+        return None;
+    };
+    let versions = values
+        .iter()
+        .map(|value| match value {
+            regorus::Value::String(value) => value.parse::<McpProtocolVersion>().ok(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    // Both policy ingress paths promise a non-empty, strictly ordered list.
+    // Rechecking that runtime contract prevents a dropped or corrupted
+    // projection from silently selecting a different wire profile.
+    if versions.is_empty() || !versions.windows(2).all(|pair| pair[0] < pair[1]) {
+        return None;
+    }
+    Some(versions)
 }
 
 fn endpoint_has_graphql_policy(val: &regorus::Value) -> bool {
@@ -455,17 +651,25 @@ fn validate_host_wildcard(errors: &mut Vec<String>, loc: &str, host: &str) {
 
     let labels: Vec<&str> = host.split('.').collect();
     let first_label = labels.first().copied().unwrap_or_default();
-    if labels.iter().skip(1).any(|label| label.contains('*')) {
-        errors.push(format!(
-            "{loc}: host wildcard may only appear in the first DNS label, got '{host}'"
-        ));
-        return;
-    }
     if first_label.contains("**") && first_label != "**" {
         errors.push(format!(
             "{loc}: recursive host wildcard '**' is only allowed as the entire first DNS label, got '{host}'"
         ));
         return;
+    }
+    for label in labels.iter().skip(1).copied() {
+        if label.contains("**") {
+            errors.push(format!(
+                "{loc}: recursive host wildcard '**' is only allowed as the entire first DNS label, got '{host}'"
+            ));
+            return;
+        }
+        if label.contains('*') && label != "*" {
+            errors.push(format!(
+                "{loc}: middle DNS label wildcard must be the entire label '*', got '{host}'"
+            ));
+            return;
+        }
     }
 
     // Reject TLD or single-label wildcards. They are accepted by the policy
@@ -802,9 +1006,11 @@ fn validate_mcp_params_field(
     has_tool: bool,
     mcp_strict_tool_names: bool,
 ) {
-    let Some(params) = rule.get("params").filter(|v| !v.is_null()) else {
+    let Some(params) = rule.get("params") else {
         return;
     };
+    // Explicit params must be a map: tool alias lowering inserts params.name
+    // into it, so accepting null would discard the tool selector.
     let Some(params_obj) = params.as_object() else {
         errors.push(format!("{loc}.params: expected map of matchers"));
         return;
@@ -936,6 +1142,69 @@ fn json_endpoint_has_graphql_policy(ep: &serde_json::Value) -> bool {
 ///
 /// Returns a list of errors and warnings. Errors should prevent sandbox startup;
 /// warnings are logged but don't block.
+fn additional_l7_fields(ep: &serde_json::Value) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    let non_empty_string = |name| {
+        ep.get(name)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    };
+    let enabled = |name| {
+        ep.get(name)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+
+    for (name, present) in [
+        ("enforcement", non_empty_string("enforcement")),
+        ("path", non_empty_string("path")),
+        ("allow_encoded_slash", enabled("allow_encoded_slash")),
+        (
+            "websocket_credential_rewrite",
+            enabled("websocket_credential_rewrite"),
+        ),
+        (
+            "request_body_credential_rewrite",
+            enabled("request_body_credential_rewrite"),
+        ),
+        ("persisted_queries", non_empty_string("persisted_queries")),
+        (
+            "graphql_persisted_queries",
+            ep.get("graphql_persisted_queries").is_some(),
+        ),
+        (
+            "graphql_max_body_bytes",
+            ep.get("graphql_max_body_bytes").is_some(),
+        ),
+        (
+            "json_rpc_max_body_bytes",
+            ep.get("json_rpc_max_body_bytes").is_some(),
+        ),
+        (
+            "mcp.strict_tool_names",
+            ep.get("mcp_strict_tool_names").is_some(),
+        ),
+        (
+            "mcp.allow_all_known_mcp_methods",
+            ep.get("mcp_allow_all_known_mcp_methods").is_some(),
+        ),
+        ("credential_signing", non_empty_string("credential_signing")),
+        ("signing_service", non_empty_string("signing_service")),
+        ("signing_region", non_empty_string("signing_region")),
+        (
+            "credential_binding",
+            ep.get("credential_binding")
+                .is_some_and(|value| !value.is_null()),
+        ),
+    ] {
+        if present {
+            fields.push(name);
+        }
+    }
+
+    fields
+}
+
 pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<String>) {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
@@ -981,6 +1250,12 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
             );
             let loc = format!("{name}.endpoints[{i}]");
 
+            errors.extend(
+                validate_endpoint_modes(tls, enforcement, access)
+                    .into_iter()
+                    .map(|reason| format!("{loc}: {reason}")),
+            );
+
             if protocol == "mcp" {
                 if host.trim().is_empty() {
                     errors.push(format!(
@@ -1022,40 +1297,55 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 ));
             }
 
-            // rules + access mutual exclusion
-            if has_rules && !access.is_empty() {
-                errors.push(format!("{loc}: rules and access are mutually exclusive"));
+            // L7 endpoint semantic validation (shared with profile lint).
+            // Computed lazily: has_deny_rules and rules_would_deny_all are
+            // needed here but also referenced by per-rule checks below.
+            let has_deny_rules = ep
+                .get("deny_rules")
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| !a.is_empty());
+            let rules_would_deny_all =
+                ep.get("rules")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|rules| {
+                        !rules.is_empty()
+                            && rules.iter().all(|rule| {
+                                let allow = rule.get("allow");
+                                allow.is_none_or(serde_json::Value::is_null)
+                                    || allow.is_some_and(|v| {
+                                        let str_empty = |key| {
+                                            v.get(key)
+                                                .and_then(|s| s.as_str())
+                                                .unwrap_or("")
+                                                .is_empty()
+                                        };
+                                        str_empty("method")
+                                            && str_empty("path")
+                                            && str_empty("command")
+                                            && str_empty("operation_type")
+                                            && str_empty("operation_name")
+                                            && !mcp_rule_has_tool_selector(v)
+                                    })
+                            })
+                    });
+            let mcp_allow_all_known_mcp_methods = ep
+                .get("mcp_allow_all_known_mcp_methods")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let l7_fields = L7EndpointFields {
+                protocol,
+                access,
+                has_rules,
+                has_deny_rules,
+                rules_would_deny_all,
+                allow_all_known_mcp_methods: mcp_allow_all_known_mcp_methods,
+            };
+            for msg in validate_l7_endpoint_semantics(&l7_fields) {
+                errors.push(format!("{loc}: {msg}"));
             }
-
-            if jsonrpc_family && !access.is_empty() {
-                if protocol == "mcp" {
-                    errors.push(format!(
-                        "{loc}: protocol {protocol} does not support access presets; use rules/deny_rules or set mcp.allow_all_known_mcp_methods: true for an allow-all MCP policy"
-                    ));
-                } else {
-                    errors.push(format!(
-                        "{loc}: protocol {protocol} does not support access presets; use explicit rules with allow.method such as \"*\""
-                    ));
-                }
-            }
-
-            if protocol == "json-rpc" && !has_rules {
-                errors.push(format!(
-                    "{loc}: protocol {protocol} requires explicit rules with allow.method"
-                ));
-            }
-
-            // protocol requires rules or access
-            if !protocol.is_empty() && protocol != "mcp" && !has_rules && access.is_empty() {
-                errors.push(format!(
-                    "{loc}: protocol requires rules or access to define allowed traffic"
-                ));
-            }
-
-            if !protocol.is_empty() && l7_protocol.is_none() {
-                errors.push(format!(
-                    "{loc}: unknown protocol '{protocol}' (expected rest, websocket, graphql, sql, json-rpc, or mcp)"
-                ));
+            for msg in validate_explicit_tcp_additional_fields(protocol, &additional_l7_fields(ep))
+            {
+                errors.push(format!("{loc}: {msg}"));
             }
 
             if let Some(mode) = ep.get("persisted_queries").and_then(|v| v.as_str())
@@ -1108,6 +1398,7 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                     "{loc}: JSON-RPC-specific endpoint fields are ignored unless protocol is json-rpc or mcp"
                 ));
             }
+            validate_mcp_versions_field(&mut errors, &loc, ep, l7_protocol);
             let has_mcp_strict_tool_names = ep.get("mcp_strict_tool_names").is_some();
             let has_mcp_allow_all_known_mcp_methods =
                 ep.get("mcp_allow_all_known_mcp_methods").is_some();
@@ -1145,20 +1436,6 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 .get("mcp_strict_tool_names")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
-            let mcp_allow_all_known_mcp_methods = ep
-                .get("mcp_allow_all_known_mcp_methods")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            if protocol == "mcp"
-                && !has_rules
-                && access.is_empty()
-                && !mcp_allow_all_known_mcp_methods
-            {
-                errors.push(format!(
-                    "{loc}: protocol mcp requires rules when mcp.allow_all_known_mcp_methods is false"
-                ));
-            }
-
             if ep
                 .get("websocket_credential_rewrite")
                 .and_then(serde_json::Value::as_bool)
@@ -1195,13 +1472,6 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 }
             }
 
-            // Deprecated tls values: warn but don't error
-            if tls == "terminate" || tls == "passthrough" {
-                warnings.push(format!(
-                    "{loc}: 'tls: {tls}' is deprecated; TLS termination is now automatic. Use 'tls: skip' to disable."
-                ));
-            }
-
             // tls: skip with L7 on port 443 won't work
             if tls == "skip" && !protocol.is_empty() && ports.contains(&443) {
                 warnings.push(format!(
@@ -1216,41 +1486,9 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 ));
             }
 
-            // rules with empty list
-            if ep
-                .get("rules")
-                .and_then(|v| v.as_array())
-                .is_some_and(Vec::is_empty)
-            {
-                errors.push(format!(
-                    "{loc}: rules list cannot be empty (would deny all traffic). Use `access: full` or remove rules."
-                ));
-            }
-
-            // port 443 + rest + tls: skip — L7 won't work (already handled above)
-            // The old warning about missing `tls: terminate` is no longer needed
-            // because TLS termination is now automatic.
-
-            // Validate deny_rules
-            let has_deny_rules = ep
-                .get("deny_rules")
-                .and_then(|v| v.as_array())
-                .is_some_and(|a| !a.is_empty());
+            // Per-rule deny_rules validation (semantic checks handled by
+            // shared validator above).
             if has_deny_rules {
-                // deny_rules require L7 inspection
-                if protocol.is_empty() {
-                    errors.push(format!(
-                        "{loc}: deny_rules require protocol (L7 inspection must be enabled)"
-                    ));
-                }
-
-                // deny_rules require some allow base (access or rules)
-                if protocol != "mcp" && !has_rules && access.is_empty() {
-                    errors.push(format!(
-                        "{loc}: deny_rules require rules or access to define the base allow set"
-                    ));
-                }
-
                 let has_mcp_tool_allow_selectors =
                     protocol == "mcp" && mcp_endpoint_has_tool_allow_selectors(ep);
 
@@ -1347,6 +1585,17 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 }
             }
 
+            // Empty rules list (explicitly set but empty)
+            if ep
+                .get("rules")
+                .and_then(|v| v.as_array())
+                .is_some_and(Vec::is_empty)
+            {
+                errors.push(format!(
+                    "{loc}: rules list cannot be empty (would deny all traffic). Use `access: full` or remove rules."
+                ));
+            }
+
             // Empty deny_rules list (explicitly set but empty)
             if ep
                 .get("deny_rules")
@@ -1400,16 +1649,20 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 for (rule_idx, rule) in rules.iter().enumerate() {
                     let allow = rule.get("allow").unwrap_or(rule);
                     let rule_loc = format!("{loc}.rules[{rule_idx}].allow");
-                    if has_mcp_tool_allow_selectors
-                        && allow
+                    if has_mcp_tool_allow_selectors && !mcp_rule_has_tool_selector(allow) {
+                        let method = allow
                             .get("method")
                             .and_then(serde_json::Value::as_str)
-                            .is_some_and(method_matcher_matches_tools_call)
-                        && !mcp_rule_has_tool_selector(allow)
-                    {
-                        errors.push(format!(
-                            "{rule_loc}: method matcher allows every tool call and conflicts with MCP tool allow rules; add tool or params.name to narrow tools/call, or remove the tool allow rules"
-                        ));
+                            .unwrap_or("");
+                        if method_matcher_matches_tools_call(method)
+                            || (method.is_empty() && mcp_allow_all_known_mcp_methods)
+                        {
+                            errors.push(format!(
+                                "{rule_loc}: method matcher allows every tool call and conflicts \
+                                 with MCP tool allow rules; add tool or params.name to narrow \
+                                 tools/call, or remove the tool allow rules"
+                            ));
+                        }
                     }
                     validate_jsonrpc_rule_fields(
                         &mut errors,
@@ -1454,23 +1707,125 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
     (errors, warnings)
 }
 
+fn validate_mcp_versions_field(
+    errors: &mut Vec<String>,
+    loc: &str,
+    endpoint: &serde_json::Value,
+    protocol: Option<L7Protocol>,
+) {
+    let Some(value) = endpoint.get("mcp_versions") else {
+        return;
+    };
+    if protocol != Some(L7Protocol::Mcp) {
+        errors.push(format!(
+            "{loc}: mcp.versions is only valid for protocol mcp"
+        ));
+        return;
+    }
+    let Some(values) = value.as_array() else {
+        errors.push(format!("{loc}: mcp.versions must be an array"));
+        return;
+    };
+    if values.is_empty() {
+        errors.push(format!("{loc}: mcp.versions must not be empty"));
+        return;
+    }
+
+    let mut versions = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(value) = value.as_str() else {
+            errors.push(format!("{loc}: mcp.versions entries must be strings"));
+            return;
+        };
+        let Ok(version) = value.parse::<McpProtocolVersion>() else {
+            errors.push(format!(
+                "{loc}: mcp.versions contains an unsupported protocol version"
+            ));
+            return;
+        };
+        versions.push(version);
+    }
+
+    // Runtime ingress has already normalized the allowlist. Requiring strict
+    // order here catches duplicates and bypasses that could otherwise fail
+    // later by removing L7 inspection from the selected route.
+    if !versions.windows(2).all(|pair| pair[0] < pair[1]) {
+        errors.push(format!(
+            "{loc}: mcp.versions must be unique and in canonical order"
+        ));
+    }
+}
+
+/// Map a supported L7 `access` preset to explicit rules for `protocol`.
+///
+/// Returns `None` when `access` is not `read-only`, `read-write`, or `full`.
+/// Graphql and websocket presets differ from REST; all other protocols use
+/// REST presets. Requires prior `validate_l7_policies` so mcp/json-rpc `access`
+/// is rejected before expansion runs.
+fn access_preset_rules(protocol: &str, access: &str) -> Option<Vec<serde_json::Value>> {
+    if protocol == "graphql" {
+        match access {
+            "read-only" => Some(vec![graphql_rule_json("query")]),
+            "read-write" => Some(vec![
+                graphql_rule_json("query"),
+                graphql_rule_json("mutation"),
+            ]),
+            "full" => Some(vec![graphql_rule_json("*")]),
+            _ => None,
+        }
+    } else if protocol == "websocket" {
+        match access {
+            "read-only" => Some(vec![rule_json("GET", "**")]),
+            "read-write" => Some(vec![
+                rule_json("GET", "**"),
+                rule_json("WEBSOCKET_TEXT", "**"),
+            ]),
+            "full" => Some(vec![rule_json("*", "**")]),
+            _ => None,
+        }
+    } else {
+        match access {
+            "read-only" => Some(vec![
+                rule_json("GET", "**"),
+                rule_json("HEAD", "**"),
+                rule_json("OPTIONS", "**"),
+            ]),
+            "read-write" => Some(vec![
+                rule_json("GET", "**"),
+                rule_json("HEAD", "**"),
+                rule_json("OPTIONS", "**"),
+                rule_json("POST", "**"),
+                rule_json("PUT", "**"),
+                rule_json("PATCH", "**"),
+            ]),
+            "full" => Some(vec![rule_json("*", "**")]),
+            _ => None,
+        }
+    }
+}
+
 /// Expand `access` presets into explicit `rules` in the policy data.
 ///
 /// This preprocesses the JSON data so Rego only needs to handle explicit rules.
-pub fn expand_access_presets(data: &mut serde_json::Value) {
+/// Returns warnings for unsupported `access` values that were ignored.
+///
+/// Unsupported preset detection lives here rather than in `validate_l7_policies`
+/// so supported presets stay defined only in `access_preset_rules`.
+pub fn expand_access_presets(data: &mut serde_json::Value) -> Vec<String> {
+    let mut warnings = Vec::new();
     let Some(policies) = data
         .get_mut("network_policies")
         .and_then(|v| v.as_object_mut())
     else {
-        return;
+        return warnings;
     };
 
-    for (_name, policy) in policies.iter_mut() {
+    for (name, policy) in policies.iter_mut() {
         let Some(endpoints) = policy.get_mut("endpoints").and_then(|v| v.as_array_mut()) else {
             continue;
         };
 
-        for ep in endpoints.iter_mut() {
+        for (i, ep) in endpoints.iter_mut().enumerate() {
             let protocol = ep
                 .get("protocol")
                 .and_then(|v| v.as_str())
@@ -1511,38 +1866,13 @@ pub fn expand_access_presets(data: &mut serde_json::Value) {
                 continue;
             }
 
-            let rules = if protocol == "graphql" {
-                match access.as_str() {
-                    "read-only" => vec![graphql_rule_json("query")],
-                    "read-write" => vec![graphql_rule_json("query"), graphql_rule_json("mutation")],
-                    "full" => vec![graphql_rule_json("*")],
-                    _ => continue,
-                }
-            } else if protocol == "websocket" {
-                match access.as_str() {
-                    "read-only" => vec![rule_json("GET", "**")],
-                    "read-write" => vec![rule_json("GET", "**"), rule_json("WEBSOCKET_TEXT", "**")],
-                    "full" => vec![rule_json("*", "**")],
-                    _ => continue,
-                }
-            } else {
-                match access.as_str() {
-                    "read-only" => vec![
-                        rule_json("GET", "**"),
-                        rule_json("HEAD", "**"),
-                        rule_json("OPTIONS", "**"),
-                    ],
-                    "read-write" => vec![
-                        rule_json("GET", "**"),
-                        rule_json("HEAD", "**"),
-                        rule_json("OPTIONS", "**"),
-                        rule_json("POST", "**"),
-                        rule_json("PUT", "**"),
-                        rule_json("PATCH", "**"),
-                    ],
-                    "full" => vec![rule_json("*", "**")],
-                    _ => continue,
-                }
+            let Some(rules) = access_preset_rules(protocol, &access) else {
+                let loc = format!("{name}.endpoints[{i}]");
+                let warning = format!(
+                    "{loc}: unsupported L7 access preset '{access}' ignored; expected one of: read-only, read-write, full"
+                );
+                warnings.push(warning);
+                continue;
             };
 
             ep.as_object_mut()
@@ -1550,6 +1880,8 @@ pub fn expand_access_presets(data: &mut serde_json::Value) {
                 .insert("rules".to_string(), serde_json::Value::Array(rules));
         }
     }
+
+    warnings
 }
 
 fn rule_json(method: &str, path: &str) -> serde_json::Value {
@@ -1593,12 +1925,11 @@ mod tests {
     #[test]
     fn parse_l7_config_rest_enforce() {
         let val = regorus::Value::from_json_str(
-            r#"{"protocol": "rest", "tls": "terminate", "enforcement": "enforce", "host": "api.example.com", "port": 443}"#,
+            r#"{"protocol": "rest", "enforcement": "enforce", "host": "api.example.com", "port": 443}"#,
         )
         .unwrap();
         let config = parse_l7_config(&val).unwrap();
         assert_eq!(config.protocol, L7Protocol::Rest);
-        // "terminate" is deprecated and treated as Auto.
         assert_eq!(config.tls, TlsMode::Auto);
         assert_eq!(config.enforcement, EnforcementMode::Enforce);
     }
@@ -1613,6 +1944,281 @@ mod tests {
         assert_eq!(config.protocol, L7Protocol::Rest);
         assert_eq!(config.tls, TlsMode::Auto);
         assert_eq!(config.enforcement, EnforcementMode::Audit);
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_classifies_only_bound_credential_failure() {
+        use openshell_core::endpoint_status::{
+            EndpointConfigVersion, EndpointInventoryEntry, EndpointResult, EndpointStatusCommand,
+            endpoint_status_channel,
+        };
+
+        let endpoint_id = "endpoint:v1:credential".to_string();
+        let (sender, mut receiver) = endpoint_status_channel();
+        sender
+            .reset(
+                EndpointConfigVersion {
+                    policy_hash: "policy".to_string(),
+                    provider_env_revision: 1,
+                },
+                vec![EndpointInventoryEntry {
+                    endpoint_id: endpoint_id.clone(),
+                    uses_provider_credentials: true,
+                }],
+            )
+            .await
+            .expect("install MCP test inventory");
+        let _reset = receiver.recv().await.expect("inventory reset");
+        let value = regorus::Value::from_json_str(&format!(
+            r#"{{"protocol":"mcp","mcp_versions":["2025-11-25"],"endpoint_id":"{endpoint_id}","policy_hash":"policy","provider_credentialed":true}}"#
+        ))
+        .expect("parse MCP config JSON");
+        let config = parse_l7_config(&value).expect("parse MCP config");
+        let observer = EndpointObserver::begin(Some(&sender), &config).expect("begin observation");
+
+        observer.observe_credential_failure(false);
+
+        assert!(matches!(
+            receiver.recv().await.expect("credential observation"),
+            EndpointStatusCommand::Observe {
+                result: EndpointResult::CredentialUnavailable,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_rejects_old_policy_selection_after_inventory_reset() {
+        use openshell_core::endpoint_status::{
+            EndpointConfigVersion, EndpointInventoryEntry, endpoint_status_channel,
+        };
+
+        let endpoint_id = "endpoint:v1:shared";
+        let inventory = vec![EndpointInventoryEntry {
+            endpoint_id: endpoint_id.to_string(),
+            uses_provider_credentials: false,
+        }];
+        let (sender, mut receiver) = endpoint_status_channel();
+        let mut tracker = receiver.tracker();
+        sender
+            .reset(
+                EndpointConfigVersion {
+                    policy_hash: "policy-a".to_string(),
+                    provider_env_revision: 1,
+                },
+                inventory.clone(),
+            )
+            .await
+            .expect("install first policy inventory");
+        assert!(tracker.apply(receiver.recv().await.expect("first inventory reset")));
+        let value = regorus::Value::from_json_str(
+            r#"{"protocol":"mcp","mcp_versions":["2025-11-25"],"endpoint_id":"endpoint:v1:shared","policy_hash":"policy-a"}"#,
+        )
+        .expect("parse first policy selection");
+        let selected = parse_l7_config(&value).expect("select first policy endpoint");
+
+        // The replacement retains the endpoint address while changing policy.
+        // A delayed selection must not acquire the replacement's authority.
+        sender
+            .reset(
+                EndpointConfigVersion {
+                    policy_hash: "policy-b".to_string(),
+                    provider_env_revision: 1,
+                },
+                inventory,
+            )
+            .await
+            .expect("install replacement policy inventory");
+        assert!(tracker.apply(receiver.recv().await.expect("replacement inventory reset")));
+        if let Some(observer) = EndpointObserver::begin(Some(&sender), &selected) {
+            observer.observe(EndpointResult::PolicyDenied);
+        }
+        while let Ok(command) = receiver.try_recv() {
+            tracker.apply(command);
+        }
+
+        let snapshot = tracker
+            .snapshot()
+            .expect("replacement inventory remains installed");
+        assert_eq!(snapshot.config_version.policy_hash, "policy-b");
+        assert_eq!(snapshot.endpoints.len(), 1);
+        assert_eq!(
+            snapshot.endpoints[0].result,
+            EndpointResult::NoObservedExchange
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_rejects_new_policy_selection_before_inventory_reset() {
+        use openshell_core::endpoint_status::{
+            EndpointConfigVersion, EndpointInventoryEntry, endpoint_status_channel,
+        };
+
+        let (sender, mut receiver) = endpoint_status_channel();
+        let mut tracker = receiver.tracker();
+        sender
+            .reset(
+                EndpointConfigVersion {
+                    policy_hash: "policy-a".to_string(),
+                    provider_env_revision: 1,
+                },
+                vec![EndpointInventoryEntry {
+                    endpoint_id: "endpoint:v1:shared".to_string(),
+                    uses_provider_credentials: false,
+                }],
+            )
+            .await
+            .expect("install first policy inventory");
+        assert!(tracker.apply(receiver.recv().await.expect("first inventory reset")));
+        // The runtime can install the new policy before its inventory reset.
+        // The new policy's result must not be attributed to the old inventory.
+        let value = regorus::Value::from_json_str(
+            r#"{"protocol":"mcp","mcp_versions":["2025-11-25"],"endpoint_id":"endpoint:v1:shared","policy_hash":"policy-b"}"#,
+        )
+        .expect("parse replacement policy selection");
+        let selected = parse_l7_config(&value).expect("select replacement policy endpoint");
+        if let Some(observer) = EndpointObserver::begin(Some(&sender), &selected) {
+            observer.observe(EndpointResult::HttpResponseReceived);
+        }
+        while let Ok(command) = receiver.try_recv() {
+            tracker.apply(command);
+        }
+
+        let snapshot = tracker
+            .snapshot()
+            .expect("first inventory remains installed");
+        assert_eq!(snapshot.config_version.policy_hash, "policy-a");
+        assert_eq!(snapshot.endpoints.len(), 1);
+        assert_eq!(
+            snapshot.endpoints[0].result,
+            EndpointResult::NoObservedExchange
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_rejects_stale_policy_guards_without_disabling_fresh_requests() {
+        use openshell_core::endpoint_status::{
+            EndpointConfigVersion, EndpointInventoryEntry, endpoint_status_channel,
+        };
+
+        let policy = openshell_policy::restrictive_default_policy();
+        let engine = crate::opa::OpaEngine::from_proto(&policy).expect("test policy engine");
+        let (sender, mut receiver) = endpoint_status_channel();
+        let mut tracker = receiver.tracker();
+        sender
+            .reset(
+                EndpointConfigVersion {
+                    policy_hash: "policy".to_string(),
+                    provider_env_revision: 1,
+                },
+                vec![EndpointInventoryEntry {
+                    endpoint_id: "endpoint:v1:shared".to_string(),
+                    uses_provider_credentials: false,
+                }],
+            )
+            .await
+            .expect("install test inventory");
+        assert!(tracker.apply(receiver.recv().await.expect("inventory reset")));
+        let context = sender.capture().expect("capture installed authority");
+        let value = regorus::Value::from_json_str(
+            r#"{"protocol":"mcp","mcp_versions":["2025-11-25"],"endpoint_id":"endpoint:v1:shared","policy_hash":"policy"}"#,
+        )
+        .expect("parse selected MCP policy");
+        let selected = parse_l7_config(&value).expect("selected MCP endpoint");
+        let previous_guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("capture initial policy guard");
+        let previous_observer = EndpointObserver::begin_captured(
+            Some(&sender),
+            &selected,
+            Some(&context),
+            Some(1),
+            Some(&previous_guard),
+        )
+        .expect("current policy can begin an observation");
+
+        // Runtime generations can advance while the canonical policy and
+        // inventory stay equal. Only new selections may use the new runtime.
+        engine
+            .reload_from_proto(&policy)
+            .expect("reinstall same policy");
+        assert!(
+            EndpointObserver::begin_captured(
+                Some(&sender),
+                &selected,
+                Some(&context),
+                Some(1),
+                Some(&previous_guard),
+            )
+            .is_none()
+        );
+        previous_observer.observe(EndpointResult::HttpResponseReceived);
+        while let Ok(command) = receiver.try_recv() {
+            tracker.apply(command);
+        }
+        assert_eq!(
+            tracker
+                .snapshot()
+                .expect("inventory remains installed")
+                .endpoints[0]
+                .result,
+            EndpointResult::NoObservedExchange,
+        );
+
+        let current_guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("capture replacement policy guard");
+        let current_observer = EndpointObserver::begin_captured(
+            Some(&sender),
+            &selected,
+            Some(&context),
+            Some(1),
+            Some(&current_guard),
+        )
+        .expect("fresh selection stays observable without an inventory reset");
+        current_observer.observe(EndpointResult::HttpResponseReceived);
+        assert!(tracker.apply(receiver.recv().await.expect("fresh policy observation")));
+        assert_eq!(
+            tracker
+                .snapshot()
+                .expect("inventory remains installed")
+                .endpoints[0]
+                .result,
+            EndpointResult::HttpResponseReceived,
+        );
+    }
+
+    #[tokio::test]
+    async fn non_mcp_endpoint_never_begins_an_observation() {
+        use openshell_core::endpoint_status::{EndpointConfigVersion, endpoint_status_channel};
+
+        let (sender, _receiver) = endpoint_status_channel();
+        sender
+            .reset(
+                EndpointConfigVersion {
+                    policy_hash: "policy".to_string(),
+                    provider_env_revision: 1,
+                },
+                Vec::new(),
+            )
+            .await
+            .expect("install MCP test configuration");
+        let value = regorus::Value::from_json_str(
+            r#"{"protocol":"rest","endpoint_id":"endpoint:v1:not-mcp"}"#,
+        )
+        .expect("parse REST config JSON");
+        let config = parse_l7_config(&value).expect("parse REST config");
+        assert!(EndpointObserver::begin(Some(&sender), &config).is_none());
+    }
+
+    #[test]
+    fn parse_l7_config_rejects_unknown_enforcement() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "enforcement": "enforc", "access": "read-only", "host": "api.example.com", "port": 443}"#,
+        )
+        .unwrap();
+
+        assert!(parse_l7_config(&val).is_none());
     }
 
     #[test]
@@ -1678,6 +2284,43 @@ mod tests {
     }
 
     #[test]
+    fn parse_endpoint_credential_guard_handles_l4_and_opt_in() {
+        let guarded = regorus::Value::from_json_str(
+            r#"{"host":"api.example.com","ports":[443],"provider_credentialed":true}"#,
+        )
+        .unwrap();
+        let guard = parse_endpoint_credential_guard(&guarded);
+        assert!(guard.blocks_connect());
+
+        let opted_in = regorus::Value::from_json_str(
+            r#"{"host":"api.example.com","ports":[443],"provider_credentialed":true,"allow_uninspected_credentials":true}"#,
+        )
+        .unwrap();
+        assert!(!parse_endpoint_credential_guard(&opted_in).blocks_connect());
+    }
+
+    #[test]
+    fn generic_resolver_enables_rest_body_backstop_without_provider_marker() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol":"rest","host":"api.example.com","ports":[443]}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert!(!config.deny_uninspected_body_credentials(false));
+        assert!(config.deny_uninspected_body_credentials(true));
+
+        let opted_in = regorus::Value::from_json_str(
+            r#"{"protocol":"rest","host":"api.example.com","ports":[443],"allow_uninspected_credentials":true}"#,
+        )
+        .unwrap();
+        assert!(
+            !parse_l7_config(&opted_in)
+                .unwrap()
+                .deny_uninspected_body_credentials(true)
+        );
+    }
+
+    #[test]
     fn parse_l7_config_allow_encoded_slash_defaults_false() {
         let val = regorus::Value::from_json_str(
             r#"{"protocol": "rest", "host": "api.example.com", "port": 443}"#,
@@ -1700,7 +2343,7 @@ mod tests {
     #[test]
     fn parse_l7_config_mcp_strict_tool_names_defaults_true() {
         let val = regorus::Value::from_json_str(
-            r#"{"protocol": "mcp", "host": "mcp.example.com", "port": 443}"#,
+            r#"{"protocol": "mcp", "host": "mcp.example.com", "port": 443, "mcp_versions": ["2025-11-25"]}"#,
         )
         .unwrap();
         let config = parse_l7_config(&val).unwrap();
@@ -1710,11 +2353,51 @@ mod tests {
     #[test]
     fn parse_l7_config_mcp_strict_tool_names_can_disable() {
         let val = regorus::Value::from_json_str(
-            r#"{"protocol": "mcp", "host": "mcp.example.com", "port": 443, "mcp_strict_tool_names": false}"#,
+            r#"{"protocol": "mcp", "host": "mcp.example.com", "port": 443, "mcp_strict_tool_names": false, "mcp_versions": ["2025-11-25"]}"#,
         )
         .unwrap();
         let config = parse_l7_config(&val).unwrap();
         assert!(!config.mcp_strict_tool_names);
+    }
+
+    #[test]
+    fn parse_l7_config_requires_canonical_mcp_versions() {
+        let explicit = regorus::Value::from_json_str(
+            r#"{"protocol": "mcp", "mcp_versions": ["2025-03-26", "2025-11-25"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_l7_config(&explicit).unwrap().mcp_versions,
+            vec![
+                McpProtocolVersion::V2025_03_26,
+                McpProtocolVersion::V2025_11_25
+            ]
+        );
+
+        for invalid in [
+            r#"{"protocol": "mcp"}"#,
+            r#"{"protocol": "mcp", "mcp_versions": []}"#,
+            r#"{"protocol": "mcp", "mcp_versions": ["2026-01-01"]}"#,
+            r#"{"protocol": "mcp", "mcp_versions": [1]}"#,
+            r#"{"protocol": "mcp", "mcp_versions": ["2025-11-25", "2025-11-25"]}"#,
+            r#"{"protocol": "mcp", "mcp_versions": ["2025-11-25", "2025-03-26"]}"#,
+        ] {
+            let value = regorus::Value::from_json_str(invalid).unwrap();
+            assert!(
+                parse_l7_config(&value).is_none(),
+                "non-canonical MCP runtime config must be rejected: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_l7_config_keeps_mcp_versions_off_other_protocols() {
+        let value = regorus::Value::from_json_str(
+            r#"{"protocol": "json-rpc", "mcp_versions": ["2025-11-25"]}"#,
+        )
+        .unwrap();
+
+        assert!(parse_l7_config(&value).unwrap().mcp_versions.is_empty());
     }
 
     #[test]
@@ -1801,6 +2484,63 @@ mod tests {
     }
 
     #[test]
+    fn validate_explicit_tcp_rejects_additional_l7_field_families() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "database.example.com",
+                        "port": 5432,
+                        "protocol": "tcp",
+                        "enforcement": "enforce",
+                        "path": "/query",
+                        "allow_encoded_slash": true,
+                        "websocket_credential_rewrite": true,
+                        "request_body_credential_rewrite": true,
+                        "persisted_queries": "allow_registered",
+                        "graphql_persisted_queries": {},
+                        "graphql_max_body_bytes": 1024,
+                        "json_rpc_max_body_bytes": 1024,
+                        "mcp_strict_tool_names": false,
+                        "mcp_allow_all_known_mcp_methods": false,
+                        "credential_signing": "sigv4",
+                        "signing_service": "rds",
+                        "signing_region": "us-west-2",
+                        "credential_binding": {"provider": "database"}
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+
+        let (errors, _) = validate_l7_policies(&data);
+        let tcp_error = errors
+            .iter()
+            .find(|error| error.contains("protocol tcp does not support L7-only fields"))
+            .expect("explicit TCP should reject additional L7 fields");
+
+        for field in [
+            "enforcement",
+            "path",
+            "allow_encoded_slash",
+            "websocket_credential_rewrite",
+            "request_body_credential_rewrite",
+            "persisted_queries",
+            "graphql_persisted_queries",
+            "graphql_max_body_bytes",
+            "json_rpc_max_body_bytes",
+            "mcp.strict_tool_names",
+            "mcp.allow_all_known_mcp_methods",
+            "credential_signing",
+            "signing_service",
+            "signing_region",
+            "credential_binding",
+        ] {
+            assert!(tcp_error.contains(field), "missing {field}: {tcp_error}");
+        }
+    }
+
+    #[test]
     fn validate_request_body_credential_rewrite_warns_unless_rest() {
         let data = serde_json::json!({
             "network_policies": {
@@ -1840,7 +2580,8 @@ mod tests {
             }
         });
 
-        expand_access_presets(&mut data);
+        let warnings = expand_access_presets(&mut data);
+        assert!(warnings.is_empty(), "expected no warnings: {warnings:?}");
         let rules = data["network_policies"]["test"]["endpoints"][0]["rules"]
             .as_array()
             .unwrap();
@@ -2353,6 +3094,46 @@ mod tests {
     }
 
     #[test]
+    fn validate_mcp_empty_allow_with_allow_all_conflicts_with_tool_rules() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "mcp.example.com",
+                        "port": 443,
+                        "protocol": "mcp",
+                        "mcp_allow_all_known_mcp_methods": true,
+                        "rules": [{
+                            "allow": {
+                                "params": { "name": { "glob": "read_*" } }
+                            }
+                        }, {
+                            "allow": {
+                                "method": "",
+                                "path": "",
+                                "command": "",
+                                "operation_type": "",
+                                "operation_name": ""
+                            }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("rules[1].allow")
+                    && e.contains("allows every tool call")
+                    && e.contains("conflicts with MCP tool allow rules")
+            }),
+            "empty allow with allow_all_known_mcp_methods normalizes to method:* and should \
+             conflict with tool-specific rules: {errors:?}"
+        );
+    }
+
+    #[test]
     fn validate_jsonrpc_rejects_params_matchers() {
         let data = serde_json::json!({
             "network_policies": {
@@ -2611,30 +3392,37 @@ mod tests {
     }
 
     #[test]
-    fn validate_tls_terminate_deprecated_warning() {
-        let data = serde_json::json!({
-            "network_policies": {
-                "test": {
-                    "endpoints": [{
-                        "host": "api.example.com",
-                        "port": 443,
-                        "tls": "terminate",
-                        "protocol": "rest",
-                        "access": "full"
-                    }],
-                    "binaries": []
+    fn validate_rejects_unknown_endpoint_modes_without_warning() {
+        for (field, value) in [
+            ("tls", "terminate"),
+            ("tls", "passthrough"),
+            ("enforcement", "enforcee"),
+            ("access", "read_only"),
+        ] {
+            let mut endpoint = serde_json::json!({
+                "host": "api.example.com",
+                "port": 443,
+                "protocol": "rest",
+                "access": "full"
+            });
+            endpoint[field] = value.into();
+            let data = serde_json::json!({
+                "network_policies": {
+                    "test": { "endpoints": [endpoint], "binaries": [] }
                 }
-            }
-        });
-        let (errors, warnings) = validate_l7_policies(&data);
-        assert!(
-            errors.is_empty(),
-            "deprecated tls should not error: {errors:?}"
-        );
-        assert!(
-            warnings.iter().any(|w| w.contains("deprecated")),
-            "should warn about deprecated tls: {warnings:?}"
-        );
+            });
+
+            let (errors, warnings) = validate_l7_policies(&data);
+            assert!(
+                errors.iter().any(|e| e.contains("test.endpoints[0]")
+                    && e.contains(&format!("unknown {field} value '{value}'"))),
+                "{field}: {value} should be rejected: {errors:?}"
+            );
+            assert!(
+                !warnings.iter().any(|w| w.contains("deprecated")),
+                "{field}: {value} should not warn: {warnings:?}"
+            );
+        }
     }
 
     #[test]
@@ -2700,7 +3488,8 @@ mod tests {
                 }
             }
         });
-        expand_access_presets(&mut data);
+        let warnings = expand_access_presets(&mut data);
+        assert!(warnings.is_empty(), "expected no warnings: {warnings:?}");
         let rules = data["network_policies"]["test"]["endpoints"][0]["rules"]
             .as_array()
             .unwrap();
@@ -2729,13 +3518,44 @@ mod tests {
                 }
             }
         });
-        expand_access_presets(&mut data);
+        let warnings = expand_access_presets(&mut data);
+        assert!(warnings.is_empty(), "expected no warnings: {warnings:?}");
         let rules = data["network_policies"]["test"]["endpoints"][0]["rules"]
             .as_array()
             .unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0]["allow"]["method"].as_str().unwrap(), "*");
         assert_eq!(rules[0]["allow"]["path"].as_str().unwrap(), "**");
+    }
+
+    #[test]
+    fn expand_unsupported_access_preset_warns_and_leaves_rules_unexpanded() {
+        let mut data = serde_json::json!({
+            "network_policies": {
+                "allow-my-service": {
+                    "endpoints": [{
+                        "host": "my-service.example.com",
+                        "port": 80,
+                        "protocol": "rest",
+                        "access": "allow"
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let warnings = expand_access_presets(&mut data);
+        assert!(
+            data["network_policies"]["allow-my-service"]["endpoints"][0]
+                .get("rules")
+                .is_none(),
+            "unsupported access preset must not expand rules"
+        );
+        assert_eq!(
+            warnings,
+            vec![
+                "allow-my-service.endpoints[0]: unsupported L7 access preset 'allow' ignored; expected one of: read-only, read-write, full".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -2753,7 +3573,8 @@ mod tests {
                 }
             }
         });
-        expand_access_presets(&mut data);
+        let warnings = expand_access_presets(&mut data);
+        assert!(warnings.is_empty(), "expected no warnings: {warnings:?}");
         let rules = data["network_policies"]["test"]["endpoints"][0]["rules"]
             .as_array()
             .unwrap();
@@ -2826,7 +3647,8 @@ mod tests {
                 }
             }
         });
-        expand_access_presets(&mut data);
+        let warnings = expand_access_presets(&mut data);
+        assert!(warnings.is_empty(), "expected no warnings: {warnings:?}");
         assert!(
             data["network_policies"]["test"]["endpoints"][0]
                 .get("rules")
@@ -2877,12 +3699,36 @@ mod tests {
     }
 
     #[test]
-    fn validate_wildcard_host_mid_label_error() {
+    fn validate_wildcard_host_middle_label_star_valid_no_error() {
         let data = serde_json::json!({
             "network_policies": {
                 "test": {
                     "endpoints": [{
-                        "host": "foo.*.example.com",
+                        "host": "*.s3.*.amazonaws.com",
+                        "port": 443
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.is_empty(),
+            "*.s3.*.amazonaws.com should be valid, got errors: {errors:?}"
+        );
+        assert!(
+            warnings.is_empty(),
+            "*.s3.*.amazonaws.com should not warn, got warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn validate_wildcard_host_middle_label_partial_star_error() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "*.s3.us-*.amazonaws.com",
                         "port": 443
                     }],
                     "binaries": []
@@ -2891,8 +3737,30 @@ mod tests {
         });
         let (errors, _warnings) = validate_l7_policies(&data);
         assert!(
-            errors.iter().any(|e| e.contains("first DNS label")),
-            "Mid-label wildcard should be rejected, got errors: {errors:?}"
+            errors
+                .iter()
+                .any(|e| e.contains("middle DNS label wildcard")),
+            "Partial middle-label wildcard should be rejected, got errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_wildcard_host_middle_label_double_star_error() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "*.s3.**.amazonaws.com",
+                        "port": 443
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| e.contains("recursive host wildcard")),
+            "Middle-label ** wildcard should be rejected, got errors: {errors:?}"
         );
     }
 
@@ -3380,6 +4248,140 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("deny_rules require rules or access")),
             "should require rules or access for deny_rules: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rules_empty_list_rejected() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "rest",
+                        "access": "full",
+                        "rules": []
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("rules list cannot be empty")),
+            "should reject empty rules: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rules_deny_all_with_empty_allow_object() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "rest",
+                        "rules": [{"allow": {"method": "", "path": ""}}]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| e.contains("would deny all traffic")),
+            "should detect deny-all with empty allow object: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_params_selector_not_classified_as_deny_all() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "mcp.example.com",
+                        "port": 443,
+                        "protocol": "mcp",
+                        "mcp_allow_all_known_mcp_methods": true,
+                        "rules": [{
+                            "allow": {
+                                "method": "",
+                                "path": "",
+                                "command": "",
+                                "operation_type": "",
+                                "operation_name": "",
+                                "params": { "name": { "glob": "read_*" } }
+                            }
+                        }],
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors.is_empty(),
+            "MCP rule with params.name selector should not be classified as deny-all: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_tool_selector_not_classified_as_deny_all() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "mcp.example.com",
+                        "port": 443,
+                        "protocol": "mcp",
+                        "mcp_allow_all_known_mcp_methods": true,
+                        "rules": [{
+                            "allow": {
+                                "method": "",
+                                "path": "",
+                                "command": "",
+                                "operation_type": "",
+                                "operation_name": "",
+                                "tool": "my-tool"
+                            }
+                        }],
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors.is_empty(),
+            "MCP rule with tool selector should not be classified as deny-all: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_allow_all_with_empty_allow_not_denied() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "mcp.example.com",
+                        "port": 443,
+                        "protocol": "mcp",
+                        "mcp_allow_all_known_mcp_methods": true,
+                        "rules": [{"allow": {}}],
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            !errors.iter().any(|e| e.contains("would deny all traffic")),
+            "MCP with allow_all and empty allow should not be rejected as deny-all: {errors:?}"
         );
     }
 

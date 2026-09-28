@@ -5,6 +5,10 @@
 # Build output
 /target/
 e2e/rust/target/
+target/
+
+# Test result artifacts (JUnit XML, etc.)
+/results/
 debug/
 release/
 
@@ -63,7 +67,12 @@ pip-log.txt
 pip-delete-this-directory.txt
 
 # Unit test / coverage reports
+coverage.out
+coverage/
 htmlcov/
+
+# Trivy scan reports (tasks/scripts/trivy-scan-*.sh)
+/reports/
 .tox/
 .nox/
 .coverage
@@ -133,6 +142,16 @@ tramp
 .\#*
 
 # =============================================================================
+# Agent tooling
+# =============================================================================
+
+# Local agent state and configuration
+.codex/
+.pi/
+.claude/settings.local.json
+.claude/worktrees/
+
+# =============================================================================
 # OS
 # =============================================================================
 
@@ -170,6 +189,9 @@ temp/
 *.tmp
 e2e/gpu/images/.build/
 
+# Ansible Galaxy roles
+/tests/ansible/.roles/
+
 # Secrets/credentials (should never be committed)
 *.pem
 *.key
@@ -200,15 +222,9 @@ artifacts/
 # Local mise settings
 mise.local.toml
 
-# Local Codex app state
-.codex/
-
 # Ignore plans for now
 architecture/plans
 
-# Claude
-.claude/settings.local.json
-.claude/worktrees/
 rfc.md
 .worktrees
 .z3-trace

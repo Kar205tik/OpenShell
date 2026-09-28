@@ -5,18 +5,26 @@
 
 from __future__ import annotations
 
+from .errors import ErrorInfo, FieldViolation, GatewayError, from_grpc_error
+from .mutations import DeletionOutcome, DeletionResult
 from .sandbox import (
-    ClusterInferenceConfig,
+    ClientCredentialsAuth,
     ExecChunk,
     ExecResult,
-    InferenceRouteClient,
+    Page,
+    Pager,
     Sandbox,
     SandboxClient,
     SandboxError,
     SandboxRef,
     SandboxSession,
     SandboxStatusRef,
+    SandboxTemplateClient,
+    SandboxWorkloadTemplateProvenanceRef,
+    ServiceExposure,
     TlsConfig,
+    WorkspaceClient,
+    WorkspaceRef,
 )
 
 try:
@@ -27,16 +35,28 @@ except Exception:
     __version__ = "0.0.0"
 
 __all__ = [
-    "ClusterInferenceConfig",
+    "ClientCredentialsAuth",
+    "DeletionOutcome",
+    "DeletionResult",
+    "ErrorInfo",
     "ExecChunk",
     "ExecResult",
-    "InferenceRouteClient",
+    "FieldViolation",
+    "GatewayError",
+    "Page",
+    "Pager",
     "Sandbox",
     "SandboxClient",
     "SandboxError",
     "SandboxRef",
     "SandboxSession",
     "SandboxStatusRef",
+    "SandboxTemplateClient",
+    "SandboxWorkloadTemplateProvenanceRef",
+    "ServiceExposure",
     "TlsConfig",
+    "WorkspaceClient",
+    "WorkspaceRef",
     "__version__",
+    "from_grpc_error",
 ]

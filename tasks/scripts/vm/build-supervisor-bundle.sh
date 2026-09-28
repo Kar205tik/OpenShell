@@ -7,6 +7,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 OUTPUT_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-compressed}"
 
+# shellcheck source=tasks/scripts/build-env.sh
+source "${ROOT}/tasks/scripts/build-env.sh"
+
 GUEST_ARCH=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -43,10 +46,10 @@ fi
 
 case "${GUEST_ARCH}" in
     aarch64|arm64)
-        RUST_TARGET="aarch64-unknown-linux-gnu"
+        SANDBOX_RUST_TARGET="aarch64-unknown-linux-musl"
         ;;
     x86_64|amd64)
-        RUST_TARGET="x86_64-unknown-linux-gnu"
+        SANDBOX_RUST_TARGET="x86_64-unknown-linux-musl"
         ;;
     *)
         echo "ERROR: Unsupported guest architecture: ${GUEST_ARCH}" >&2
@@ -55,70 +58,17 @@ case "${GUEST_ARCH}" in
         ;;
 esac
 
-SUPERVISOR_BIN="${ROOT}/target/${RUST_TARGET}/release/openshell-sandbox"
+SUPERVISOR_BIN="${ROOT}/target/${SANDBOX_RUST_TARGET}/release/openshell-sandbox"
 SUPERVISOR_OUTPUT="${OUTPUT_DIR}/openshell-sandbox.zst"
-
-ensure_build_nofile_limit() {
-    local desired="${OPENSHELL_VM_BUILD_NOFILE_LIMIT:-8192}"
-    local minimum=1024
-    local current=""
-    local hard=""
-    local target=""
-
-    [ "$(uname -s)" = "Darwin" ] || return 0
-    command -v cargo-zigbuild >/dev/null 2>&1 || return 0
-
-    current="$(ulimit -n 2>/dev/null || echo "")"
-    case "${current}" in
-        ''|*[!0-9]*)
-            return 0
-            ;;
-    esac
-
-    if [ "${current}" -ge "${desired}" ]; then
-        return 0
-    fi
-
-    hard="$(ulimit -Hn 2>/dev/null || echo "")"
-    target="${desired}"
-    case "${hard}" in
-        ''|unlimited|infinity)
-            ;;
-        *[!0-9]*)
-            ;;
-        *)
-            if [ "${hard}" -lt "${target}" ]; then
-                target="${hard}"
-            fi
-            ;;
-    esac
-
-    if [ "${target}" -gt "${current}" ] && ulimit -n "${target}" 2>/dev/null; then
-        echo "==> Raised open file limit for cargo-zigbuild: ${current} -> $(ulimit -n)"
-    fi
-
-    current="$(ulimit -n 2>/dev/null || echo "${current}")"
-    case "${current}" in
-        ''|*[!0-9]*)
-            return 0
-            ;;
-    esac
-
-    if [ "${current}" -lt "${desired}" ]; then
-        echo "WARNING: Open file limit is ${current}; cargo-zigbuild is more reliable at ${desired}+ on macOS."
-    fi
-
-    if [ "${current}" -lt "${minimum}" ]; then
-        echo "ERROR: Open file limit (${current}) is too low for cargo-zigbuild on macOS." >&2
-        echo "       Run: ulimit -n ${desired}" >&2
-        echo "       Then re-run this script." >&2
-        exit 1
-    fi
-}
+VM_INIT_BIN="${ROOT}/target/${SANDBOX_RUST_TARGET}/release/openshell-vm-init"
+VM_INIT_OUTPUT="${OUTPUT_DIR}/openshell-vm-init.zst"
+HOST_SUPERVISOR_BIN="${ROOT}/target/release/openshell-supervisor"
+HOST_SUPERVISOR_OUTPUT="${OUTPUT_DIR}/openshell-supervisor.zst"
 
 echo "==> Building openshell-sandbox supervisor bundle"
 echo "    Guest arch: ${GUEST_ARCH}"
-echo "    Rust target: ${RUST_TARGET}"
+echo "    Sandbox target: ${SANDBOX_RUST_TARGET} (static musl)"
+echo "    Host supervisor target: native"
 echo "    Output: ${SUPERVISOR_OUTPUT}"
 
 mkdir -p "${OUTPUT_DIR}"
@@ -134,13 +84,19 @@ run_supervisor_build() {
     fi
 
     if command -v cargo-zigbuild >/dev/null 2>&1; then
-        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo zigbuild --release -p openshell-sandbox --target "${RUST_TARGET}" \
+        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo zigbuild --release -p openshell-sandbox --target "${SANDBOX_RUST_TARGET}" \
+            --manifest-path "${ROOT}/Cargo.toml"
+        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo zigbuild --release -p openshell-driver-vm --bin openshell-vm-init --no-default-features --target "${SANDBOX_RUST_TARGET}" \
             --manifest-path "${ROOT}/Cargo.toml"
     else
         echo "    cargo-zigbuild not found, falling back to cargo build..."
-        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p openshell-sandbox --target "${RUST_TARGET}" \
+        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p openshell-sandbox --target "${SANDBOX_RUST_TARGET}" \
+            --manifest-path "${ROOT}/Cargo.toml"
+        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p openshell-driver-vm --bin openshell-vm-init --no-default-features --target "${SANDBOX_RUST_TARGET}" \
             --manifest-path "${ROOT}/Cargo.toml"
     fi
+    ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p openshell-supervisor \
+        --manifest-path "${ROOT}/Cargo.toml"
 }
 
 print_build_failure() {
@@ -171,13 +127,25 @@ else
     fi
 fi
 
-if [ ! -f "${SUPERVISOR_BIN}" ]; then
-    echo "ERROR: supervisor binary not found at ${SUPERVISOR_BIN}" >&2
+if [ ! -f "${SUPERVISOR_BIN}" ] || [ ! -f "${VM_INIT_BIN}" ] || [ ! -f "${HOST_SUPERVISOR_BIN}" ]; then
+    echo "ERROR: sandbox, VM init, or supervisor binary not found after build" >&2
+    exit 1
+fi
+
+if readelf -l "${SUPERVISOR_BIN}" 2>/dev/null | grep -q 'Requesting program interpreter'; then
+    echo "ERROR: VM guest openshell-sandbox must be statically linked" >&2
+    exit 1
+fi
+if readelf -l "${VM_INIT_BIN}" 2>/dev/null | grep -q 'Requesting program interpreter'; then
+    echo "ERROR: openshell-vm-init must be statically linked" >&2
     exit 1
 fi
 
 zstd -19 -T0 -f "${SUPERVISOR_BIN}" -o "${SUPERVISOR_OUTPUT}"
+zstd -19 -T0 -f "${VM_INIT_BIN}" -o "${VM_INIT_OUTPUT}"
+zstd -19 -T0 -f "${HOST_SUPERVISOR_BIN}" -o "${HOST_SUPERVISOR_OUTPUT}"
 
 echo "==> Bundled supervisor ready"
 echo "    Binary: $(du -sh "${SUPERVISOR_BIN}" | cut -f1)"
 echo "    Compressed: $(du -sh "${SUPERVISOR_OUTPUT}" | cut -f1)"
+echo "    VM init: $(du -sh "${VM_INIT_OUTPUT}" | cut -f1)"

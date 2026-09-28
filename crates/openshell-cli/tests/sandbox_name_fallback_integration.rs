@@ -3,9 +3,7 @@
 
 mod helpers;
 
-use helpers::{
-    EnvVarGuard, build_ca, build_client_cert, build_server_cert, install_rustls_provider,
-};
+use helpers::{EnvVarGuard, build_ca, build_client_cert, build_server_cert};
 use openshell_bootstrap::{load_last_sandbox, save_last_sandbox};
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
@@ -14,7 +12,8 @@ use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateProviderRequest,
     CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderRequest,
     DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent,
+    DetachSandboxProviderRequest, DetachSandboxProviderResponse,
+    ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
     ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
     GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
@@ -48,6 +47,64 @@ struct TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn peer_report_provider_readiness(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportProviderReadinessResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn peer_report_endpoint_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportEndpointStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportEndpointStatusResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn peer_get_sandbox_provider_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxProviderStatusResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn report_endpoint_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportEndpointStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportEndpointStatusResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::ReportEndpointStatusResponse {},
+        ))
+    }
+
+    async fn begin_rootfs_tar_staging(
+        &self,
+        _request: tonic::Request<openshell_core::proto::BeginRootfsTarStagingRequest>,
+    ) -> Result<Response<openshell_core::proto::BeginRootfsTarStagingResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn report_main_process_exit(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportMainProcessExitResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn finalize_main_process_exit(
+        &self,
+        _request: tonic::Request<openshell_core::proto::FinalizeMainProcessExitRequest>,
+    ) -> Result<Response<openshell_core::proto::FinalizeMainProcessExitResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn get_current_user(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetCurrentUserRequest>,
+    ) -> Result<Response<openshell_core::proto::GetCurrentUserResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn health(
         &self,
         _request: tonic::Request<HealthRequest>,
@@ -58,6 +115,13 @@ impl OpenShell for TestOpenShell {
         }))
     }
 
+    async fn get_gateway_info(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetGatewayInfoRequest>,
+    ) -> Result<Response<openshell_core::proto::GetGatewayInfoResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn create_sandbox(
         &self,
         _request: tonic::Request<CreateSandboxRequest>,
@@ -65,23 +129,42 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(SandboxResponse::default()))
     }
 
+    async fn stop_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::StopSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn start_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::StartSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn get_sandbox(
         &self,
         request: tonic::Request<GetSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        let name = request.into_inner().name;
+        let request = request.into_inner();
+        let name = request.name.clone();
         *self.state.last_get_name.lock().await = Some(name.clone());
         Ok(Response::new(SandboxResponse {
             sandbox: Some(Sandbox {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "test-id".to_string(),
                     name,
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: std::collections::HashMap::new(),
                     resource_version: 0,
+                    annotations: std::collections::HashMap::new(),
+                    workspace: String::new(),
+                    deletion_time: None,
                 }),
                 ..Default::default()
             }),
+            service_urls: std::collections::HashMap::new(),
         }))
     }
 
@@ -91,6 +174,8 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<ListSandboxesResponse>, Status> {
         Ok(Response::new(ListSandboxesResponse::default()))
     }
+
+    unimplemented_sandbox_template_rpcs!();
 
     async fn list_sandbox_providers(
         &self,
@@ -117,7 +202,10 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
-        Ok(Response::new(DeleteSandboxResponse { deleted: true }))
+        Ok(Response::new(DeleteSandboxResponse {
+            sandbox_id: String::new(),
+            outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+        }))
     }
 
     async fn get_sandbox_config(
@@ -125,13 +213,10 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<GetSandboxConfigRequest>,
     ) -> Result<Response<GetSandboxConfigResponse>, Status> {
         let req = request.into_inner();
-        assert_eq!(
-            req.sandbox_id, "test-id",
-            "GetSandboxConfig should pass the id from GetSandbox"
-        );
+        assert!(!req.name.is_empty());
         Ok(Response::new(GetSandboxConfigResponse {
             policy: Some(SandboxPolicy {
-                version: 9,
+                version: 1,
                 network_policies: [
                     (
                         "user_api".to_string(),
@@ -141,8 +226,9 @@ impl OpenShell for TestOpenShell {
                                 host: "api.user.example.com".to_string(),
                                 port: 443,
                                 protocol: "rest".to_string(),
-                                enforcement: "enforce".to_string(),
-                                access: "read-only".to_string(),
+                                enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce
+                                    as i32,
+                                access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
                                 ..Default::default()
                             }],
                             ..Default::default()
@@ -156,8 +242,9 @@ impl OpenShell for TestOpenShell {
                                 host: "api.provider.example.com".to_string(),
                                 port: 443,
                                 protocol: "rest".to_string(),
-                                enforcement: "enforce".to_string(),
-                                access: "read-only".to_string(),
+                                enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce
+                                    as i32,
+                                access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
                                 ..Default::default()
                             }],
                             ..Default::default()
@@ -181,6 +268,24 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<GetGatewayConfigRequest>,
     ) -> Result<Response<GetGatewayConfigResponse>, Status> {
         Ok(Response::new(GetGatewayConfigResponse::default()))
+    }
+
+    async fn get_sandbox_provider_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxProviderStatusResponse>, Status> {
+        Err(Status::unimplemented(
+            "provider readiness is not exercised by this mock",
+        ))
+    }
+
+    async fn report_provider_readiness(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportProviderReadinessResponse>, Status> {
+        Err(Status::unimplemented(
+            "provider installation reports are not exercised by this mock",
+        ))
     }
 
     async fn get_sandbox_provider_environment(
@@ -236,6 +341,13 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(
             openshell_core::proto::RevokeSshSessionResponse::default(),
         ))
+    }
+
+    async fn exchange_provider_subject_token(
+        &self,
+        _request: tonic::Request<ExchangeProviderSubjectTokenRequest>,
+    ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn create_provider(
@@ -339,7 +451,9 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<DeleteProviderRequest>,
     ) -> Result<Response<DeleteProviderResponse>, Status> {
-        Ok(Response::new(DeleteProviderResponse { deleted: true }))
+        Ok(Response::new(DeleteProviderResponse {
+            outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+        }))
     }
 
     type WatchSandboxStream =
@@ -390,12 +504,12 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<GetSandboxPolicyStatusRequest>,
     ) -> Result<Response<GetSandboxPolicyStatusResponse>, Status> {
         let req = request.into_inner();
-        assert_eq!(req.name, "my-sandbox");
+        assert_eq!(req.sandbox, "my-sandbox");
         assert_eq!(req.version, 3);
         assert!(!req.global);
 
         let policy = SandboxPolicy {
-            version: 7,
+            version: 1,
             network_policies: std::iter::once((
                 "api".to_string(),
                 NetworkPolicyRule {
@@ -404,8 +518,8 @@ impl OpenShell for TestOpenShell {
                         host: "api.example.com".to_string(),
                         port: 443,
                         protocol: "rest".to_string(),
-                        enforcement: "enforce".to_string(),
-                        access: "read-only".to_string(),
+                        enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+                        access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -420,8 +534,8 @@ impl OpenShell for TestOpenShell {
                 version: 7,
                 policy_hash: "sha256:test-policy".to_string(),
                 status: PolicyStatus::Loaded.into(),
-                created_at_ms: 1_700_000_000_000,
-                loaded_at_ms: 1_700_000_000_500,
+                created_time: openshell_core::time::timestamp_from_millis(1_700_000_000_000).ok(),
+                loaded_time: openshell_core::time::timestamp_from_millis(1_700_000_000_500).ok(),
                 policy: Some(policy),
                 ..Default::default()
             }),
@@ -433,6 +547,13 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::ListSandboxPoliciesRequest>,
     ) -> Result<Response<openshell_core::proto::ListSandboxPoliciesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn report_sandbox_configuration(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportSandboxConfigurationRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportSandboxConfigurationResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 
@@ -551,6 +672,17 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
+    type PeerRelayStream = tokio_stream::wrappers::ReceiverStream<
+        Result<openshell_core::proto::PeerRelayFrame, Status>,
+    >;
+
+    async fn peer_relay(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::PeerRelayFrame>>,
+    ) -> Result<Response<Self::PeerRelayStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     type ForwardTcpStream = tokio_stream::wrappers::ReceiverStream<
         Result<openshell_core::proto::TcpForwardFrame, Status>,
     >;
@@ -559,6 +691,55 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<tonic::Streaming<openshell_core::proto::TcpForwardFrame>>,
     ) -> Result<Response<Self::ForwardTcpStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn create_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::CreateWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::CreateWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::GetWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_workspaces(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListWorkspacesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListWorkspacesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn add_workspace_member(
+        &self,
+        _request: tonic::Request<openshell_core::proto::AddWorkspaceMemberRequest>,
+    ) -> Result<Response<openshell_core::proto::AddWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn remove_workspace_member(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RemoveWorkspaceMemberRequest>,
+    ) -> Result<Response<openshell_core::proto::RemoveWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_workspace_members(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListWorkspaceMembersRequest>,
+    ) -> Result<Response<openshell_core::proto::ListWorkspaceMembersResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 }
@@ -571,8 +752,6 @@ struct TestServer {
 }
 
 async fn run_server() -> TestServer {
-    install_rustls_provider();
-
     let (ca, ca_key) = build_ca();
     let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
     let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
@@ -628,9 +807,16 @@ async fn run_server() -> TestServer {
 async fn sandbox_get_sends_correct_name() {
     let ts = run_server().await;
 
-    run::sandbox_get(&ts.endpoint, "my-sandbox", false, &ts.tls)
-        .await
-        .expect("sandbox_get should succeed");
+    run::sandbox_get(
+        &ts.endpoint,
+        "my-sandbox",
+        false,
+        "table",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("sandbox_get should succeed");
 
     let recorded = ts.openshell.state.last_get_name.lock().await.clone();
     assert_eq!(
@@ -645,9 +831,16 @@ async fn sandbox_get_sends_correct_name() {
 async fn sandbox_get_policy_only_round_trip() {
     let ts = run_server().await;
 
-    run::sandbox_get(&ts.endpoint, "my-sandbox", true, &ts.tls)
-        .await
-        .expect("sandbox_get with policy_only should succeed");
+    run::sandbox_get(
+        &ts.endpoint,
+        "my-sandbox",
+        true,
+        "table",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("sandbox_get with policy_only should succeed");
 
     let recorded = ts.openshell.state.last_get_name.lock().await.clone();
     assert_eq!(recorded.as_deref(), Some("my-sandbox"));
@@ -662,16 +855,16 @@ async fn sandbox_get_with_persisted_last_sandbox() {
     let _guard = EnvVarGuard::set(&[("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap())]);
 
     // Persist a last-used sandbox for "integration-cluster".
-    save_last_sandbox("integration-cluster", "persisted-sb")
+    save_last_sandbox("integration-cluster", "default", "persisted-sb")
         .expect("save_last_sandbox should succeed");
 
     // Resolve the name (simulates what the CLI does in main.rs).
-    let resolved = load_last_sandbox("integration-cluster")
+    let resolved = load_last_sandbox("integration-cluster", "default")
         .expect("load_last_sandbox should return the saved name");
     assert_eq!(resolved, "persisted-sb");
 
     // Call sandbox_get with the resolved name.
-    run::sandbox_get(&ts.endpoint, &resolved, false, &ts.tls)
+    run::sandbox_get(&ts.endpoint, &resolved, false, "table", "default", &ts.tls)
         .await
         .expect("sandbox_get should succeed");
 
@@ -695,6 +888,7 @@ async fn policy_get_full_json_cli_prints_policy_payload() {
         0,
         run::PolicyGetView::Full,
         "json",
+        "default",
         &ts.tls,
         (&mut stdout, &mut stderr),
     )
@@ -743,6 +937,7 @@ async fn policy_get_base_json_cli_prints_round_trippable_policy_payload() {
         0,
         run::PolicyGetView::Base,
         "json",
+        "default",
         &ts.tls,
         (&mut stdout, &mut stderr),
     )
@@ -784,6 +979,7 @@ async fn policy_get_explicit_revision_uses_stored_policy_status() {
         3,
         run::PolicyGetView::Full,
         "json",
+        "default",
         &ts.tls,
         (&mut stdout, &mut stderr),
     )
@@ -819,11 +1015,18 @@ async fn explicit_name_takes_precedence_over_persisted() {
     let _guard = EnvVarGuard::set(&[("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap())]);
 
     // Persist one name, but supply a different one explicitly.
-    save_last_sandbox("my-cluster", "old-sandbox").expect("save should succeed");
+    save_last_sandbox("my-cluster", "default", "old-sandbox").expect("save should succeed");
 
-    run::sandbox_get(&ts.endpoint, "explicit-sandbox", false, &ts.tls)
-        .await
-        .expect("sandbox_get should succeed");
+    run::sandbox_get(
+        &ts.endpoint,
+        "explicit-sandbox",
+        false,
+        "table",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("sandbox_get should succeed");
 
     let recorded = ts.openshell.state.last_get_name.lock().await.clone();
     assert_eq!(
