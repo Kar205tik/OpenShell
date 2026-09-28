@@ -127,15 +127,15 @@ async fn create_sandbox(
         sandbox_name.to_string(),
         "--detach".to_string(),
     ];
-    match smoke_command()? {
-        Some(command) => {
-            args.push("--".to_string());
-            args.extend(command);
-        }
-        None => {
-            args.push("--from".to_string());
-            args.push("base".to_string());
-        }
+    if let Some(extra_args) = json_string_array_env("OPENSHELL_CONFORMANCE_SMOKE_CREATE_ARGS")? {
+        args.extend(extra_args);
+    }
+    if let Some(command) = smoke_command()? {
+        args.push("--".to_string());
+        args.extend(command);
+    } else {
+        args.push("--from".to_string());
+        args.push("base".to_string());
     }
     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
     let create = runner
@@ -153,21 +153,31 @@ fn smoke_command() -> Result<Option<Vec<String>>, String> {
 }
 
 fn parse_smoke_command(value: Option<OsString>) -> Result<Option<Vec<String>>, String> {
-    let Some(value) = value else {
+    let Some(command) = json_string_array("OPENSHELL_CONFORMANCE_SMOKE_COMMAND", value)? else {
         return Ok(None);
     };
-    let value = value.into_string().map_err(|_| {
-        "OPENSHELL_CONFORMANCE_SMOKE_COMMAND must contain valid Unicode JSON".to_string()
-    })?;
-    let command = serde_json::from_str::<Vec<String>>(&value).map_err(|error| {
-        format!("OPENSHELL_CONFORMANCE_SMOKE_COMMAND must be a JSON string array: {error}")
-    })?;
     if command.first().is_none_or(String::is_empty) {
         return Err(
             "OPENSHELL_CONFORMANCE_SMOKE_COMMAND must contain a non-empty executable".to_string(),
         );
     }
     Ok(Some(command))
+}
+
+fn json_string_array_env(name: &str) -> Result<Option<Vec<String>>, String> {
+    json_string_array(name, std::env::var_os(name))
+}
+
+fn json_string_array(name: &str, value: Option<OsString>) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| format!("{name} must contain valid Unicode JSON"))?;
+    serde_json::from_str::<Vec<String>>(&value)
+        .map(Some)
+        .map_err(|error| format!("{name} must be a JSON string array: {error}"))
 }
 
 async fn delete_sandbox(
@@ -324,5 +334,17 @@ mod tests {
     fn smoke_command_rejects_an_empty_executable() {
         let error = parse_smoke_command(Some(OsString::from(r#"[""]"#))).unwrap_err();
         assert!(error.contains("non-empty executable"));
+    }
+
+    #[test]
+    fn smoke_create_args_parse_a_json_string_array() {
+        assert_eq!(
+            json_string_array(
+                "OPENSHELL_CONFORMANCE_SMOKE_CREATE_ARGS",
+                Some(OsString::from(r#"["--policy","policy.yaml"]"#)),
+            )
+            .unwrap(),
+            Some(vec!["--policy".into(), "policy.yaml".into()])
+        );
     }
 }

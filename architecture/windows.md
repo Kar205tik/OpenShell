@@ -246,6 +246,10 @@ Windows validation separates source correctness from host capability:
   fail-closed loss handling without requiring MXC.
 - The architecture-specific `windows:*` tasks check, lint, build, and run
   workspace and unsupported-driver contract tests for x64 and ARM64.
+- Hosted Windows CI runs the archive suite's control-plane smoke test against
+  the in-process MXC mock. This verifies the public CLI, gateway, driver wiring,
+  and create/get/list/delete contract without claiming OS enforcement. It does
+  not run the exec smoke test because MXC does not support `sandbox exec`.
 - Mock MXC E2E validates gateway, CLI, driver, lifecycle, and policy wiring but
   is not evidence of OS enforcement.
 - Hosted Windows CI runs the shipped provider-credential example with a
