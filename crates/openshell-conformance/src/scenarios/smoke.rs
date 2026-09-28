@@ -75,24 +75,26 @@ async fn run_smoke_exec_inner(runner: &mut OpenShellRunner) -> Result<(), String
     check_sandbox_ready(runner, &sandbox_name).await?;
 
     let marker = format!("openshell-conformance-{}", runner.id());
+    let marker_command = platform::marker_command(&marker);
+    let mut args = vec![
+        "sandbox".to_string(),
+        "exec".to_string(),
+        "--name".to_string(),
+        sandbox_name.clone(),
+        "--no-tty".to_string(),
+        "--".to_string(),
+    ];
+    args.extend(marker_command.argv().iter().cloned());
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
     let exec = runner
         .step("exec")
         .description("sandbox exec exits successfully")
         .with_timeout(EXEC_TIMEOUT)
-        .run(&[
-            "sandbox",
-            "exec",
-            "--name",
-            &sandbox_name,
-            "--no-tty",
-            "--",
-            "echo",
-            &marker,
-        ])
+        .run(&args)
         .await
         .map_err(|error| error.to_string())?;
     exec.require_success()?;
-    let expected_stdout = format!("{marker}\n");
+    let expected_stdout = marker_command.expected_stdout();
     if exec.stdout() != expected_stdout {
         return Err(exec.failure_diagnostic(&format!("stdout is exactly {expected_stdout:?}")));
     }

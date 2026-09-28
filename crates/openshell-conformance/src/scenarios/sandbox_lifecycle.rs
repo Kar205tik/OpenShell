@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::platform::{self, CommandExpectation, SandboxFixture};
 use crate::{OpenShellRunner, Poll, Scenario, ScenarioFuture};
 
 const CREATE_TIMEOUT: Duration = Duration::from_mins(10);
@@ -37,25 +38,17 @@ fn run_sandbox_lifecycle(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
 async fn stop_start_preserves_workspace(runner: &mut OpenShellRunner) -> Result<(), String> {
     let sandbox_name = format!("ct-{}-ss", runner.id());
     let sentinel = format!("openshell-stop-start-{}", runner.id());
-    let sentinel_path = "/sandbox/.openshell-stop-start-sentinel";
-    let run_count_path = "/sandbox/.openshell-main-run-count";
-    let main = format!(
-        "count=0; test ! -f '{run_count_path}' || count=$(cat '{run_count_path}'); \
-         count=$((count + 1)); printf '%s\\n' \"$count\" > '{run_count_path}'; \
-         exec sleep infinity"
-    );
+    let fixture = platform::lifecycle_fixture()?;
+    let sentinel_path = fixture.path(".openshell-stop-start-sentinel");
+    let run_count_path = fixture.path(".openshell-main-run-count");
+    let main = platform::increment_then_wait(&run_count_path);
 
-    create_running_sandbox(runner, &sandbox_name, &main, "stop-start").await?;
+    create_running_sandbox(runner, &sandbox_name, &fixture, &main, "stop-start").await?;
     exec_expect_exact(
         runner,
         &sandbox_name,
         "write-sentinel",
-        &[
-            "sh",
-            "-lc",
-            &format!("printf '%s\\n' '{sentinel}' > '{sentinel_path}' && sync"),
-        ],
-        "",
+        &platform::write_text(&sentinel_path, &sentinel),
     )
     .await?;
 
@@ -68,16 +61,10 @@ async fn stop_start_preserves_workspace(runner: &mut OpenShellRunner) -> Result<
             "sandbox '{sandbox_name}' rejects exec while stopped"
         ))
         .with_timeout(COMMAND_TIMEOUT)
-        .run(&[
-            "sandbox",
-            "exec",
-            "--name",
+        .run(&exec_args(
             &sandbox_name,
-            "--no-tty",
-            "--",
-            "cat",
-            sentinel_path,
-        ])
+            platform::read_text(&sentinel_path, &sentinel).argv(),
+        ))
         .await
         .map_err(|error| error.to_string())?;
     if stopped_exec.success() {
@@ -93,29 +80,23 @@ async fn stop_start_preserves_workspace(runner: &mut OpenShellRunner) -> Result<
         runner,
         &sandbox_name,
         "read-sentinel",
-        &["cat", sentinel_path],
-        &format!("{sentinel}\n"),
+        &platform::read_text(&sentinel_path, &sentinel),
     )
     .await?;
     exec_expect_exact(
         runner,
         &sandbox_name,
         "read-main-run-count",
-        &["cat", run_count_path],
-        "2\n",
+        &platform::read_text(&run_count_path, "2"),
     )
     .await
 }
 
 async fn stopped_can_be_deleted(runner: &mut OpenShellRunner) -> Result<(), String> {
     let sandbox_name = format!("ct-{}-sd", runner.id());
-    create_running_sandbox(
-        runner,
-        &sandbox_name,
-        "exec sleep infinity",
-        "stopped-delete",
-    )
-    .await?;
+    let fixture = platform::lifecycle_fixture()?;
+    let main = platform::keep_alive(&fixture);
+    create_running_sandbox(runner, &sandbox_name, &fixture, &main, "stopped-delete").await?;
 
     run_lifecycle_command(runner, "stop", &sandbox_name, "stopped-delete/stop").await?;
     wait_for_phase(runner, &sandbox_name, "Stopped", "stopped-delete/stopped").await?;
@@ -128,26 +109,28 @@ async fn stopped_can_be_deleted(runner: &mut OpenShellRunner) -> Result<(), Stri
 async fn create_running_sandbox(
     runner: &mut OpenShellRunner,
     sandbox_name: &str,
-    main: &str,
+    fixture: &SandboxFixture,
+    main: &[String],
     step: &str,
 ) -> Result<(), String> {
     runner.track_sandbox(sandbox_name);
+    let mut args = vec![
+        "sandbox".to_string(),
+        "create".to_string(),
+        "--name".to_string(),
+        sandbox_name.to_string(),
+        "--detach".to_string(),
+        "--no-tty".to_string(),
+    ];
+    args.extend(fixture.create_args().iter().cloned());
+    args.push("--".to_string());
+    args.extend(main.iter().cloned());
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
     let create = runner
         .step(format!("{step}/create"))
         .description(format!("sandbox '{sandbox_name}' is created"))
         .with_timeout(CREATE_TIMEOUT)
-        .run(&[
-            "sandbox",
-            "create",
-            "--name",
-            sandbox_name,
-            "--detach",
-            "--no-tty",
-            "--",
-            "sh",
-            "-lc",
-            main,
-        ])
+        .run(&args)
         .await
         .map_err(|error| error.to_string())?;
     create.require_success()?;
@@ -174,24 +157,30 @@ async fn exec_expect_exact(
     runner: &OpenShellRunner,
     sandbox_name: &str,
     step: &str,
-    command: &[&str],
-    expected_stdout: &str,
+    command: &CommandExpectation,
 ) -> Result<(), String> {
-    let mut args = vec!["sandbox", "exec", "--name", sandbox_name, "--no-tty", "--"];
-    args.extend_from_slice(command);
     let result = runner
         .step(format!("stop-start/{step}"))
         .description(format!("sandbox '{sandbox_name}' exec {step} succeeds"))
         .with_timeout(COMMAND_TIMEOUT)
-        .run(&args)
+        .run(&exec_args(sandbox_name, command.argv()))
         .await
         .map_err(|error| error.to_string())?;
     result.require_success()?;
-    if result.stdout() == expected_stdout {
+    if result.stdout() == command.expected_stdout() {
         Ok(())
     } else {
-        Err(result.failure_diagnostic(&format!("stdout is exactly {expected_stdout:?}")))
+        Err(result.failure_diagnostic(&format!(
+            "stdout is exactly {:?}",
+            command.expected_stdout()
+        )))
     }
+}
+
+fn exec_args<'a>(sandbox_name: &'a str, command: &'a [String]) -> Vec<&'a str> {
+    let mut args = vec!["sandbox", "exec", "--name", sandbox_name, "--no-tty", "--"];
+    args.extend(command.iter().map(String::as_str));
+    args
 }
 
 async fn wait_for_phase(

@@ -32,10 +32,12 @@ specific unsupported operation without hiding later coverage. Driver internals,
 platform enforcement, and hardware qualification belong in driver-specific
 tests rather than this crate.
 
-Target-specific fixture construction lives under `src/platform`. The smoke
-scenarios select the Unix or Windows implementation at compile time while the
-scenario assertions remain shared. Platform implementations may construct
-temporary policies and commands, but must exercise the same public behavior.
+Target-specific fixture and command construction lives in `src/platform/unix.rs`
+and `src/platform/windows.rs`. Scenarios select one implementation at compile
+time while their control flow and assertions remain shared. The platform layer
+provides a small set of reusable operations instead of mirroring the scenario
+tree. Implementations may construct temporary policies and commands, but must
+exercise the same public behavior.
 
 When adding a scenario, export it from the library and add the appropriate Cargo
 test wrapper under `tests/suites/conformance/cli`, then add the leaf to the
