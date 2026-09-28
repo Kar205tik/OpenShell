@@ -17,33 +17,6 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-/// Strip ANSI escape codes (e.g. colors) from a string, for readable failure
-/// messages. Not required for the assertions below to pass — the driver's
-/// own tracing output carries ANSI codes even when captured non-interactively,
-/// but they never fragment the substrings these tests check for — this is
-/// purely so a failed assertion's `{clean}` output is readable.
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                for c in chars.by_ref() {
-                    if c.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-
-    out
-}
-
 /// Run `openshell-driver-podman` pointed at a Podman socket that does not
 /// exist, and wait for it to exit.
 ///
@@ -51,14 +24,15 @@ fn strip_ansi(s: &str) -> String {
 /// socket briefly re-activating), so this can take several seconds.
 async fn run_with_unreachable_podman_socket() -> (String, i32, Duration, PathBuf) {
     let tmpdir = tempfile::tempdir().expect("create isolated socket dir");
-    let missing_socket = tmpdir
-        .path()
-        .join("openshell-driver-podman-nonexistent.sock");
+    // Use a short relative path so miette cannot insert a line-wrap gutter
+    // inside it on platforms with long temporary-directory paths.
+    let missing_socket = PathBuf::from("missing-podman.sock");
 
     let start = Instant::now();
     let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell-driver-podman"));
     cmd.arg("--podman-socket")
         .arg(&missing_socket)
+        .current_dir(tmpdir.path())
         .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -102,15 +76,14 @@ async fn driver_error_names_unreachable_socket() {
     let (output, code, _, missing_socket) = run_with_unreachable_podman_socket().await;
 
     assert_ne!(code, 0);
-    let clean = strip_ansi(&output);
 
     assert!(
-        clean.contains("connection error"),
-        "driver error should describe a connection failure:\n{clean}"
+        output.contains("connection error"),
+        "driver error should describe a connection failure:\n{output}"
     );
     assert!(
-        clean.contains(missing_socket.to_str().expect("socket path is utf-8")),
-        "driver error should name the unreachable socket path {}:\n{clean}",
+        output.contains(missing_socket.to_str().expect("socket path is utf-8")),
+        "driver error should name the unreachable socket path {}:\n{output}",
         missing_socket.display()
     );
 }
