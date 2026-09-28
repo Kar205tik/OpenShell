@@ -23,7 +23,7 @@ use tokio::time::sleep;
 
 use self::executor::{CliExecutionError, CliExecutor, ProcessCli};
 
-pub use scenarios::SMOKE_SCENARIO;
+pub use scenarios::{SMOKE_CONTROL_PLANE_SCENARIO, SMOKE_EXEC_SCENARIO, SMOKE_SCENARIO};
 
 /// An installed conformance scenario.
 #[derive(Debug)]

@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Portable phase-1 CLI conformance scenario.
+//! Portable smoke conformance scenarios.
 
+use std::ffi::OsString;
 use std::time::{Duration, Instant};
 
 use crate::{OpenShellRunner, STATUS_TIMEOUT, Scenario, ScenarioFuture};
@@ -31,15 +32,40 @@ struct SandboxListPage {
 /// Certify status -> create -> list Ready -> exec -> delete -> list empty.
 pub const SMOKE_SCENARIO: Scenario = Scenario {
     name: "smoke",
-    description: "Create, inspect, execute in, and delete a base sandbox.",
+    description: "Run the control-plane and exec smoke scenarios.",
     run: run_smoke,
 };
 
+/// Certify status -> create -> get/list Ready -> delete -> list empty.
+pub const SMOKE_CONTROL_PLANE_SCENARIO: Scenario = Scenario {
+    name: "smoke-control-plane",
+    description: "Create, inspect, and delete a sandbox without using sandbox exec.",
+    run: run_smoke_control_plane,
+};
+
+/// Certify create -> exec -> delete for drivers that support interactive exec.
+pub const SMOKE_EXEC_SCENARIO: Scenario = Scenario {
+    name: "smoke-exec",
+    description: "Create a sandbox, execute a command in it, and delete it.",
+    run: run_smoke_exec,
+};
+
 fn run_smoke(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
-    Box::pin(async move { run_smoke_inner(runner).await })
+    Box::pin(async move {
+        run_smoke_control_plane_inner(runner).await?;
+        run_smoke_exec_inner(runner).await
+    })
 }
 
-async fn run_smoke_inner(runner: &mut OpenShellRunner) -> Result<(), String> {
+fn run_smoke_control_plane(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
+    Box::pin(async move { run_smoke_control_plane_inner(runner).await })
+}
+
+fn run_smoke_exec(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
+    Box::pin(async move { run_smoke_exec_inner(runner).await })
+}
+
+async fn run_smoke_control_plane_inner(runner: &mut OpenShellRunner) -> Result<(), String> {
     let status = runner
         .step("status")
         .description("openshell status succeeds")
@@ -49,51 +75,18 @@ async fn run_smoke_inner(runner: &mut OpenShellRunner) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     status.require_success()?;
 
-    let sandbox_name = format!("ct-{}-01", runner.id());
-    runner.track_sandbox(&sandbox_name);
-    let create = runner
-        .step("create")
-        .description("sandbox creation succeeds")
-        .with_timeout(CREATE_TIMEOUT)
-        .run(&[
-            "sandbox",
-            "create",
-            "--name",
-            &sandbox_name,
-            "--from",
-            "base",
-            "--detach",
-        ])
-        .await
-        .map_err(|error| error.to_string())?;
-    create.require_success()?;
-
-    let get = runner
-        .step("get-ready")
-        .description(format!("sandbox '{sandbox_name}' can be retrieved"))
-        .with_timeout(LIST_ATTEMPT_TIMEOUT)
-        .run(&["sandbox", "get", &sandbox_name, "--output", "json"])
-        .await
-        .map_err(|error| error.to_string())?;
-    get.require_success()?;
-
-    let sandbox = get
-        .json::<SandboxListEntry>()
-        .map_err(|error| error.to_string())?;
-    if sandbox.name != sandbox_name {
-        return Err(format!(
-            "sandbox get returned {:?}; expected sandbox '{sandbox_name}'",
-            sandbox.name
-        ));
-    }
-    if sandbox.phase != "Ready" {
-        return Err(format!(
-            "sandbox '{sandbox_name}' is in phase {:?}; expected Ready",
-            sandbox.phase
-        ));
-    }
-
+    let sandbox_name = format!("ct-{}-cp", runner.id());
+    create_sandbox(runner, &sandbox_name, "create").await?;
+    check_sandbox_ready(runner, &sandbox_name).await?;
     check_sandbox_listed(runner, &sandbox_name).await?;
+
+    delete_sandbox(runner, &sandbox_name, "delete").await
+}
+
+async fn run_smoke_exec_inner(runner: &mut OpenShellRunner) -> Result<(), String> {
+    let sandbox_name = format!("ct-{}-ex", runner.id());
+    create_sandbox(runner, &sandbox_name, "create").await?;
+    check_sandbox_ready(runner, &sandbox_name).await?;
 
     let marker = format!("openshell-conformance-{}", runner.id());
     let exec = runner
@@ -118,17 +111,109 @@ async fn run_smoke_inner(runner: &mut OpenShellRunner) -> Result<(), String> {
         return Err(exec.failure_diagnostic(&format!("stdout is exactly {expected_stdout:?}")));
     }
 
+    delete_sandbox(runner, &sandbox_name, "delete").await
+}
+
+async fn create_sandbox(
+    runner: &mut OpenShellRunner,
+    sandbox_name: &str,
+    step: &str,
+) -> Result<(), String> {
+    runner.track_sandbox(sandbox_name);
+    let mut args = vec![
+        "sandbox".to_string(),
+        "create".to_string(),
+        "--name".to_string(),
+        sandbox_name.to_string(),
+        "--detach".to_string(),
+    ];
+    match smoke_command()? {
+        Some(command) => {
+            args.push("--".to_string());
+            args.extend(command);
+        }
+        None => {
+            args.push("--from".to_string());
+            args.push("base".to_string());
+        }
+    }
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let create = runner
+        .step(step)
+        .description("sandbox creation succeeds")
+        .with_timeout(CREATE_TIMEOUT)
+        .run(&args)
+        .await
+        .map_err(|error| error.to_string())?;
+    create.require_success()
+}
+
+fn smoke_command() -> Result<Option<Vec<String>>, String> {
+    parse_smoke_command(std::env::var_os("OPENSHELL_CONFORMANCE_SMOKE_COMMAND"))
+}
+
+fn parse_smoke_command(value: Option<OsString>) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.into_string().map_err(|_| {
+        "OPENSHELL_CONFORMANCE_SMOKE_COMMAND must contain valid Unicode JSON".to_string()
+    })?;
+    let command = serde_json::from_str::<Vec<String>>(&value).map_err(|error| {
+        format!("OPENSHELL_CONFORMANCE_SMOKE_COMMAND must be a JSON string array: {error}")
+    })?;
+    if command.first().is_none_or(String::is_empty) {
+        return Err(
+            "OPENSHELL_CONFORMANCE_SMOKE_COMMAND must contain a non-empty executable".to_string(),
+        );
+    }
+    Ok(Some(command))
+}
+
+async fn delete_sandbox(
+    runner: &mut OpenShellRunner,
+    sandbox_name: &str,
+    step: &str,
+) -> Result<(), String> {
     let delete = runner
-        .step("delete")
+        .step(step)
         .description("sandbox deletion succeeds")
         .with_timeout(DELETE_TIMEOUT)
-        .run(&["sandbox", "delete", &sandbox_name])
+        .run(&["sandbox", "delete", sandbox_name])
         .await
         .map_err(|error| error.to_string())?;
     delete.require_success()?;
 
-    check_empty_list(runner, &sandbox_name).await?;
-    runner.forget_sandbox(&sandbox_name);
+    check_empty_list(runner, sandbox_name).await?;
+    runner.forget_sandbox(sandbox_name);
+    Ok(())
+}
+
+async fn check_sandbox_ready(runner: &OpenShellRunner, sandbox_name: &str) -> Result<(), String> {
+    let get = runner
+        .step("get-ready")
+        .description(format!("sandbox '{sandbox_name}' can be retrieved"))
+        .with_timeout(LIST_ATTEMPT_TIMEOUT)
+        .run(&["sandbox", "get", sandbox_name, "--output", "json"])
+        .await
+        .map_err(|error| error.to_string())?;
+    get.require_success()?;
+
+    let sandbox = get
+        .json::<SandboxListEntry>()
+        .map_err(|error| error.to_string())?;
+    if sandbox.name != sandbox_name {
+        return Err(format!(
+            "sandbox get returned {:?}; expected sandbox '{sandbox_name}'",
+            sandbox.name
+        ));
+    }
+    if sandbox.phase != "Ready" {
+        return Err(format!(
+            "sandbox '{sandbox_name}' is in phase {:?}; expected Ready",
+            sandbox.phase
+        ));
+    }
     Ok(())
 }
 
@@ -210,5 +295,34 @@ async fn find_sandbox(
         page = page
             .checked_add(1)
             .ok_or_else(|| "sandbox list page counter overflowed".to_string())?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smoke_command_is_optional() {
+        assert_eq!(parse_smoke_command(None).unwrap(), None);
+    }
+
+    #[test]
+    fn smoke_command_parses_a_json_string_array() {
+        assert_eq!(
+            parse_smoke_command(Some(OsString::from(r#"["cmd.exe","/c","exit","0"]"#))).unwrap(),
+            Some(vec![
+                "cmd.exe".into(),
+                "/c".into(),
+                "exit".into(),
+                "0".into()
+            ])
+        );
+    }
+
+    #[test]
+    fn smoke_command_rejects_an_empty_executable() {
+        let error = parse_smoke_command(Some(OsString::from(r#"[""]"#))).unwrap_err();
+        assert!(error.contains("non-empty executable"));
     }
 }

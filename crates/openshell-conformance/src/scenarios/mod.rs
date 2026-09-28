@@ -5,4 +5,4 @@
 
 mod smoke;
 
-pub use smoke::SMOKE_SCENARIO;
+pub use smoke::{SMOKE_CONTROL_PLANE_SCENARIO, SMOKE_EXEC_SCENARIO, SMOKE_SCENARIO};

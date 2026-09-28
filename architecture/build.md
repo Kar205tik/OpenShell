@@ -295,8 +295,11 @@ and retain that provenance with the local entry; mutable tags are used only
 for explicit publication.
 
 CLI conformance runs after target provisioning and operates only through the
-configured OpenShell CLI. The smoke scenario verifies the black-box sandbox
-lifecycle by creating, inspecting, executing in, and deleting a sandbox.
+configured OpenShell CLI. The archive suite defines the installed-artifact test
+boundary, while `openshell-conformance` provides reusable scenarios and a
+standalone compatibility runner. Smoke coverage separates control-plane
+create/get/list/delete behavior from exec behavior so a runtime can run the
+portable subset matching its advertised capabilities.
 
 ## Python Wheel Packaging
 
