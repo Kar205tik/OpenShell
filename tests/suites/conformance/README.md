@@ -30,12 +30,9 @@ diagnose one scenario locally.
 
 Set `OPENSHELL_BIN` to the candidate CLI. The selected gateway must already be
 reachable. Smoke workloads are selected from the conformance crate's Unix or
-Windows implementation at compile time. Set
-`OPENSHELL_CONFORMANCE_SMOKE_CREATE_ARGS` to a JSON string array when a runtime
-needs additional portable create options. For example:
+Windows implementation at compile time. For example:
 
 ```shell
-export OPENSHELL_CONFORMANCE_SMOKE_CREATE_ARGS='["--policy","policy.yaml"]'
 cargo nextest run \
   --manifest-path tests/suites/conformance/Cargo.toml \
   -E 'binary(smoke) & test(=control_plane)'

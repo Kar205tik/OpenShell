@@ -201,8 +201,7 @@ command. Its control-plane test requires
 machine-readable status, creates a uniquely named detached sandbox, verifies it
 is `Ready` through get and paginated list output, deletes it, and verifies its
 name no longer appears. The exec test creates its own sandbox and checks
-`sandbox exec` with a run-specific marker. Additional create options can be
-supplied through `OPENSHELL_CONFORMANCE_SMOKE_CREATE_ARGS`.
+`sandbox exec` with a run-specific marker.
 Sandbox lifecycle, label matrices, VM overlay, and TLS-key permission assertions
 remain regular E2E coverage.
 

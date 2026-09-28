@@ -3,7 +3,6 @@
 
 //! Portable smoke conformance scenarios.
 
-use std::ffi::OsString;
 use std::time::{Duration, Instant};
 
 use crate::platform::{self, SmokeFixture};
@@ -115,9 +114,6 @@ async fn create_sandbox(
         sandbox_name.to_string(),
         "--detach".to_string(),
     ];
-    if let Some(extra_args) = json_string_array_env("OPENSHELL_CONFORMANCE_SMOKE_CREATE_ARGS")? {
-        args.extend(extra_args);
-    }
     args.extend(fixture.create_args().iter().cloned());
     if let Some(command) = fixture.command() {
         args.push("--".to_string());
@@ -133,22 +129,6 @@ async fn create_sandbox(
         .map_err(|error| error.to_string())?;
     create.require_success()?;
     Ok(fixture)
-}
-
-fn json_string_array_env(name: &str) -> Result<Option<Vec<String>>, String> {
-    json_string_array(name, std::env::var_os(name))
-}
-
-fn json_string_array(name: &str, value: Option<OsString>) -> Result<Option<Vec<String>>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let value = value
-        .into_string()
-        .map_err(|_| format!("{name} must contain valid Unicode JSON"))?;
-    serde_json::from_str::<Vec<String>>(&value)
-        .map(Some)
-        .map_err(|error| format!("{name} must be a JSON string array: {error}"))
 }
 
 async fn delete_sandbox(
@@ -276,22 +256,5 @@ async fn find_sandbox(
         page = page
             .checked_add(1)
             .ok_or_else(|| "sandbox list page counter overflowed".to_string())?;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn smoke_create_args_parse_a_json_string_array() {
-        assert_eq!(
-            json_string_array(
-                "OPENSHELL_CONFORMANCE_SMOKE_CREATE_ARGS",
-                Some(OsString::from(r#"["--policy","policy.yaml"]"#)),
-            )
-            .unwrap(),
-            Some(vec!["--policy".into(), "policy.yaml".into()])
-        );
     }
 }
