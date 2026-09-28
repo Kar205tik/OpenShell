@@ -392,7 +392,7 @@ Drivers deliver the two binaries to separate trust domains:
 | Runtime | Delivery model |
 |---|---|
 | Docker | A digest-pinned daemon-local volume supplies `openshell-sandbox`; the companion image runs `openshell-supervisor`. |
-| Podman | A pinned runtime image supplies `openshell-sandbox`; a separate pinned companion image runs `openshell-supervisor`. |
+| Podman | The driver pins `sandbox_runtime_image` and `supervisor_image` to image IDs. The former supplies `openshell-sandbox`; the latter is passed as the companion container's image and runs `openshell-supervisor`. |
 | Kubernetes | A non-root init container stages `openshell-sandbox` into a memory volume; a directly managed Pod runs `openshell-supervisor`. |
 | VM | `openshell-sandbox` is embedded in the guest rootfs; a separately digest-checked native `openshell-supervisor` runs on the host. |
 | Extension | Defined by the out-of-tree driver. |
@@ -429,14 +429,16 @@ live.
 Docker and Podman resolve OCI `Config.User` and `Config.WorkingDir` from one
 immutable image inspection. Empty, `/`, and explicit `/sandbox` values use the
 managed `/sandbox` workspace. Custom paths must be normalized absolute paths
-outside runtime and control mounts; image and driver mounts cannot cover them.
+that do not overlap `/proc`, `/sys`, `/dev`, or OpenShell's private paths. Image
+and driver mounts cannot cover the workspace path or one of its parents.
 
-Podman mounts its persistent workspace volume at a custom root with normal
-image copy-up, preserves the resulting ownership and mode, and starts directly
-as the final non-root identity. An unusable path fails closed. Only the managed
-`/sandbox` fallback uses the root/chown bootstrap. The separate supervisor uses
-the path logically but does not mount the workspace. Kubernetes and VM continue
-to use `/sandbox`.
+Podman mounts its persistent workspace volume at a custom root. When the volume
+is first created, Podman copies existing image-directory contents into it.
+OpenShell preserves their ownership and mode and starts directly as the final
+non-root identity. An unusable path fails closed. Only the managed `/sandbox`
+fallback uses the root/chown bootstrap. The separate supervisor receives the
+path but does not mount the workspace. Kubernetes and VM continue to use
+`/sandbox`.
 
 ### Executable Identity Binding
 

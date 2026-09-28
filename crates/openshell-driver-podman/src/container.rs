@@ -228,6 +228,11 @@ pub struct ResolvedPodmanImage {
 }
 
 impl ResolvedPodmanImage {
+    /// Resolve the image metadata and reject:
+    /// - a malformed or relative working directory, or one overlapping runtime
+    ///   or `OpenShell` control paths;
+    /// - an image volume with an invalid or reserved target; and
+    /// - an image volume covering the workspace or any of its ancestors.
     pub fn from_inspect(inspected: &ImageInspect) -> Result<Self, ComputeDriverError> {
         let image_config = inspected.config.as_ref();
         let workspace_root = driver_mounts::resolve_oci_workspace_root(

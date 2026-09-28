@@ -92,24 +92,23 @@ environment belong to agent children, never the supervisor process.
 
 ## OCI working directory
 
-The immutable workload-image inspection also resolves OCI `WorkingDir`. Empty,
-`/`, and explicit `/sandbox` values select the managed `/sandbox` workspace.
-Custom paths must be normalized absolute paths outside runtime and control
-mounts. Image and driver mounts may be nested below the workspace but cannot
-cover it.
+OpenShell reads `WORKDIR` from the workload image. If it is unset, `/`, or
+`/sandbox`, OpenShell uses its managed `/sandbox` workspace. A custom path must
+be absolute, with no `.` or `..` segments. It cannot overlap container system
+paths (`/proc`, `/sys`, `/dev`) or OpenShell's private paths (for example,
+`/.openshell` and `/run/openshell`). Image and driver mounts may be inside the
+workspace, but cannot replace the workspace path or one of its parents.
 
-For a custom root, the driver mounts the persistent workspace volume at the
-resolved path without `nocopy` or ownership-changing volume options. Podman
-performs its normal first-use copy-up from the image. OpenShell preserves the
-copied ownership and mode, starts directly as the final non-root identity, and
-fails closed unless that identity can traverse and write the path. Agent
-children use the path as cwd and `HOME`; `filesystem.include_workdir` grants it
-when enabled.
+For a custom path, Podman mounts a persistent workspace volume there. When the
+volume is first created, Podman copies any files already in that image directory
+into it. OpenShell keeps their ownership and permissions, starts as the final
+non-root user, and rejects the image if that user cannot reach and write the
+directory. Agent commands use the path as their working directory and `HOME`;
+`filesystem.include_workdir` grants access to it when enabled.
 
-Only `/sandbox` uses the root-to-non-root bootstrap needed to prepare a managed
-workspace. The separate supervisor receives the path logically but does not
-mount it. Because Podman copy-up varies by deployment, validate custom images
-with the target runtime configuration.
+For `/sandbox`, OpenShell prepares the managed workspace before switching to
+the non-root user. The separate supervisor receives the path but does not mount
+the workspace. Test custom images with the Podman configuration you will use.
 
 ## Lifecycle and readiness
 

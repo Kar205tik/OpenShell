@@ -269,11 +269,14 @@ Set `process.run_as_user` and `process.run_as_group` in the sandbox policy to ch
 
 On Docker and Podman, the image's `WORKDIR` becomes the workspace. Images with
 no `WORKDIR`, `WORKDIR /`, or `WORKDIR /sandbox` use OpenShell's managed
-`/sandbox` workspace. Custom paths must be normalized absolute paths outside
-runtime and control mounts. Image and driver mounts cannot cover the workspace.
+`/sandbox` workspace. Custom paths must be absolute, with no `.` or `..`
+segments, and cannot overlap container system paths (`/proc`, `/sys`, `/dev`)
+or OpenShell's private paths. Image and driver mounts cannot replace the
+workspace or one of its parents.
 
 Docker validates the directory in the image filesystem. Podman mounts the
-persistent workspace volume at that path with normal image copy-up. OpenShell
-preserves its ownership and mode, and fails unless the final non-root identity
-can traverse and write it. Validate custom images with the target Podman
-configuration. Kubernetes and MicroVM continue to use `/sandbox`.
+persistent workspace volume at that path. When the volume is first created,
+Podman copies existing files from the image directory into it. OpenShell keeps
+their ownership and permissions, and fails unless the final non-root user can
+reach and write the directory. Test custom images with the Podman configuration
+you will use. Kubernetes and MicroVM continue to use `/sandbox`.
