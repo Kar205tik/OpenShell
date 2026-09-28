@@ -27,7 +27,9 @@ workspace and select tests with nextest filters.
 
 Set `OPENSHELL_BIN` to the candidate CLI. The selected gateway must already be
 reachable. Runtimes that require an explicit sandbox workload can set
-`OPENSHELL_CONFORMANCE_SMOKE_COMMAND` to a JSON string array. For example:
+`OPENSHELL_CONFORMANCE_SMOKE_COMMAND` to a JSON string array. Set
+`OPENSHELL_CONFORMANCE_SMOKE_CREATE_ARGS` to a JSON string array when the
+runtime also needs portable create options such as `--policy`. For example:
 
 ```shell
 export OPENSHELL_CONFORMANCE_SMOKE_COMMAND='["sleep","infinity"]'

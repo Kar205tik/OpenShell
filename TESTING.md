@@ -231,13 +231,15 @@ is `Ready` through get and paginated list output, deletes it, and verifies its
 name no longer appears. The exec test creates its own sandbox and checks
 `sandbox exec` with a run-specific marker. Drivers without exec support run the
 control-plane test alone. Runtimes that require an explicit workload set
-`OPENSHELL_CONFORMANCE_SMOKE_COMMAND` to a JSON string array. Sandbox lifecycle,
-label matrices, VM overlay, and TLS-key permission assertions remain regular
-E2E coverage.
+`OPENSHELL_CONFORMANCE_SMOKE_COMMAND` to a JSON string array; additional create
+options can be supplied through `OPENSHELL_CONFORMANCE_SMOKE_CREATE_ARGS`.
+Sandbox lifecycle, label matrices, VM overlay, and TLS-key permission assertions
+remain regular E2E coverage.
 
 Each invocation prints a ten-character run ID before creating resources.
-Conformance sandboxes use names such as `ct-<run-id>-01`. The runner tracks the
-exact name and uses it for cleanup; phase 1 does not add ownership labels.
+Conformance sandboxes use names such as `ct-<run-id>-cp` and
+`ct-<run-id>-ex`. The runner tracks the exact name and uses it for cleanup;
+smoke conformance does not add ownership labels.
 
 The runner deletes owned resources after both success and failure. If the test
 process is interrupted before cleanup, locate leftovers without touching
