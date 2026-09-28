@@ -273,6 +273,11 @@ configured OpenShell CLI. The smoke scenario verifies the black-box sandbox
 lifecycle by creating, inspecting, executing in, and deleting a sandbox. The
 file-transfer scenario verifies portable upload and download behavior, Git-aware
 filtering, and sandbox workspace path safety.
+Four policy cases exercise create-time policy loading, initial revision history,
+invalid policy rejection, and live policy replacement. The live-update case
+requires a runtime that supports policy updates; a driver without that
+capability selects the supported tests by name. These are CLI and gateway
+conformance checks, not filesystem or network enforcement probes.
 Feature suites use the same disposable guest but may provision isolated
 dependencies after installation. The Keycloak provider-refresh suite starts a
 guest-local Keycloak realm and verifies a successful OAuth refresh followed by
