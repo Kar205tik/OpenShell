@@ -1,0 +1,5 @@
+{
+  "ExecutePreprocessor": {
+    "kernel_manager_class": "jupyter_server.gateway.managers.GatewayKernelManager"
+  }
+}

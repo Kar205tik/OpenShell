@@ -24,5 +24,4 @@ WORKDIR /sandbox
 
 EXPOSE 8888
 
-# The example sets Jupyter as the sandbox's main command when it creates the
-# sandbox; OpenShell does not run the image's default command.
+# The OpenShell CLI starts Jupyter as the sandbox's main command.
