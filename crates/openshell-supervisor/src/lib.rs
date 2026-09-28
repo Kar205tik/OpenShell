@@ -5942,13 +5942,13 @@ network_policies:
         // sandbox log must record the refusal once, with the first message,
         // while every report still carries the message of its own attempt.
         let log = CapturedLog::default();
+        // Keep two dispatchers alive so tracing consults registered subscribers
+        // when caching callsite interest. With only one, a parallel test thread
+        // without a default subscriber can cache `Interest::never` for our events.
+        let _other_dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let _subscriber = tracing_subscriber::registry()
             .with(openshell_ocsf::OcsfShorthandLayer::new(log.clone()).with_non_ocsf(false))
             .set_default();
-        // Other parallel tests may register these callsites while no subscriber
-        // is active. Refresh the process-wide cache after installing this
-        // thread-local subscriber so the OCSF events cannot remain disabled.
-        tracing::callsite::rebuild_interest_cache();
         let first = SyncRefusal::new(
             tonic::Code::FailedPrecondition,
             UNATTACHED_PROVIDER_DIAGNOSTIC,
