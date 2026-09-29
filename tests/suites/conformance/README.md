@@ -23,6 +23,8 @@ In particular:
   requiring `sandbox exec`.
 - `lifecycle::restart_persistence` covers stop, start, and workspace persistence
   and requires `sandbox exec`.
+- `lifecycle::canonical_main` covers successful and failing canonical-main
+  terminal states, persistent status, and deletion.
 - Future environment coverage should use a separate leaf when declared-
   environment behavior has a distinct runtime requirement.
 - `policy-advisor/mechanistic-proposal`,

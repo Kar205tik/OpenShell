@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn selects_all_scenarios_by_default() {
         let selected = select_scenarios(&[]).expect("select all");
-        assert_eq!(selected.len(), 10);
+        assert_eq!(selected.len(), 11);
         assert_eq!(selected.len(), scenarios().len());
     }
 
@@ -270,6 +270,7 @@ mod tests {
             [
                 "sandbox-lifecycle/control-plane",
                 "sandbox-lifecycle/restart-persistence",
+                "sandbox-lifecycle/canonical-main",
             ]
         );
     }
