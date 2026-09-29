@@ -104,7 +104,7 @@ For a custom path, Podman mounts a persistent workspace volume there. When the
 volume is first created, Podman copies any files already in that image directory
 into it. OpenShell keeps their ownership and permissions, starts as the final
 non-root user, and rejects the image if that user cannot reach and write the
-directory. Agent commands use the path as their working directory and `HOME`;
+directory. Agent commands use the path as their working directory;
 `filesystem.include_workdir` grants access to it when enabled.
 
 For `/sandbox`, OpenShell prepares the managed workspace before switching to

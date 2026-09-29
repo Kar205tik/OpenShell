@@ -204,7 +204,6 @@ async fn podman_uses_oci_identity_workspace_copy_up_and_inspected_image_id() {
             "-c",
             "set -eu; \
              test \"$(pwd -P)\" = /home/app/project; \
-             test \"$HOME\" = /home/app/project; \
              test \"$(cat root-owned.txt)\" = root-owned; \
              touch direct-workspace-write; \
              touch cache/from-create; \
