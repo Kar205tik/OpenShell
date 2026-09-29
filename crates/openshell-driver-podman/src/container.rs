@@ -228,10 +228,8 @@ pub struct ResolvedPodmanImage {
 }
 
 impl ResolvedPodmanImage {
-    /// Resolve the image metadata and reject:
-    /// - a malformed or reserved working directory;
-    /// - an image volume with an invalid or reserved target, or one covering
-    ///   the resolved workspace.
+    /// Resolve the image metadata and reject a malformed or reserved working
+    /// directory. Podman owns image-declared volume handling.
     pub fn from_inspect(inspected: &ImageInspect) -> Result<Self, ComputeDriverError> {
         let image_config = inspected.config.as_ref();
         let workspace_root = driver_mounts::resolve_oci_workspace_root(
@@ -245,23 +243,6 @@ impl ResolvedPodmanImage {
             driver_mounts::validate_workspace_control_path(&workspace_root, control_path)
                 .map_err(ComputeDriverError::Precondition)?;
         }
-        if let Some(volumes) = image_config.and_then(|config| config.volumes.as_ref()) {
-            for volume in volumes.keys() {
-                validate_podman_mount_target(volume).map_err(|error| {
-                    ComputeDriverError::Precondition(format!(
-                        "invalid image-declared volume '{volume}': {error}"
-                    ))
-                })?;
-                driver_mounts::validate_workspace_mount_target(volume, &workspace_root).map_err(
-                    |_| {
-                        ComputeDriverError::Precondition(format!(
-                            "image-declared volume '{volume}' masks OCI WorkingDir '{workspace_root}' before workspace validation"
-                        ))
-                    },
-                )?;
-            }
-        }
-
         Ok(Self {
             id: inspected.id.clone(),
             oci_user: image_config
@@ -1895,7 +1876,6 @@ mod tests {
                     "HTTP_PROXY=http://bypass".into(),
                 ],
                 working_dir: working_dir.to_string(),
-                volumes: None,
             }),
         })
         .unwrap()
@@ -2106,26 +2086,6 @@ mod tests {
                 .map(String::as_str),
             Some("/run/openshell/proxy-tls")
         );
-    }
-
-    #[test]
-    fn resolved_image_rejects_volumes_covering_working_dir() {
-        let inspect = |volume: &str| ImageInspect {
-            id: "sha256:image".into(),
-            config: Some(ImageConfig {
-                working_dir: "/workspace/project".into(),
-                volumes: Some(std::collections::HashMap::from([(
-                    volume.into(),
-                    Value::Null,
-                )])),
-                ..Default::default()
-            }),
-        };
-
-        assert!(ResolvedPodmanImage::from_inspect(&inspect("/workspace")).is_err());
-        let image = ResolvedPodmanImage::from_inspect(&inspect("/workspace/project/cache"))
-            .expect("image volumes nested below the workspace remain valid");
-        assert_eq!(image.workspace_root, "/workspace/project");
     }
 
     #[test]
