@@ -37,13 +37,12 @@ The supervisor joins the workload's **user namespace only** to preserve UID/GID
 mapping for shared-volume access. PID, mount, and network namespaces remain
 separate. The channel volume uses shared SELinux relabeling (`:z`).
 
-Before starting either container, the driver uploads volume-relative archives
-directly to the channel and workspace volume destinations. A rootfs upload on a
-stopped Podman container does not populate nested named volumes. Restart restores
-only the channel bootstrap into the existing channel volume, preserving the
-workspace. The workload starts before the supervisor so its user namespace exists
-when the supervisor joins it; a stopped supervisor resolves that namespace again
-on its next start.
+Before starting either container, the driver uploads bootstrap files to the
+channel volume. For managed `/sandbox`, it also prepares the workspace volume;
+custom image workspaces need no upload. Restart restores only the channel
+bootstrap, preserving the workspace. The workload starts before the supervisor
+so its user namespace exists when the supervisor joins it; a stopped supervisor
+resolves that namespace again on its next start.
 
 The runtime must pass the sandbox's unprivileged enforcement probe, including
 nested seccomp notification and Landlock. Unsupported runtime defaults fail
@@ -100,16 +99,15 @@ mounts. For a custom path, image volumes and driver mounts cannot cover the
 workspace or one of its parents; mounts nested below it remain valid. Podman
 creates a private volume for each image-declared path nested below it.
 
-For a custom path, Podman mounts a persistent workspace volume there. When the
-volume is first created, Podman copies any files already in that image directory
-into it. OpenShell keeps their ownership and permissions, starts as the final
-non-root user, and rejects the image if that user cannot reach and write the
-directory. Agent commands use the path as their working directory;
+For a custom path, Podman uses the image's container filesystem directly.
+OpenShell keeps the image directory's ownership and permissions, starts as the
+final non-root user, and rejects the image if that user cannot reach and write
+the directory. Agent commands use the path as their working directory;
 `filesystem.include_workdir` grants access to it when enabled.
 
-For `/sandbox`, OpenShell prepares the managed workspace before switching to
-the non-root user. The separate supervisor receives the path but does not mount
-the workspace. Test custom images with the Podman configuration you will use.
+For `/sandbox`, OpenShell creates a workspace volume and prepares it before
+switching to the non-root user. The separate supervisor receives the path but
+does not mount the workspace.
 
 ## Lifecycle and readiness
 

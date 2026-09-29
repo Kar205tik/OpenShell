@@ -1004,6 +1004,7 @@ impl PodmanComputeDriver {
             otel.status_code = tracing::field::Empty,
         ))
         .await?;
+        let managed_workspace = resolved_image.uses_managed_workspace();
 
         // Fail closed on a missing/unreadable corporate proxy CA bundle before
         // creating any resources, so the operator gets a clear error
@@ -1042,14 +1043,16 @@ impl PodmanComputeDriver {
             ));
         }
 
-        // Create the workspace volume and per-sandbox runtime files.
+        // Create the managed workspace volume, if needed, and runtime files.
         let (resolver_secret_name, token_secret_name, proxy_auth_secret_name) = async {
             let phase_status = openshell_otel::ErrorStatusGuard::current();
             let result = async {
-                self.client
-                    .create_owned_volume(&vol_name, &sandbox.id, &sandbox.workspace)
-                    .await
-                    .map_err(ComputeDriverError::from)?;
+                if managed_workspace {
+                    self.client
+                        .create_owned_volume(&vol_name, &sandbox.id, &sandbox.workspace)
+                        .await
+                        .map_err(ComputeDriverError::from)?;
+                }
                 let resolver_secret_name =
                     match create_sandbox_resolver_secret(&self.client, &sandbox.id).await {
                         Ok(name) => name,
@@ -1231,7 +1234,7 @@ impl PodmanComputeDriver {
                             archives.channel,
                         )
                         .await?;
-                    if resolved_image.uses_managed_workspace() {
+                    if managed_workspace {
                         self.client
                             .copy_to_container(
                                 &workload_id,

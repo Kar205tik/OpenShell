@@ -4,10 +4,10 @@
 #![cfg(feature = "e2e-podman")]
 
 //! Podman-specific E2E coverage for OCI identity/workspace inspection,
-//! workspace-volume copy-up, and immutable-image launch.
+//! direct image-workspace access, and immutable-image launch.
 //!
 //! The test builds an image through the selected Podman engine, creates a
-//! sandbox from its mutable tag, and verifies the child identity, copied image
+//! sandbox from its mutable tag, and verifies the child identity, image
 //! content, workspace placement, and image ID recorded on the real sandbox
 //! container.
 
@@ -184,7 +184,7 @@ fn normalized_image_id(image_id: &str) -> &str {
 }
 
 #[tokio::test]
-async fn podman_uses_oci_identity_workspace_copy_up_and_inspected_image_id() {
+async fn podman_uses_oci_identity_image_workdir_and_inspected_image_id() {
     if !is_e2e_driver("podman") {
         eprintln!("Skipping Podman OCI identity test: e2e driver is not podman");
         return;
@@ -316,7 +316,7 @@ async fn assert_isolated_pair(image: &ImageGuard, sandbox: &SandboxGuard, contai
     .unwrap();
     assert!(!mounts.contains("/etc/openshell/tls"));
     assert!(!mounts.contains("/.openshell/supervisor"));
-    assert!(mounts.lines().any(|path| path == "/home/app/project"));
+    assert!(!mounts.lines().any(|path| path == "/home/app/project"));
     assert!(mounts.lines().any(|path| path == "/home/app/project/cache"));
     assert!(!mounts.lines().any(|path| path == "/sandbox"));
     let posture = sandbox.exec(&["sh", "-c", "set -eu; awk '/^CapEff:|^CapBnd:|^NoNewPrivs:/ {print}' /proc/self/status; test ! -r /.openshell/channel/sandbox/server.key; test ! -r /.openshell/supervisor/runtime-descriptor.json"]).await.expect("workload cannot read either control credential set");

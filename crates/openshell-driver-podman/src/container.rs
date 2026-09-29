@@ -1257,11 +1257,14 @@ fn build_base_spec(
     let mut networks = BTreeMap::new();
     networks.insert(config.network_name.clone(), NetworkAttachment {});
 
-    let mut volumes = vec![NamedVolume {
-        name: vol,
-        dest: image.workspace_root.clone(),
-        options: vec!["rw".into()],
-    }];
+    let mut volumes = Vec::new();
+    if image.uses_managed_workspace() {
+        volumes.push(NamedVolume {
+            name: vol,
+            dest: image.workspace_root.clone(),
+            options: vec!["rw".into()],
+        });
+    }
     volumes.extend(user_mounts.volumes);
 
     let mut image_volumes = if supervisor_bin_path.is_some() {
@@ -2303,12 +2306,7 @@ mod tests {
             container["command"],
             serde_json::json!(["--workdir", "/workspace/project"])
         );
-        assert!(container["volumes"].as_array().is_some_and(|volumes| {
-            volumes.iter().any(|volume| {
-                volume["name"].as_str() == Some("openshell-sandbox-test-id-workspace")
-                    && volume["dest"].as_str() == Some("/workspace/project")
-            })
-        }));
+        assert!(container["volumes"].as_array().is_some_and(Vec::is_empty));
         assert_eq!(
             container["env"][openshell_core::sandbox_env::OCI_IMAGE_USER].as_str(),
             Some("app:staff")
