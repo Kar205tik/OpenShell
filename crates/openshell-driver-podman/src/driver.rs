@@ -762,7 +762,7 @@ impl PodmanComputeDriver {
             .and_then(|value| serde_json::from_str(value).ok())
             .ok_or_else(missing)?;
         let anonymous_targets: Vec<String> = labels
-            .get("openshell.ai/private-image-volume-targets")
+            .get(openshell_core::resource_admission::PRIVATE_IMAGE_VOLUME_TARGETS_LABEL)
             .and_then(|value| serde_json::from_str(value).ok())
             .unwrap_or_default();
         let mut actual = std::collections::BTreeMap::new();

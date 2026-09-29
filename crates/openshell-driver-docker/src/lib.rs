@@ -1215,7 +1215,7 @@ impl DockerComputeDriver {
             .ok_or_else(|| Status::failed_precondition("sandbox lacks resource identity record"))?;
         let mut actual = std::collections::BTreeMap::new();
         let anonymous_targets: Vec<String> = labels
-            .get("openshell.ai/private-image-volume-targets")
+            .get(openshell_core::resource_admission::PRIVATE_IMAGE_VOLUME_TARGETS_LABEL)
             .and_then(|value| serde_json::from_str(value).ok())
             .unwrap_or_default();
         for mount in container.mounts.as_deref().unwrap_or_default() {
@@ -5709,7 +5709,7 @@ fn build_container_create_body_for_image(
     });
     let mut labels = template.labels.clone();
     labels.insert(
-        "openshell.ai/private-image-volume-targets".into(),
+        openshell_core::resource_admission::PRIVATE_IMAGE_VOLUME_TARGETS_LABEL.into(),
         serde_json::to_string(&image.volumes)
             .map_err(|error| Status::internal(error.to_string()))?,
     );

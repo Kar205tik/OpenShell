@@ -50,7 +50,7 @@ const CONTAINER_PREFIX: &str = "openshell-";
 
 /// Volume name prefix.
 const VOLUME_PREFIX: &str = "openshell-sandbox-";
-const WORKLOAD_CONTROL_PATHS: &[&str] = &[
+const PODMAN_WORKLOAD_CONTROL_PATHS: &[&str] = &[
     "/.openshell",
     openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_ROOT,
 ];
@@ -243,7 +243,7 @@ impl ResolvedPodmanImage {
             image_config.map_or("", |config| config.working_dir.as_str()),
         )
         .map_err(ComputeDriverError::Precondition)?;
-        for control_path in WORKLOAD_CONTROL_PATHS {
+        for control_path in PODMAN_WORKLOAD_CONTROL_PATHS {
             driver_mounts::validate_workspace_control_path(&workspace_root, control_path)
                 .map_err(ComputeDriverError::Precondition)?;
         }
@@ -254,7 +254,7 @@ impl ResolvedPodmanImage {
             for volume in volumes.keys() {
                 driver_mounts::validate_container_mount_target_with_control_paths(
                     volume,
-                    WORKLOAD_CONTROL_PATHS,
+                    PODMAN_WORKLOAD_CONTROL_PATHS,
                 )
                 .map_err(|error| {
                     ComputeDriverError::Precondition(format!(
@@ -878,7 +878,7 @@ fn podman_user_mounts(
                 driver_mounts::validate_absolute_mount_source(&source, "bind source")?;
                 driver_mounts::validate_container_mount_target_with_control_paths(
                     &target,
-                    WORKLOAD_CONTROL_PATHS,
+                    PODMAN_WORKLOAD_CONTROL_PATHS,
                 )?;
                 result.mounts.push(Mount {
                     kind: "bind".into(),
@@ -897,7 +897,7 @@ fn podman_user_mounts(
                 driver_mounts::validate_mount_source(&source, "volume source")?;
                 driver_mounts::validate_container_mount_target_with_control_paths(
                     &target,
-                    WORKLOAD_CONTROL_PATHS,
+                    PODMAN_WORKLOAD_CONTROL_PATHS,
                 )?;
                 result.volumes.push(NamedVolume {
                     name: source,
@@ -926,7 +926,7 @@ fn podman_user_mounts(
                 }
                 driver_mounts::validate_container_mount_target_with_control_paths(
                     &target,
-                    WORKLOAD_CONTROL_PATHS,
+                    PODMAN_WORKLOAD_CONTROL_PATHS,
                 )?;
                 result.mounts.push(Mount {
                     kind: "tmpfs".into(),
@@ -945,7 +945,7 @@ fn podman_user_mounts(
                 driver_mounts::validate_mount_source(&source, "image source")?;
                 driver_mounts::validate_container_mount_target_with_control_paths(
                     &target,
-                    WORKLOAD_CONTROL_PATHS,
+                    PODMAN_WORKLOAD_CONTROL_PATHS,
                 )?;
                 result.image_volumes.push(ImageVolume {
                     source,
@@ -1023,7 +1023,7 @@ fn validate_podman_driver_mounts(
         };
         driver_mounts::validate_container_mount_target_with_control_paths(
             target,
-            WORKLOAD_CONTROL_PATHS,
+            PODMAN_WORKLOAD_CONTROL_PATHS,
         )?;
         let normalized_target = driver_mounts::normalize_mount_target(target);
         if !targets.insert(normalized_target.clone()) {
@@ -1593,7 +1593,7 @@ pub fn build_isolation_specs(
         .labels
         .insert(crate::isolation::LABEL_ROLE.into(), "sandbox".into());
     workload.labels.insert(
-        "openshell.ai/private-image-volume-targets".into(),
+        openshell_core::resource_admission::PRIVATE_IMAGE_VOLUME_TARGETS_LABEL.into(),
         serde_json::to_string(&input.image.image_volume_targets)
             .map_err(|error| ComputeDriverError::Message(error.to_string()))?,
     );
@@ -2052,7 +2052,7 @@ mod tests {
             custom_specs
                 .workload
                 .labels
-                .get("openshell.ai/private-image-volume-targets")
+                .get(openshell_core::resource_admission::PRIVATE_IMAGE_VOLUME_TARGETS_LABEL)
                 .map(String::as_str),
             Some("[\"/workspace/project/cache\"]")
         );
