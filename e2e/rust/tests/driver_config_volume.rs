@@ -17,7 +17,7 @@ use bollard::query_parameters::{
     RemoveVolumeOptionsBuilder, StartContainerOptions, WaitContainerOptions,
 };
 use futures_util::TryStreamExt;
-#[cfg(any(feature = "e2e-docker", feature = "e2e-podman"))]
+#[cfg(feature = "e2e-docker")]
 use openshell_e2e::harness::container::ImageGuard;
 use openshell_e2e::harness::container::e2e_driver;
 use openshell_e2e::harness::sandbox::SandboxGuard;
@@ -26,9 +26,9 @@ use serde_json::{Map, Value};
 const TEST_IMAGE: &str = "nvcr.io/nvidia/base/ubuntu:24.04";
 const VOLUME_TARGET: &str = "/sandbox/e2e-volume";
 const BIND_TARGET: &str = "/sandbox/e2e-bind";
-#[cfg(any(feature = "e2e-docker", feature = "e2e-podman"))]
+#[cfg(feature = "e2e-docker")]
 const OCI_VOLUME_TARGET: &str = "/workspace/project/e2e-volume";
-#[cfg(any(feature = "e2e-docker", feature = "e2e-podman"))]
+#[cfg(feature = "e2e-docker")]
 const OCI_USER_DOCKERFILE: &str = r#"FROM public.ecr.aws/docker/library/python:3.13-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
@@ -119,12 +119,12 @@ async fn sandbox_mounts_existing_driver_config_volume() {
 }
 
 #[tokio::test]
-#[cfg(any(feature = "e2e-docker", feature = "e2e-podman"))]
+#[cfg(feature = "e2e-docker")]
 async fn oci_workspace_preparation_skips_nested_volume_ownership() {
     let driver = e2e_driver().expect("OPENSHELL_E2E_DRIVER must be set by the e2e wrapper");
     assert!(
-        matches!(driver.as_str(), "docker" | "podman"),
-        "OCI workspace mount e2e requires docker or podman, got {driver}"
+        driver == "docker",
+        "OCI workspace mount e2e requires docker, got {driver}"
     );
 
     let volume = VolumeGuard::create(&driver)
@@ -305,7 +305,7 @@ async fn verify_volume(volume: &VolumeGuard) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(any(feature = "e2e-docker", feature = "e2e-podman"))]
+#[cfg(feature = "e2e-docker")]
 async fn verify_volume_ownership(volume: &VolumeGuard) -> Result<(), String> {
     let output = run_volume_container(
         volume,

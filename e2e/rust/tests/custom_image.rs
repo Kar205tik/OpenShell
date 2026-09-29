@@ -243,7 +243,7 @@ async fn sandbox_rejects_image_workdir_that_would_require_new_authority() {
         }
         Err(error) => error,
     };
-    let message = error;
+    let message = error.to_string();
     assert!(
         (message.contains("WorkspaceValidationFailed") && message.contains("WorkingDir"))
             || message.contains("subsystem request failed")

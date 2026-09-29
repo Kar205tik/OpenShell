@@ -125,9 +125,7 @@ enabled = false
 
 </Warning>
 
-Mount targets may overlap the workspace, but cannot cover the workload's
-`/.openshell` runtime and control channel or its
-`/run/openshell-supervisor-ca` mount.
+Mount targets cannot replace the workspace root, the container root, or OpenShell paths under `/opt/openshell`, `/etc/openshell`, and `/run/openshell`.
 
 ## Podman Driver
 
@@ -269,17 +267,12 @@ Set `process.run_as_user` and `process.run_as_group` in the sandbox policy to ch
 | Kubernetes | OpenShift SCC namespace annotations, otherwise `1000`. Override with `sandbox_uid` and `sandbox_gid`. |
 | MicroVM | The image's `sandbox` account, otherwise `1000`. Override with `sandbox_uid` and `sandbox_gid`. |
 
-On Docker and Podman, the image's `WORKDIR` becomes the workspace. Images with
-no `WORKDIR`, `WORKDIR /`, or `WORKDIR /sandbox` use OpenShell's managed
-`/sandbox` workspace. Custom paths must be absolute, with no `.` or `..`
-segments, and cannot overlap private mounts still used inside the workload.
-Supervisor-only paths outside that private tree are allowed. Image and driver
-mounts may overlap the workspace, but conflicting mounts can prevent the
-workload from starting.
+On Docker, the image's `WORKDIR` becomes the workspace. Images with no `WORKDIR`, `/`, or `/sandbox` use `/sandbox`. Any other `WORKDIR` must exist in the image and be writable by the sandbox user.
 
-Docker validates the directory visible after container mounts. Podman mounts the
-persistent workspace volume at that path. When the volume is first created,
-Podman copies existing files from the image directory into it. OpenShell keeps
-their ownership and permissions, and fails unless the final non-root user can
-reach and write the directory. Test custom images with the Podman configuration
-you will use. Kubernetes and MicroVM continue to use `/sandbox`.
+Podman also uses the image's `WORKDIR` as the workspace, falling back to
+`/sandbox` for an empty, `/`, or `/sandbox` value. A custom path must be an
+absolute, normalized path that does not overlap Podman's private workload
+mounts. Podman mounts the persistent workspace volume there and copies existing
+image-directory files into a new volume. OpenShell preserves their permissions
+and requires the final non-root user to be able to write there. Kubernetes and
+MicroVM continue to use `/sandbox`.

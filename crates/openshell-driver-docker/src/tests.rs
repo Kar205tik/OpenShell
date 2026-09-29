@@ -1551,10 +1551,10 @@ fn container_creation_rejects_invalid_oci_working_dir() {
 
 #[test]
 fn container_creation_rejects_openshell_control_path_working_dir() {
-    let mut metadata = DockerImageMetadata {
+    let metadata = DockerImageMetadata {
         id: "sha256:immutable".to_string(),
         user: "1234:1235".to_string(),
-        working_dir: "/.openshell/runtime/project".to_string(),
+        working_dir: "/opt/openshell/bin/project".to_string(),
         volumes: Vec::new(),
     };
     let err = build_container_create_body_for_image(
@@ -1569,32 +1569,10 @@ fn container_creation_rejects_openshell_control_path_working_dir() {
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("OpenShell control path"));
-
-    metadata.working_dir = "/opt/openshell/bin/project".to_string();
-    build_container_create_body_for_image(
-        &test_sandbox(),
-        &runtime_config(),
-        &DockerSandboxDriverConfig::default(),
-        None,
-        &metadata,
-        &test_workload_identity(),
-    )
-    .expect("supervisor-only paths are not reserved in the workload");
-
-    metadata.working_dir = "/proc".to_string();
-    build_container_create_body_for_image(
-        &test_sandbox(),
-        &runtime_config(),
-        &DockerSandboxDriverConfig::default(),
-        None,
-        &metadata,
-        &test_workload_identity(),
-    )
-    .expect("OCI system paths are not rejected before workload launch");
 }
 
 #[test]
-fn container_creation_allows_image_volume_covering_working_dir() {
+fn container_creation_rejects_image_volume_that_masks_working_dir() {
     let sandbox = test_sandbox();
     let metadata = DockerImageMetadata {
         id: "sha256:immutable".to_string(),
@@ -1603,7 +1581,7 @@ fn container_creation_allows_image_volume_covering_working_dir() {
         volumes: vec!["/workspace".to_string()],
     };
 
-    build_container_create_body_for_image(
+    let error = build_container_create_body_for_image(
         &sandbox,
         &runtime_config(),
         &DockerSandboxDriverConfig::default(),
@@ -1611,32 +1589,92 @@ fn container_creation_allows_image_volume_covering_working_dir() {
         &metadata,
         &test_workload_identity(),
     )
-    .expect("image volumes may cover a workload-owned workspace");
+    .unwrap_err();
+
+    assert!(
+        error
+            .message()
+            .contains("masks OCI WorkingDir '/workspace/project'")
+    );
 }
 
 #[test]
-fn container_creation_allows_mounts_covering_working_dir() {
-    let mount: DockerSandboxDriverConfig = serde_json::from_value(serde_json::json!({
+fn container_creation_reserves_resolved_workspace_root_but_allows_nested_mounts() {
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "/workspace".to_string(),
+        volumes: Vec::new(),
+    };
+    let root_mount: DockerSandboxDriverConfig = serde_json::from_value(serde_json::json!({
         "mounts": [{"type": "tmpfs", "target": "/workspace"}]
     }))
     .unwrap();
-    for workdir in ["/workspace", "/workspace/project"] {
-        let image = DockerImageMetadata {
-            id: "sha256:immutable".to_string(),
-            user: "1234:1235".to_string(),
-            working_dir: workdir.to_string(),
-            volumes: Vec::new(),
-        };
-        build_container_create_body_for_image(
-            &test_sandbox(),
-            &runtime_config(),
-            &mount,
-            None,
-            &image,
-            &test_workload_identity(),
-        )
-        .expect("driver mounts may cover the workload workspace");
-    }
+    let err = build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &root_mount,
+        None,
+        &metadata,
+        &test_workload_identity(),
+    )
+    .unwrap_err();
+    assert!(
+        err.message()
+            .contains("reserved for the OpenShell workspace")
+    );
+
+    let ancestor_mount: DockerSandboxDriverConfig = serde_json::from_value(serde_json::json!({
+        "mounts": [{"type": "tmpfs", "target": "/workspace"}]
+    }))
+    .unwrap();
+    let nested_metadata = DockerImageMetadata {
+        working_dir: "/workspace/project".to_string(),
+        volumes: Vec::new(),
+        ..metadata.clone()
+    };
+    let err = build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &ancestor_mount,
+        None,
+        &nested_metadata,
+        &test_workload_identity(),
+    )
+    .unwrap_err();
+    assert!(
+        err.message()
+            .contains("reserved for the OpenShell workspace")
+    );
+
+    let nested_mount: DockerSandboxDriverConfig = serde_json::from_value(serde_json::json!({
+        "mounts": [{"type": "tmpfs", "target": "/workspace/cache"}]
+    }))
+    .unwrap();
+    build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &nested_mount,
+        None,
+        &metadata,
+        &test_workload_identity(),
+    )
+    .expect("nested workspace mounts remain supported");
+
+    let compatibility_path_mount: DockerSandboxDriverConfig =
+        serde_json::from_value(serde_json::json!({
+            "mounts": [{"type": "tmpfs", "target": "/sandbox"}]
+        }))
+        .unwrap();
+    build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &compatibility_path_mount,
+        None,
+        &metadata,
+        &test_workload_identity(),
+    )
+    .expect("/sandbox remains mountable when the inspected workspace is elsewhere");
 }
 
 #[test]
@@ -2107,7 +2145,7 @@ fn driver_config_rejects_reserved_mount_targets() {
         "mounts": [{
             "type": "volume",
             "source": "work-nfs",
-            "target": "/.openshell/runtime"
+            "target": "/etc/openshell/auth"
         }]
     })));
 
@@ -2115,19 +2153,6 @@ fn driver_config_rejects_reserved_mount_targets() {
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("reserved OpenShell path"));
-
-    sandbox
-        .spec
-        .as_mut()
-        .unwrap()
-        .template
-        .as_mut()
-        .unwrap()
-        .driver_config = Some(json_struct(serde_json::json!({
-        "mounts": [{"type": "volume", "source": "work-nfs", "target": "/etc/openshell/auth"}]
-    })));
-    build_container_create_body(&sandbox, &runtime_config())
-        .expect("supervisor-only paths are not reserved in the workload");
 }
 
 #[test]

@@ -426,13 +426,14 @@ traffic. No untrusted child performs an identity transition. Identity-changing
 policy updates require sandbox recreation, while other policy updates remain
 live.
 
-Docker and Podman resolve OCI `Config.User` and `Config.WorkingDir` from one
-immutable image inspection. Empty, `/`, and explicit `/sandbox` values use the
-managed `/sandbox` workspace. Custom paths must be normalized absolute paths
-that do not overlap private mounts still inside the workload container.
-Supervisor-only paths outside that private tree are not reserved. Image and
+Docker retains its existing working-directory and mount validation. Podman
+resolves OCI `Config.User` and `Config.WorkingDir` from one immutable image
+inspection. Empty, `/`, and explicit `/sandbox` values use the managed
+`/sandbox` workspace. Custom paths must be normalized absolute paths that do
+not overlap private mounts inside the Podman workload. Other paths are not
+reserved merely because the separate supervisor uses them. Podman image and
 driver mounts may cover the workspace; conflicting mounts can make the workload
-unusable. Private workload mount targets remain reserved.
+unusable.
 
 Podman mounts its persistent workspace volume at a custom root. When the volume
 is first created, Podman copies existing image-directory contents into it.
