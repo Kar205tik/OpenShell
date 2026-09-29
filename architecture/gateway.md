@@ -1265,6 +1265,10 @@ only. Shared provider, resource, and tracing-layer construction lives in
 `openshell-otel`, along with shared HTTP/tonic trace-context propagation and
 gRPC failure recording.
 
+The optional `traces_filter = "api-requests"` selects API-request trace trees before SDK sampling. It excludes unparented background work and the documented polling, status, health and reflection endpoints. Classification uses the request span's server kind and path, so a manual call to a polling endpoint is excluded too. Eligible request roots use the SDK-configured sampler; descendants inherit a local parent's sampled flag. Both gateway and in-process driver providers use this selection. A dropped span retains an unsampled context so its descendants cannot restart the trace, even with an `always_on` SDK sampler. Separate processes keep their own exporter configuration.
+
+The default `all` retains existing sampling behavior. Request selection does not remove Rust tracing spans or filter log events, audit output or metrics. It also excludes errors discovered later in a dropped background operation; operators use `all` to investigate those paths. It preserves existing asynchronous trace propagation but does not add context to detached tasks.
+
 The `tower_http` `TraceLayer` in `multiplex.rs` opens a span per inbound request,
 and that span continues incoming W3C trace context when present or starts a new
 trace otherwise. It is named for the RPC and carries the request ID that also

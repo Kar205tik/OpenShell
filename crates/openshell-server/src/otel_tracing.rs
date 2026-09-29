@@ -8,8 +8,8 @@
 //!
 //! # Configuration split
 //!
-//! `[openshell.gateway.otlp]` decides **whether and where** to export: the
-//! table's presence is the on-switch, its `endpoint` the destination.
+//! `[openshell.gateway.otlp]` selects trace trees and decides where to export:
+//! the table's presence is the on-switch, its `endpoint` the destination.
 //! `OTEL_EXPORTER_OTLP_ENDPOINT` is deliberately not read, so enablement has
 //! one source.
 //!
@@ -29,7 +29,23 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::Subscriber;
 use tracing_subscriber::registry::LookupSpan;
 
-use crate::config_file::OtlpConfig;
+use crate::config_file::{OtlpConfig, TracesFilter};
+
+mod request_filter;
+
+/// Preserve SDK environment sampling for eligible requests. Both the gateway
+/// and in-process driver must share the selection so a driver cannot restart
+/// a dropped background trace with its own sampler.
+pub fn sampler_for(
+    filter: TracesFilter,
+) -> Option<Box<dyn opentelemetry_sdk::trace::ShouldSample>> {
+    match filter {
+        TracesFilter::All => None,
+        TracesFilter::ApiRequests => Some(Box::new(request_filter::RequestSampler::new(
+            opentelemetry_sdk::trace::Config::default().sampler,
+        ))),
+    }
+}
 
 /// `service.name` reported when the config file does not override it.
 const DEFAULT_SERVICE_NAME: &str = "openshell-gateway";
@@ -84,6 +100,7 @@ fn trace_config<'cfg>(
             gateway.name(),
             gateway.compute_driver(),
         ),
+        sampler: sampler_for(cfg.traces_filter),
     }
 }
 
@@ -98,8 +115,8 @@ fn build_resource(cfg: &OtlpConfig, gateway: GatewayResourceAttributes<'_>) -> R
 /// the current reactor as it is constructed. It does not connect: an
 /// unreachable collector produces export failures, never a startup failure.
 ///
-/// The sampler and span limits are left at the SDK's defaults, which are
-/// themselves resolved from `OTEL_*` env vars (see the module docs).
+/// Span limits and root sampling use the SDK's `OTEL_*` configuration. Optional
+/// request selection excludes background work before consulting that sampler.
 #[cfg(test)]
 fn build_provider(
     cfg: &OtlpConfig,
@@ -163,6 +180,19 @@ pub mod test_exporter {
     /// concurrent non-tracing tests cannot contaminate or reset its spans.
     #[must_use]
     pub fn install_traced() -> TracingTestGuard {
+        install_traced_with_sampler(None)
+    }
+
+    /// Installs deterministic request selection for request-boundary tests.
+    pub fn install_request_traced() -> TracingTestGuard {
+        install_traced_with_sampler(Some(Box::new(super::request_filter::RequestSampler::new(
+            Box::new(opentelemetry_sdk::trace::Sampler::AlwaysOn),
+        ))))
+    }
+
+    fn install_traced_with_sampler(
+        sampler: Option<Box<dyn opentelemetry_sdk::trace::ShouldSample>>,
+    ) -> TracingTestGuard {
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let lock = crate::TEST_TRACING_LOCK
@@ -170,9 +200,12 @@ pub mod test_exporter {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::sync::LazyLock::force(&INITIALIZED);
         let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
-        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-            .with_simple_exporter(exporter.clone())
-            .build();
+        let mut builder = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone());
+        if let Some(sampler) = sampler {
+            builder = builder.with_sampler(sampler);
+        }
+        let provider = builder.build();
         let subscriber = tracing_subscriber::registry().with(super::layer(&provider, None));
         let dispatch = tracing::Dispatch::new(subscriber);
         TracingTestGuard {
@@ -296,6 +329,7 @@ mod tests {
         OtlpConfig {
             endpoint: "http://127.0.0.1:4317".into(),
             service_name: None,
+            traces_filter: TracesFilter::All,
         }
     }
 

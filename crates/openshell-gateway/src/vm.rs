@@ -838,6 +838,7 @@ mod tests {
             Some(&OtlpConfig {
                 endpoint: "http://collector.internal:4317".to_string(),
                 service_name: Some("custom-gateway".to_string()),
+                traces_filter: openshell_server::config_file::TracesFilter::All,
             }),
             "production-us-west",
         );

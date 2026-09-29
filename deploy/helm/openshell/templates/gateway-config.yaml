@@ -86,6 +86,9 @@ data:
     {{- if $otlp.serviceName }}
     service_name = {{ $otlp.serviceName | quote }}
     {{- end }}
+    {{- if $otlp.tracesFilter }}
+    traces_filter = {{ $otlp.tracesFilter | quote }}
+    {{- end }}
     {{- end }}
 
     {{- if not .Values.server.disableTls }}

@@ -69,6 +69,8 @@ impl ComputeDriverTracing {
         [self.in_process_target(), self.crate_target_prefix]
     }
 
+    /// Build a driver provider, optionally using its host's trace selection.
+    /// Standalone drivers pass `None` and retain the SDK's environment sampler.
     #[must_use]
     pub fn provider_for(
         self,
@@ -76,12 +78,14 @@ impl ComputeDriverTracing {
         service_version: &'static str,
         gateway_name: Option<&str>,
         compute_driver: Option<&str>,
+        sampler: Option<Box<dyn opentelemetry_sdk::trace::ShouldSample>>,
     ) -> (Option<SdkTracerProvider>, Option<SetupError>) {
         crate::provider_for(endpoint.map(|endpoint| OtlpTraceConfig {
             endpoint,
             service_name: ServiceName::Fixed(self.service_name),
             service_version: Some(service_version),
             resource_attributes: crate::gateway_resource_attributes(gateway_name, compute_driver),
+            sampler,
         }))
     }
 
@@ -213,6 +217,7 @@ pub fn install_driver_tracing(
         config.service_version,
         config.gateway_name,
         Some(descriptor.compute_driver()),
+        None,
     );
     tracing_subscriber::registry()
         .with(

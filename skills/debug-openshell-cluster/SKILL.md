@@ -937,6 +937,8 @@ credential failures.
 
 ## Common Failure Patterns
 
+When request traces are present but reconciliation or supervisor polling traces are missing, inspect `[openshell.gateway.otlp].traces_filter` in the effective gateway TOML. `api-requests` deliberately excludes those operations and their failures, including manual calls to the same polling endpoints. Use `all` and restart the gateway to investigate background work; Helm exposes this as `server.otlp.tracesFilter`. Separate driver and supervisor processes retain their own trace settings. Console logs, audit events and metrics are unaffected by this filter.
+
 | Symptom | Likely cause | Check |
 |---|---|---|
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |

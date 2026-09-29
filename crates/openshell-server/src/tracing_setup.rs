@@ -57,6 +57,8 @@ pub fn install(
                 openshell_core::VERSION,
                 gateway.name(),
                 gateway.compute_driver(),
+                otlp_config
+                    .and_then(|config| crate::otel_tracing::sampler_for(config.traces_filter)),
             )
         },
     );

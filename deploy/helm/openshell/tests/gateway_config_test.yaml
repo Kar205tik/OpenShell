@@ -268,10 +268,14 @@ tests:
     set:
       server.otlp.endpoint: http://otel-collector.observability.svc:4317
       server.otlp.serviceName: production-gateway
+      server.otlp.tracesFilter: api-requests
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\.otlp\].*?endpoint\s*=\s*"http://otel-collector\.observability\.svc:4317".*?service_name\s*=\s*"production-gateway"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'traces_filter\s*=\s*"api-requests"'
 
   - it: omits OTLP tracing configuration by default
     template: templates/gateway-config.yaml

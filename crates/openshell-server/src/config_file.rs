@@ -213,6 +213,21 @@ pub struct OtlpConfig {
     /// `service.name` resource attribute. Defaults to `openshell-gateway`.
     #[serde(default)]
     pub service_name: Option<String>,
+
+    /// Select all traces or API requests and their descendants. This selection
+    /// is applied before the SDK sampler; it does not filter log events.
+    #[serde(default)]
+    pub traces_filter: TracesFilter,
+}
+
+/// Which gateway and in-process driver trace trees are eligible for export.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TracesFilter {
+    #[default]
+    All,
+    /// Excludes unparented background work and documented housekeeping RPCs.
+    ApiRequests,
 }
 
 /// `[openshell.supervisor]` section.
@@ -859,6 +874,23 @@ endpoint = "http://127.0.0.1:4317"
         let otlp = file.openshell.gateway.otlp.expect("otlp config");
         assert_eq!(otlp.endpoint, "http://127.0.0.1:4317");
         assert!(otlp.service_name.is_none());
+        assert_eq!(otlp.traces_filter, TracesFilter::All);
+    }
+
+    #[test]
+    fn otlp_config_selects_request_traces_and_rejects_unknown_filter() {
+        let config: OtlpConfig =
+            toml::from_str("endpoint = 'http://127.0.0.1:4317'\ntraces_filter = 'api-requests'")
+                .unwrap();
+        assert_eq!(config.traces_filter, TracesFilter::ApiRequests);
+        let encoded = toml::to_string(&config).unwrap();
+        assert_eq!(toml::from_str::<OtlpConfig>(&encoded).unwrap(), config);
+        assert!(
+            toml::from_str::<OtlpConfig>(
+                "endpoint = 'http://127.0.0.1:4317'\ntraces_filter = 'api'",
+            )
+            .is_err()
+        );
     }
 
     #[test]

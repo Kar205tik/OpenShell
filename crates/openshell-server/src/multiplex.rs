@@ -2223,6 +2223,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn request_filter_keeps_failed_api_trace_and_drops_poll_children() {
+        use crate::otel_tracing::test_exporter;
+
+        let traced = test_exporter::install_request_traced();
+        let make_request = |path| {
+            Request::builder()
+                .uri(path)
+                .header(
+                    "traceparent",
+                    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                )
+                .body(Empty::<Bytes>::new())
+                .unwrap()
+        };
+        let request = make_request_span(&make_request("/openshell.v1.OpenShell/CreateSandbox"));
+        request.in_scope(|| drop(tracing::info_span!("kept.store")));
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("7"));
+        record_response_trailers(Some(&trailers), Duration::ZERO, &request);
+        drop(request);
+        let poll = make_request_span(&make_request("/openshell.v1.OpenShell/GetSandboxConfig"));
+        poll.in_scope(|| drop(tracing::info_span!("excluded.store")));
+        drop(poll);
+        let spans = traced.finished_spans();
+        assert_eq!(spans.len(), 2, "{spans:?}");
+        let request = traced.span_named("openshell.v1.OpenShell/CreateSandbox");
+        assert_eq!(
+            request.span_context.trace_id().to_string(),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert_eq!(request.parent_span_id.to_string(), "00f067aa0ba902b7");
+        assert!(matches!(
+            request.status,
+            opentelemetry::trace::Status::Error { .. }
+        ));
+        assert_eq!(
+            traced.span_named("kept.store").parent_span_id,
+            request.span_context.span_id()
+        );
+    }
+
     /// The `TraceLayer` creates the server span, so no gRPC handler needs
     /// `#[instrument]`. The request ID carries into it so a trace can be
     /// correlated with the gateway's logs.

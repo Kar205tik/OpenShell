@@ -215,6 +215,7 @@ enabled = false
 [openshell.gateway.otlp]
 endpoint     = "http://otel-collector.observability.svc:4317"
 service_name = "openshell-gateway"
+traces_filter = "all"
 
 [openshell.gateway.oidc]
 issuer                           = "https://idp.example.com/realms/openshell"
@@ -298,11 +299,18 @@ The OpenTelemetry SDK logs export failures after startup. Spans in a failed batc
 
 Only OpenTelemetry traces are exported. Inbound gRPC and HTTP requests produce server spans named for the RPC or HTTP method. Store and compute-driver operations appear as child spans. Internal reconciliation, credential-refresh, and driver-watch loops create operation roots for their store work because no inbound request supplies a parent. The gateway continues valid W3C `traceparent` context and starts a new trace when none is supplied. Request spans carry `method`, `path`, and the `request_id` that also appears in gateway logs. Health endpoint spans use DEBUG level and are not exported by the default INFO filter.
 
+Set `traces_filter = "api-requests"` to omit routine background trace trees while keeping API requests and their child operations. The default, `"all"`, preserves the existing export behavior. Restart the gateway after changing this setting. Selected request roots still follow `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG`; their children inherit the sampling decision, including work explicitly parented to the request after its handler returns. The filter applies to the gateway and its in-process compute driver. Separate driver and supervisor processes retain their own exporter settings.
+
+The request mode excludes `/health`, `/healthz`, `/readyz`, `/metrics`, gRPC health and reflection, and these `openshell.v1.OpenShell` RPCs: `GetSandboxConfig`, `GetSandboxProviderEnvironment`, `ReportPolicyStatus`, `ReportEndpointStatus`, `ReportProviderReadiness`, `ReportSandboxConfiguration`, `PushSandboxLogs`, and `ConnectSupervisor`. Calls to these endpoints are excluded even when made manually or carrying a sampled incoming trace. Other requests, including exec and forwarding relays, remain eligible. Background work with no selected local parent is also excluded.
+
+Errors inside a selected trace remain visible. Failures in excluded background work are excluded too, because selection happens before the operation finishes. Use `"all"` when investigating reconciliation or supervisor polling. This setting does not filter console logs, audit events, or metrics, and it does not add trace context to tasks that do not already carry it.
+
 The gateway forwards the OTLP configuration, configured gateway name, configured compute driver, and W3C trace context to managed external drivers. Built-in drivers also export their spans to the same collector through dedicated in-process providers. Driver spans retain the gateway trace context, use a distinct service name such as `openshell-driver-docker` or `openshell-driver-podman`, and carry the same `openshell.gateway.name` and `openshell.gateway.compute_driver` resource attributes as gateway spans. Compute-driver client and server spans use the same fully qualified protobuf operation name, such as `openshell.compute.v1.ComputeDriver/CreateSandbox`, in both the span name and `rpc.method`. The service name and span kind distinguish each side. Backend-prefixed child spans identify implementation work. A streaming watch records a terminal status when observed; consumer teardown without a terminal status leaves the span status unset. Operator-run external drivers own their own telemetry configuration.
 
 For Helm deployments, set `server.otlp.endpoint` to render this table. The
 optional `server.otlp.serviceName` value overrides the gateway service name;
-driver service names remain fixed.
+driver service names remain fixed. Set `server.otlp.tracesFilter` to
+`api-requests` for request trace selection; it defaults to `all`.
 
 The local `mise run helm:k3s:create` workflow installs a trace collector and UI,
 enables Agent Sandbox controller tracing on supported releases, and configures
@@ -325,7 +333,7 @@ In-process compute drivers read their backend-specific settings from `[openshell
 
 ### Tuning
 
-This table decides whether and where to export. How the SDK exports is controlled by the standard OpenTelemetry environment variables, which the gateway reads through the SDK rather than mirroring as TOML keys:
+This table decides whether and where to export and which trace trees are eligible. Sampling of eligible requests and other SDK tuning remain controlled by the standard OpenTelemetry environment variables:
 
 | Variable | Effect |
 |---|---|

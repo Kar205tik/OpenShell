@@ -123,6 +123,9 @@ pub struct OtlpTraceConfig<'a> {
     pub service_name: ServiceName<'a>,
     pub service_version: Option<&'a str>,
     pub resource_attributes: Vec<KeyValue>,
+    /// Optional service-specific selection around the SDK's sampling policy.
+    /// `None` keeps the SDK's environment-selected sampler unchanged.
+    pub sampler: Option<Box<dyn opentelemetry_sdk::trace::ShouldSample>>,
 }
 
 /// Failure to construct an OTLP trace provider.
@@ -199,10 +202,13 @@ pub fn build_provider(config: &OtlpTraceConfig<'_>) -> Result<SdkTracerProvider,
         .with_endpoint(endpoint)
         .build()?;
 
-    Ok(SdkTracerProvider::builder()
+    let mut builder = SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
-        .with_resource(resource_for(config))
-        .build())
+        .with_resource(resource_for(config));
+    if let Some(sampler) = &config.sampler {
+        builder = builder.with_sampler(sampler.clone());
+    }
+    Ok(builder.build())
 }
 
 /// Build the provider for an optional OTLP configuration.
@@ -470,6 +476,7 @@ mod tests {
             service_name: ServiceName::Fixed("openshell-driver-vm"),
             service_version: Some("1.2.3"),
             resource_attributes: vec![KeyValue::new("openshell.gateway.name", "vm-dev")],
+            sampler: None,
         });
 
         assert_eq!(
@@ -501,6 +508,7 @@ mod tests {
             service_name: ServiceName::Fixed("test-service"),
             service_version: None,
             resource_attributes: Vec::new(),
+            sampler: None,
         }));
 
         assert!(provider.is_none());

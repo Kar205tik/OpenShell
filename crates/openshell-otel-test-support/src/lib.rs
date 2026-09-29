@@ -40,6 +40,7 @@ pub async fn assert_compute_driver_tracing(
         service_version,
         Some("test-gateway"),
         Some(descriptor.compute_driver()),
+        None,
     );
     assert!(error.is_none(), "valid OTLP endpoint should configure");
     let provider = provider.expect("provider");
