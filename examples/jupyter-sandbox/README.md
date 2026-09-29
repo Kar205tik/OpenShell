@@ -48,13 +48,12 @@ this shell for step 3.
 Use the service URL printed in step 2 as the `--gateway` value:
 
 ```shell
-cp demo.ipynb demo.executed.ipynb
-nb execute demo.executed.ipynb \
+nb execute demo.ipynb \
   --gateway 'http://default--jupyter-demo.openshell.localhost:<gateway-port>/' \
   --gateway-token "$JUPYTER_TOKEN"
 ```
 
-The command writes `285` into `demo.executed.ipynb` on your computer. Its code
+The command writes `285` into `demo.ipynb` on your computer. Its code
 runs in a Jupyter kernel inside the sandbox. The `nb` CLI accepts the service
 URL as a flag and authenticates its REST and WebSocket connections.
 
