@@ -17,6 +17,114 @@ namespace. The gateway and workspace releases can then be upgraded and removed
 independently. Use Kubernetes `operator` workspace mode when one gateway serves
 multiple pre-provisioned workspace namespaces.
 
+## Cluster-scoped vs namespaced objects
+
+Most objects in this chart are namespaced and land in the release namespace.
+Only two are cluster-scoped:
+
+| Object | Default name |
+| --- | --- |
+| `ClusterRole` | `<fullname>-node-reader-<release namespace>` |
+| `ClusterRoleBinding` | `<fullname>-node-reader-<release namespace>` |
+
+By default the release creates both, so an install by a cluster-admin is
+unchanged. On clusters where cluster-scoped RBAC is owned by a different team,
+split the install in two.
+
+A cluster-admin applies the cluster-scoped objects once per gateway
+ServiceAccount, rendered from the same values the release uses:
+
+```shell
+helm template openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  --namespace openshell -f my-values.yaml \
+  --set rbac.create=true \
+  --set rbac.clusterScoped.create=true \
+  --set agentSandbox.preflight.enabled=false \
+  --show-only templates/clusterrole.yaml \
+  --show-only templates/clusterrolebinding.yaml | kubectl apply -f -
+```
+
+A namespace-admin then installs and upgrades the release with cluster-scoped
+objects omitted, using [`ci/values-namespace-admin.yaml`](ci/values-namespace-admin.yaml)
+or the equivalent `--set`:
+
+```shell
+helm upgrade --install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  --namespace openshell -f my-values.yaml \
+  --set rbac.clusterScoped.create=false
+```
+
+The gateway ServiceAccount name and namespace do not change, so the
+pre-created `ClusterRoleBinding` keeps matching the release. This works with
+`serviceAccount.create=false` too: the `ClusterRoleBinding` subject follows
+`serviceAccount.name`, so render the admin step with the same values.
+
+### Which flag the installer needs
+
+In the default `shared` workspace mode the release also creates a namespaced
+sandbox `Role` granting Agent Sandbox (`agents.x-k8s.io`) permissions.
+Kubernetes forbids granting permissions you do not hold, and the built-in
+`admin` ClusterRole does not cover that CRD, so an installer holding only
+`admin` cannot create it. `rbac.clusterScoped.create=false` alone is then not
+enough and the install fails with `attempting to grant RBAC permissions not
+currently held`.
+
+| Workspace mode | Installer holds | Use |
+| --- | --- | --- |
+| `shared` | built-in `admin` only | `rbac.create=false`, cluster-admin pre-creates all gateway RBAC |
+| `shared` | `admin` plus the sandbox permissions in the namespace | `rbac.clusterScoped.create=false` |
+| `managed`, `operator` | built-in `admin` only | `rbac.clusterScoped.create=false` |
+
+`managed` and `operator` render no namespaced sandbox `Role`, so no extra grant
+is needed there.
+
+With `rbac.create=false` the cluster-admin applies the namespaced RBAC too,
+adding it to the same render:
+
+```shell
+helm template openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  --namespace openshell -f my-values.yaml \
+  --set rbac.create=true \
+  --set rbac.clusterScoped.create=true \
+  --set agentSandbox.preflight.enabled=false \
+  --show-only templates/clusterrole.yaml \
+  --show-only templates/clusterrolebinding.yaml \
+  --show-only templates/role.yaml \
+  --show-only templates/rolebinding.yaml \
+  --show-only templates/peer-role.yaml | kubectl apply -f -
+```
+
+To grant the installer the sandbox permissions instead, bind it to a Role
+carrying the same rules as the chart's `openshell-sandbox` Role.
+
+The certgen hook and credential driver RBAC keep their own flags
+(`pkiInitJob.enabled` and
+`server.credentialDrivers.kubernetesSecrets.rbac.create`).
+
+### Migrating an existing release
+
+Helm deletes objects that leave a release manifest, so setting
+`rbac.clusterScoped.create=false` on a release that already owns the
+`ClusterRole` and `ClusterRoleBinding` deletes them. The gateway then loses
+TokenReview until a cluster-admin re-applies them. Hand ownership over first, as
+cluster-admin, so nothing is deleted:
+
+```shell
+kubectl annotate clusterrole "openshell-node-reader-<namespace>" \
+  helm.sh/resource-policy=keep --overwrite
+kubectl annotate clusterrolebinding "openshell-node-reader-<namespace>" \
+  helm.sh/resource-policy=keep --overwrite
+```
+
+The objects then survive the upgrade that sets the flag, and the cluster-admin
+owns them from that point on. Fresh installs need no such step.
+
+`rbac.clusterScoped.create` is independent of
+`server.drivers.kubernetes.workspaceMode`. Managed and operator modes change
+what the `ClusterRole` contains, but they never force the namespaced release to
+apply it. Re-run the cluster-admin step after changing values that affect the
+`ClusterRole` rules.
+
 ## Prerequisites
 
 > **Required:** Your cluster CNI MUST enforce Kubernetes `NetworkPolicy` for
@@ -247,7 +355,7 @@ discovery endpoint or its TLS CA.
 | pkiInitJob.timeoutSeconds | int | `120` | Maximum time in seconds for the certgen hook to poll for cert-manager certificates. When using cert-manager with BackendTLSPolicy, the hook polls for this many seconds waiting for the certificate to be issued, then creates the backend CA ConfigMap. The Job deadline is set to (timeoutSeconds + 30) to allow time for ConfigMap creation and cleanup. Increase this if cert-manager takes longer than 120 seconds to issue certificates. |
 | podAnnotations | object | `{}` | Extra annotations to add to the gateway pod. |
 | podLabels | object | `{}` | Extra labels to add to the gateway pod. |
-| podLifecycle.terminationGracePeriodSeconds | int | `5` | Grace period, in seconds, before Kubernetes terminates the gateway pod. |
+| podLifecycle.terminationGracePeriodSeconds | int | `30` | Maximum time, in seconds, Kubernetes waits for the gateway to exit before killing it. The gateway exits as soon as shutdown completes; the limit covers supervisor session cleanup and draining queued OCSF records. |
 | podSecurityContext.fsGroup | int | `1000` | fsGroup assigned to the gateway pod. |
 | probes.liveness.failureThreshold | int | `3` | Liveness probe failure threshold before the container is restarted. |
 | probes.liveness.initialDelaySeconds | int | `2` | Liveness probe initial delay, in seconds. |
@@ -260,6 +368,10 @@ discovery endpoint or its TLS CA.
 | probes.startup.failureThreshold | int | `30` | Startup probe failure threshold before the container is killed. |
 | probes.startup.periodSeconds | int | `2` | Startup probe period, in seconds. |
 | probes.startup.timeoutSeconds | int | `1` | Startup probe timeout, in seconds. |
+| rbac.clusterScoped.clusterRoleBindingName | string | `""` | Name for the ClusterRoleBinding. Empty uses the `<fullname>-node-reader-<release namespace>` default. |
+| rbac.clusterScoped.clusterRoleName | string | `""` | Name for the ClusterRole. Empty uses the `<fullname>-node-reader-<release namespace>` default. |
+| rbac.clusterScoped.create | bool | `true` | Create the cluster-scoped ClusterRole and ClusterRoleBinding. Disable for a namespace-admin install where a cluster-admin applies them separately; the gateway ServiceAccount name and namespace are unchanged, so a pre-created ClusterRoleBinding still matches. |
+| rbac.create | bool | `true` | Create the RBAC objects that grant the gateway ServiceAccount access. Disable to supply the namespaced sandbox and peer Role/RoleBinding and the cluster-scoped ClusterRole/ClusterRoleBinding out of band. The certgen hook and credential driver RBAC keep their own flags. |
 | replicaCount | int | `1` | Number of OpenShell gateway replicas. Values greater than 1 require server.externalDbSecret because the default SQLite backend is per pod. |
 | resources | object | `{}` | Gateway pod resource requests and limits. |
 | sandbox.image.digest | string | `""` | Sandbox image digest. When set, this takes precedence over tag. |
@@ -308,12 +420,21 @@ discovery endpoint or its TLS CA.
 | server.enableUserNamespaces | bool | `false` | Enable Kubernetes user namespace isolation (hostUsers: false) for sandbox pods. Requires Kubernetes 1.33+ with user namespace support available (beta through 1.35, GA in 1.36+), plus a supporting container runtime and Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host UID and capabilities become namespaced. |
 | server.enableWebsocketTunnel | bool | `false` | Enable the WebSocket tunnel used by CLI/SDK clients behind an authenticated edge proxy. Leave disabled for direct gateway installs. |
 | server.externalDbSecret | string | `""` | Name of a pre-existing Opaque Secret containing a PostgreSQL connection URI (key: uri). When set, the gateway reads OPENSHELL_DB_URL from this Secret instead of using dbUrl. The Secret must contain a `uri` key, e.g. postgresql://user:pass@host:5432/dbname. |
+| server.extraVolumeMounts | list | `[]` | Additional volume mounts for the gateway container. |
+| server.extraVolumes | list | `[]` | Additional volumes for the gateway pod. |
 | server.grpcEndpoint | string | `""` | gRPC endpoint sandboxes call back into the gateway. Leave empty to derive it from the chart fullname, release namespace, service port, and disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080. Override only when sandboxes must reach the gateway via a different hostname (e.g. an external ingress or a host alias). |
 | server.grpcRateLimit.requests | int | `0` | Maximum gRPC requests allowed per window. Must be positive (alongside windowSeconds) to enable rate limiting; 0 (default) disables it. |
 | server.grpcRateLimit.windowSeconds | int | `0` | gRPC rate-limit window length in seconds. Must be positive (alongside requests) to enable rate limiting; 0 (default) disables it. |
 | server.hostGatewayIP | string | `""` | Host gateway IP for sandbox pod hostAliases. When set, sandbox pods get hostAliases entries mapping host.docker.internal and host.openshell.internal to this IP, allowing them to reach services running on the Docker host. Auto-detected by the cluster entrypoint script. |
 | server.logLevel | string | `"info"` | Gateway log level. |
 | server.name | string | `""` | Operator-facing gateway name. Defaults to the chart fullname so all replicas in one installation share an identity. Set explicitly when one telemetry collector receives spans from multiple namespaces or clusters. |
+| server.ocsfLog.enabled | bool | `false` | Write gateway OCSF events as JSONL. |
+| server.ocsfLog.maxFiles | int | `7` | Rotated files retained when rotation is daily. |
+| server.ocsfLog.path | string | `"/tmp/gateway-ocsf.jsonl"` | OCSF JSONL path. The default is writable in the gateway container but does not persist across restarts. To keep records, mount a volume with server.extraVolumes and server.extraVolumeMounts and set a path on it. When replicas share the volume, set subPathExpr: $(OPENSHELL_POD_NAME) on the mount so each replica writes its own file. |
+| server.ocsfLog.queueCapacity | int | `10000` | Maximum records waiting for the file writer. |
+| server.ocsfLog.queueMaxBytes | int | `16777216` | Maximum encoded bytes waiting for the file writer. |
+| server.ocsfLog.rotation | string | `"daily"` | Rotate the active file daily in UTC, or never. |
+| server.ocsfLog.schemaVersion | string | `""` | Optional OCSF downgrade target. Empty emits native OCSF 1.8.0. Supported values: "1.1", "1.3". |
 | server.oidc.adminRole | string | `""` | Role name for admin access. Leave empty (with userRole also empty) for authentication-only mode. Both must be set or both empty. |
 | server.oidc.audience | string | `"openshell-cli"` | Expected audience claim for the API resource server. This should match the server's --oidc-audience, NOT the CLI client ID. |
 | server.oidc.caConfigMapName | string | `""` | Name of a ConfigMap containing a CA certificate bundle (key: ca.crt) for verifying the OIDC issuer's TLS certificate. Required when the issuer uses a non-public CA (e.g. OpenShift ingress, private PKI). |
