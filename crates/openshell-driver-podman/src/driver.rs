@@ -1035,7 +1035,12 @@ impl PodmanComputeDriver {
             let result = async {
                 if managed_workspace {
                     self.client
-                        .create_owned_volume(&vol_name, &sandbox.id, &sandbox.workspace)
+                        .create_owned_volume(
+                            &vol_name,
+                            &sandbox.id,
+                            &sandbox.workspace,
+                            Some((identity.uid, identity.gid)),
+                        )
                         .await
                         .map_err(ComputeDriverError::from)?;
                 }
@@ -1162,7 +1167,6 @@ impl PodmanComputeDriver {
                     supervisor_bin: supervisor_bin_path.as_deref(),
                     tls_secrets: tls_secret_names.as_ref(),
                     identity: &identity,
-                    rootless: self.rootless,
                 });
                 let mut specs = match specs {
                     Ok(spec) => spec,
@@ -1177,7 +1181,7 @@ impl PodmanComputeDriver {
                     let identities = self.validate_user_volume_mounts_available(sandbox).await?;
                     specs.record_resource_identities(&identities)?;
                     self.client
-                        .create_owned_volume(&channel_volume, &sandbox.id, &sandbox.workspace)
+                        .create_owned_volume(&channel_volume, &sandbox.id, &sandbox.workspace, None)
                         .await?;
                     channel_owned.store(true, std::sync::atomic::Ordering::Relaxed);
                     let workload_id = self.client.create_typed_container(&specs.workload).await?;
@@ -3040,7 +3044,7 @@ mod tests {
         assert!(
             driver
                 .client
-                .create_owned_volume("private-collision", "sandbox-123", "team-a")
+                .create_owned_volume("private-collision", "sandbox-123", "team-a", None)
                 .await
                 .is_err()
         );
@@ -3556,7 +3560,11 @@ mod tests {
             image_response("sha256:supervisor"),
             StubResponse::new(StatusCode::NOT_FOUND, ""), // no existing private workspace
             StubResponse::new(StatusCode::CREATED, "{}"), // workspace volume
-            owned_volume_response(&container::volume_name(sandbox_id), sandbox_id),
+            owned_volume_response(
+                &container::volume_name(sandbox_id),
+                sandbox_id,
+                Some((1234, 1235)), // the stub image's OCI user
+            ),
             StubResponse::new(StatusCode::CREATED, "{}"), // resolver secret
         ];
         if proxy_secret {
@@ -3573,15 +3581,30 @@ mod tests {
         responses.push(owned_volume_response(
             &crate::isolation::channel_volume_name(sandbox_id),
             sandbox_id,
+            None,
         ));
         responses
     }
 
-    fn owned_volume_response(name: &str, sandbox_id: &str) -> StubResponse {
+    fn owned_volume_response(
+        name: &str,
+        sandbox_id: &str,
+        owner: Option<(u32, u32)>,
+    ) -> StubResponse {
+        let options = owner.map_or_else(
+            || serde_json::json!({}),
+            |(uid, gid)| {
+                serde_json::json!({
+                    "o": format!("uid={uid},gid={gid}"),
+                    "UID": uid.to_string(),
+                    "GID": gid.to_string(),
+                })
+            },
+        );
         StubResponse::new(
             StatusCode::OK,
             serde_json::json!({
-                "Name": name, "Driver": "local", "Options": {},
+                "Name": name, "Driver": "local", "Options": options,
                 "Labels": {LABEL_SANDBOX_ID: sandbox_id, container::LABEL_SANDBOX_WORKSPACE: ""}
             })
             .to_string(),

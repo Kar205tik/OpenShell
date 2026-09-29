@@ -705,12 +705,30 @@ impl PodmanClient {
     // ── Volume operations ────────────────────────────────────────────────
 
     /// Never adopt an unrelated existing volume on a private provisioning path.
+    ///
+    /// With `owner`, Podman creates the volume root owned by that UID and GID,
+    /// so a non-root workload can use it without a privileged chown.
     pub(crate) async fn create_owned_volume(
         &self,
         name: &str,
         sandbox_id: &str,
         workspace: &str,
+        owner: Option<(u32, u32)>,
     ) -> Result<(), PodmanApiError> {
+        let mount_options = owner.map(|(uid, gid)| format!("uid={uid},gid={gid}"));
+        // Podman records the parsed `UID`/`GID` next to the raw `o` option.
+        let owned_as_requested = |options: &HashMap<String, String>| {
+            let Some((uid, gid)) = owner else {
+                return options.is_empty();
+            };
+            options.get("o") == mount_options.as_ref()
+                && options.iter().all(|(key, value)| match key.as_str() {
+                    "o" => true,
+                    "UID" => *value == uid.to_string(),
+                    "GID" => *value == gid.to_string(),
+                    _ => false,
+                })
+        };
         let labels = HashMap::from([
             (
                 openshell_core::driver_utils::LABEL_SANDBOX_ID.to_string(),
@@ -724,7 +742,7 @@ impl PodmanClient {
         match self.inspect_volume(name).await {
             Ok(existing) => {
                 if existing.driver != "local"
-                    || !existing.options.is_empty()
+                    || !owned_as_requested(&existing.options)
                     || existing.labels.as_ref() != Some(&labels)
                 {
                     return Err(PodmanApiError::InvalidInput(
@@ -736,14 +754,15 @@ impl PodmanClient {
             Err(PodmanApiError::NotFound(_)) => {}
             Err(error) => return Err(error),
         }
-        self.create_ignore_conflict(
-            "/libpod/volumes/create",
-            &serde_json::json!({"Name":name,"Driver":"local","Labels":labels}),
-        )
-        .await?;
+        let mut body = serde_json::json!({"Name":name,"Driver":"local","Labels":labels});
+        if let Some(mount_options) = &mount_options {
+            body["Options"] = serde_json::json!({ "o": mount_options });
+        }
+        self.create_ignore_conflict("/libpod/volumes/create", &body)
+            .await?;
         let created = self.inspect_volume(name).await?;
         if created.driver != "local"
-            || !created.options.is_empty()
+            || !owned_as_requested(&created.options)
             || created.labels.as_ref() != Some(&labels)
         {
             return Err(PodmanApiError::InvalidInput(
@@ -1159,6 +1178,42 @@ mod tests {
             ["GET /v5.0.0/libpod/volumes/work-bind/json"]
         );
         let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn create_owned_volume_verifies_requested_owner() {
+        let labels =
+            r#"{"openshell.ai/sandbox-id":"sandbox-1","openshell.ai/sandbox-workspace":"team-a"}"#;
+        for (options, accepted) in [
+            (
+                r#"{"o":"uid=1234,gid=1235","UID":"1234","GID":"1235"}"#,
+                true,
+            ),
+            (r#"{"o":"uid=1234,gid=1235"}"#, true),
+            (r#"{"o":"uid=1234,gid=1235","UID":"0","GID":"1235"}"#, false),
+            (r#"{"o":"uid=1234,gid=1235","device":"/srv/work"}"#, false),
+            ("{}", false),
+        ] {
+            let (socket_path, _, handle) = spawn_podman_stub(
+                "owned-volume",
+                vec![
+                    StubResponse::new(StatusCode::NOT_FOUND, ""),
+                    StubResponse::new(StatusCode::CREATED, "{}"),
+                    StubResponse::new(
+                        StatusCode::OK,
+                        format!(
+                            r#"{{"Name":"work","Driver":"local","Options":{options},"Labels":{labels}}}"#
+                        ),
+                    ),
+                ],
+            );
+            let result = PodmanClient::new(socket_path.clone())
+                .create_owned_volume("work", "sandbox-1", "team-a", Some((1234, 1235)))
+                .await;
+            assert_eq!(result.is_ok(), accepted, "options {options}: {result:?}");
+            handle.await.expect("stub task should finish");
+            let _ = std::fs::remove_file(socket_path);
+        }
     }
 
     #[tokio::test]

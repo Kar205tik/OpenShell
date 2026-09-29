@@ -74,19 +74,14 @@ USER 2345:2346
     .await;
 }
 
-/// An image without a `WORKDIR` uses the managed `/sandbox` workspace. An
-/// image that declares `USER` provides a `/sandbox` owned by that user.
+/// An image without a `WORKDIR` uses the managed `/sandbox` workspace, owned
+/// by the image user, even when the image does not contain `/sandbox`.
 #[tokio::test]
 async fn default_workdir_uses_managed_workspace() {
     run("oci-image/default-workdir", async |runner| {
         let image = TestImage::build(
             "default-workdir",
-            &format!(
-                "FROM {BASE_IMAGE}
-RUN mkdir /sandbox && chown 2345:2346 /sandbox && chmod 0700 /sandbox
-USER 2345:2346
-"
-            ),
+            &format!("FROM {BASE_IMAGE}\nUSER 2345:2346\n"),
         )?;
         let checks = workspace_checks("2345:2346", "/sandbox", false);
         create_sandbox(runner, "default", "dw", &image, &checks)
