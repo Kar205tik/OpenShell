@@ -5663,7 +5663,7 @@ fn build_container_create_body_for_image(
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
     let resource_limits = docker_resource_limits(template)?;
-    let workspace_root = driver_mounts::resolve_oci_workspace_root_for_workload(
+    driver_mounts::resolve_oci_workspace_root_for_workload(
         &image.working_dir,
         WORKLOAD_RESERVED_PATHS,
     )
@@ -5678,21 +5678,6 @@ fn build_container_create_body_for_image(
                 "invalid image-declared volume '{volume}': {error}"
             ))
         })?;
-        driver_mounts::validate_workspace_mount_target(volume, &workspace_root).map_err(|_| {
-            Status::failed_precondition(format!(
-                "image-declared volume '{volume}' masks OCI WorkingDir '{workspace_root}' before workspace validation"
-            ))
-        })?;
-    }
-    for mount in &driver_config.mounts {
-        let target = match mount {
-            DockerDriverMountConfig::Bind { target, .. }
-            | DockerDriverMountConfig::Volume { target, .. }
-            | DockerDriverMountConfig::Tmpfs { target, .. }
-            | DockerDriverMountConfig::Image { target, .. } => target,
-        };
-        driver_mounts::validate_workspace_mount_target(target, &workspace_root)
-            .map_err(Status::failed_precondition)?;
     }
     let mut user_mounts = docker_driver_mounts(driver_config)?;
     user_mounts.push(Mount {

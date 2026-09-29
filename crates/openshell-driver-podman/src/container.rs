@@ -234,10 +234,9 @@ pub struct ResolvedPodmanImage {
 
 impl ResolvedPodmanImage {
     /// Resolve the image metadata and reject:
-    /// - a malformed or relative working directory, or one overlapping runtime
-    ///   or `OpenShell` control paths;
-    /// - an image volume with an invalid or reserved target; and
-    /// - an image volume covering the workspace or any of its ancestors.
+    /// - a malformed or relative working directory, or one overlapping the
+    ///   workload's trusted runtime, control channel, or CA mount;
+    /// - an image volume with an invalid or reserved target.
     pub fn from_inspect(inspected: &ImageInspect) -> Result<Self, ComputeDriverError> {
         let image_config = inspected.config.as_ref();
         let workspace_root = driver_mounts::resolve_oci_workspace_root_for_workload(
@@ -256,13 +255,6 @@ impl ResolvedPodmanImage {
                         "invalid image-declared volume '{volume}': {error}"
                     ))
                 })?;
-                driver_mounts::validate_workspace_mount_target(volume, &workspace_root).map_err(
-                    |_| {
-                        ComputeDriverError::Precondition(format!(
-                            "image-declared volume '{volume}' masks OCI WorkingDir '{workspace_root}' before workspace validation"
-                        ))
-                    },
-                )?;
             }
         }
 
@@ -841,7 +833,6 @@ pub fn podman_driver_image_mount_sources(
 fn podman_user_mounts(
     sandbox: &DriverSandbox,
     enable_bind_mounts: bool,
-    workspace_root: &str,
 ) -> Result<PodmanUserMounts, String> {
     let template = sandbox
         .spec
@@ -853,13 +844,6 @@ fn podman_user_mounts(
     let config = podman_driver_config(template, enable_bind_mounts)?;
     let mut result = PodmanUserMounts::default();
     for mount in config.mounts {
-        let target = match &mount {
-            PodmanDriverMountConfig::Bind { target, .. }
-            | PodmanDriverMountConfig::Volume { target, .. }
-            | PodmanDriverMountConfig::Tmpfs { target, .. }
-            | PodmanDriverMountConfig::Image { target, .. } => target,
-        };
-        driver_mounts::validate_workspace_mount_target(target, workspace_root)?;
         match mount {
             PodmanDriverMountConfig::Bind {
                 source,
@@ -1213,7 +1197,7 @@ fn build_base_spec(
             .unwrap_or_default(),
     );
     let resource_limits = build_resource_limits(sandbox, config);
-    let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts, &image.workspace_root)
+    let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
         .map_err(ComputeDriverError::InvalidArgument)?;
     if sandbox
         .spec
@@ -2105,7 +2089,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_image_rejects_masking_oci_volumes_but_allows_nested_volumes() {
+    fn resolved_image_allows_volumes_covering_or_nested_in_working_dir() {
         let inspect = |volume: &str| ImageInspect {
             id: "sha256:image".into(),
             config: Some(ImageConfig {
@@ -2118,7 +2102,8 @@ mod tests {
             }),
         };
 
-        assert!(ResolvedPodmanImage::from_inspect(&inspect("/workspace")).is_err());
+        ResolvedPodmanImage::from_inspect(&inspect("/workspace"))
+            .expect("image volumes may cover a workload-owned workspace");
         let image = ResolvedPodmanImage::from_inspect(&inspect("/workspace/project/cache"))
             .expect("image volumes nested below the workspace remain valid");
         assert_eq!(image.workspace_root, "/workspace/project");
@@ -2141,6 +2126,12 @@ mod tests {
                 .unwrap()
                 .workspace_root,
             "/etc/openshell/tls/client"
+        );
+        assert_eq!(
+            ResolvedPodmanImage::from_inspect(&inspect("/proc"))
+                .unwrap()
+                .workspace_root,
+            "/proc"
         );
     }
 
@@ -3235,7 +3226,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_workspace_rejects_masking_driver_mount() {
+    fn resolved_workspace_allows_covering_driver_mount() {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let image = resolved_image("sha256:immutable", "1000:1000", "/workspace/project");
@@ -3249,7 +3240,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let error = build_container_spec_for_image(
+        build_container_spec_for_image(
             &sandbox,
             &test_config(),
             None,
@@ -3259,12 +3250,7 @@ mod tests {
             None,
             None,
         )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("reserved for the OpenShell workspace")
-        );
+        .expect("driver mounts may cover a workload-owned workspace");
     }
 
     #[test]

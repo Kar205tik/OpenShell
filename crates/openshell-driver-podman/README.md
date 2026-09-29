@@ -94,13 +94,12 @@ environment belong to agent children, never the supervisor process.
 
 OpenShell reads `WORKDIR` from the workload image. If it is unset, `/`, or
 `/sandbox`, OpenShell uses its managed `/sandbox` workspace. A custom path must
-be absolute, with no `.` or `..` segments. It cannot overlap container system
-paths (`/proc`, `/sys`, `/dev`) or mounts still used in the workload:
-`/.openshell` for the control channel, `/opt/openshell/bin` for the sandbox
-runtime, and `/run/openshell-supervisor-ca` for generated CA material. Paths
-used only by the separate supervisor are allowed. Image and driver mounts may
-be inside the workspace, but cannot replace the workspace path or one of its
-parents.
+be absolute, with no `.` or `..` segments. It cannot overlap mounts still
+used in the workload: `/.openshell` for the control channel,
+`/opt/openshell/bin` for the sandbox runtime, and
+`/run/openshell-supervisor-ca` for generated CA material. Supervisor-only paths
+outside those private mounts are allowed. Image and driver mounts may overlap
+the workspace; a conflicting mount can prevent the workload from starting.
 
 For a custom path, Podman mounts a persistent workspace volume there. When the
 volume is first created, Podman copies any files already in that image directory
@@ -139,8 +138,8 @@ User `bind`, `volume`, `tmpfs`, and `image` mounts and CDI GPU selection remain
 native Podman features and apply only to the workload. Bind mounts require the
 operator's `enable_bind_mounts` opt-in and disabled label admission. Supplemental
 image mounts also require disabled admission. Driver JSON requires
-`allow_driver_config = true`. The workload's private mounts and workspace
-root cannot be replaced. User-owned volumes are never created or deleted.
+`allow_driver_config = true`. The workload's private mounts cannot be
+replaced. User-owned volumes are never created or deleted.
 
 See [gateway configuration](../../docs/how-it-works/gateways/configuration.mdx) for
 operator settings and [NETWORKING.md](NETWORKING.md) for supervisor networking.

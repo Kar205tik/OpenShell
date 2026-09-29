@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use crate::container_paths::{CONTROL_ROOTS, OCI_RUNTIME_MOUNT_ROOTS};
+use crate::container_paths::CONTROL_ROOTS;
 
 /// `SELinux` relabelling mode for bind mounts.
 ///
@@ -81,8 +81,7 @@ pub fn validate_mount_subpath(subpath: &str) -> Result<(), String> {
 
 /// Validate a container-side mount target for user-supplied driver mounts.
 ///
-/// Workspace collisions depend on the inspected image's resolved working
-/// directory and are checked separately by `validate_workspace_mount_target`.
+/// Drivers may apply additional checks for mounts used by their workload.
 pub fn validate_container_mount_target(target: &str) -> Result<(), String> {
     validate_container_mount_target_for_workload(target, CONTROL_ROOTS)
 }
@@ -114,8 +113,8 @@ pub fn validate_container_mount_target_for_workload(
 /// value and the path passed to the supervisor cannot be interpreted
 /// differently.
 pub fn resolve_oci_workspace_root(working_dir: &str) -> Result<String, String> {
-    // The sandbox runtime checks syntax and OCI mounts again; each compute
-    // driver checks its own workload mounts before admitting the workspace.
+    // The sandbox runtime checks syntax again; each compute driver checks
+    // its own workload mounts before admitting the workspace.
     resolve_oci_workspace_root_for_workload(working_dir, &[])
 }
 
@@ -128,9 +127,6 @@ pub fn resolve_oci_workspace_root_for_workload(
         return Ok(DEFAULT_WORKSPACE_ROOT.to_string());
     }
     let workspace_root = normalize_absolute_container_path(working_dir, "OCI WorkingDir")?;
-    for runtime_path in OCI_RUNTIME_MOUNT_ROOTS {
-        validate_workspace_reserved_path(&workspace_root, runtime_path, "OCI runtime mount")?;
-    }
     for control_path in workload_reserved_paths {
         validate_workspace_control_path(&workspace_root, control_path)?;
     }
@@ -196,8 +192,8 @@ fn validate_workspace_reserved_path(
     Ok(())
 }
 
-/// Reject a user-supplied mount that would replace or contain the resolved
-/// workspace root. Mounts below the workspace remain valid.
+/// Reject a user-supplied mount that would replace or contain a driver-managed
+/// workspace root. Kubernetes uses this for its fixed workspace mount.
 pub fn validate_workspace_mount_target(target: &str, workspace_root: &str) -> Result<(), String> {
     let normalized_target = normalize_mount_target(target);
     if path_is_or_under(Path::new(workspace_root), Path::new(&normalized_target)) {
@@ -279,16 +275,9 @@ mod tests {
     }
 
     #[test]
-    fn oci_workspace_root_rejects_runtime_and_selected_workload_paths() {
+    fn oci_workspace_root_only_reserves_selected_workload_paths() {
         let reserved = &["/control"];
-        for invalid in [
-            "/proc",
-            "/proc/self",
-            "/sys",
-            "/dev/shm",
-            "/control",
-            "/control/data",
-        ] {
+        for invalid in ["/control", "/control/data"] {
             assert!(
                 resolve_oci_workspace_root_for_workload(invalid, reserved).is_err(),
                 "expected workspace '{invalid}' to be rejected"
@@ -298,6 +287,12 @@ mod tests {
             resolve_oci_workspace_root_for_workload("/etc/openshell", reserved).unwrap(),
             "/etc/openshell"
         );
+        for path in ["/proc", "/sys", "/dev/shm"] {
+            assert_eq!(
+                resolve_oci_workspace_root_for_workload(path, reserved).unwrap(),
+                path
+            );
+        }
     }
 
     #[test]

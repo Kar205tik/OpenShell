@@ -66,11 +66,12 @@ already exist without symlink components. The resolved identity must be able to
 traverse every parent and write and enter the workdir; OpenShell does not
 change its ownership or mode.
 
-Image `VOLUME` declarations and user mounts must not cover the workdir, one of
-its parents, the workload's `/.openshell` runtime/channel tree, or its
-`/run/openshell-supervisor-ca` mount. OpenShell asks
-the kernel to validate access under the final identity, so POSIX ACL and host
-LSM decisions remain authoritative.
+The workdir cannot overlap the workload's `/.openshell` runtime/channel tree
+or its `/run/openshell-supervisor-ca` mount. Image `VOLUME` declarations and
+user mounts may cover the workdir; Docker's final mount layout determines
+whether that directory is usable. OpenShell asks the kernel to validate access
+under the final identity, so POSIX ACL and host LSM decisions remain
+authoritative.
 
 ## Container Contract
 
@@ -114,9 +115,9 @@ mount types are:
 
 Host bind mounts are disabled by default because they expose daemon-host paths
 to sandbox requests. User bind and volume mounts are read-only by default.
-Targets must be absolute, normalized paths and cannot overlap the workspace
-root or private mounts still used inside the workload. Supervisor-only paths
-are allowed.
+Targets must be absolute, normalized paths and cannot overlap private mounts
+still used inside the workload. They may overlap the workspace; paths outside
+the workload's private tree that are used only by the supervisor are allowed.
 
 Example:
 
