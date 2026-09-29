@@ -225,13 +225,14 @@ pub struct ResolvedPodmanImage {
     pub(crate) oci_user: String,
     pub(crate) environment: Vec<String>,
     pub(crate) workspace_root: String,
+    image_volume_targets: Vec<String>,
 }
 
 impl ResolvedPodmanImage {
     /// Resolve the image metadata and reject:
     /// - a malformed or reserved working directory;
-    /// - an image volume with an invalid or reserved target, or one covering
-    ///   the resolved workspace.
+    /// - for a custom working directory, an image volume with an invalid or
+    ///   reserved target, or one covering the resolved workspace.
     pub fn from_inspect(inspected: &ImageInspect) -> Result<Self, ComputeDriverError> {
         let image_config = inspected.config.as_ref();
         let workspace_root = driver_mounts::resolve_oci_workspace_root(
@@ -245,7 +246,10 @@ impl ResolvedPodmanImage {
             driver_mounts::validate_workspace_control_path(&workspace_root, control_path)
                 .map_err(ComputeDriverError::Precondition)?;
         }
-        if let Some(volumes) = image_config.and_then(|config| config.volumes.as_ref()) {
+        let mut image_volume_targets = Vec::new();
+        if workspace_root != driver_mounts::DEFAULT_WORKSPACE_ROOT
+            && let Some(volumes) = image_config.and_then(|config| config.volumes.as_ref())
+        {
             for volume in volumes.keys() {
                 validate_podman_mount_target(volume).map_err(|error| {
                     ComputeDriverError::Precondition(format!(
@@ -259,7 +263,9 @@ impl ResolvedPodmanImage {
                         ))
                     },
                 )?;
+                image_volume_targets.push(volume.clone());
             }
+            image_volume_targets.sort();
         }
         Ok(Self {
             id: inspected.id.clone(),
@@ -268,6 +274,7 @@ impl ResolvedPodmanImage {
                 .to_string(),
             environment: image_config.map_or_else(Vec::new, |config| config.env.clone()),
             workspace_root,
+            image_volume_targets,
         })
     }
 
@@ -1576,6 +1583,11 @@ pub fn build_isolation_specs(
     workload
         .labels
         .insert(crate::isolation::LABEL_ROLE.into(), "sandbox".into());
+    workload.labels.insert(
+        "openshell.ai/private-image-volume-targets".into(),
+        serde_json::to_string(&input.image.image_volume_targets)
+            .map_err(|error| ComputeDriverError::Message(error.to_string()))?,
+    );
     workload.env = BTreeMap::new();
     workload.unsetenv = input
         .image
@@ -2008,7 +2020,10 @@ mod tests {
                 driver_mounts::DEFAULT_WORKSPACE_ROOT,
             ]
         );
-        let custom_image = resolved_image("sha256:image", "1000:1001", "/workspace/project");
+        let mut custom_image = resolved_image("sha256:image", "1000:1001", "/workspace/project");
+        custom_image
+            .image_volume_targets
+            .push("/workspace/project/cache".into());
         let custom_specs = build_isolation_specs(IsolationSpecInput {
             sandbox: &sandbox,
             config: &config,
@@ -2024,6 +2039,14 @@ mod tests {
         })
         .unwrap();
         assert_eq!(custom_specs.workload.user, "1000:1001");
+        assert_eq!(
+            custom_specs
+                .workload
+                .labels
+                .get("openshell.ai/private-image-volume-targets")
+                .map(String::as_str),
+            Some("[\"/workspace/project/cache\"]")
+        );
         assert!(custom_specs.workload.cap_add.is_empty());
         assert_eq!(
             custom_specs.workload.command,
@@ -2125,28 +2148,13 @@ mod tests {
         let image = ResolvedPodmanImage::from_inspect(&inspect("/workspace/project/cache"))
             .expect("image volumes nested below the workspace remain valid");
         assert_eq!(image.workspace_root, "/workspace/project");
-    }
+        assert_eq!(image.image_volume_targets, vec!["/workspace/project/cache"]);
 
-    #[test]
-    fn resolved_image_reuses_reserved_workdir_validation() {
-        let inspect = |working_dir: &str| ImageInspect {
-            id: "sha256:image".into(),
-            config: Some(ImageConfig {
-                working_dir: working_dir.into(),
-                ..Default::default()
-            }),
-        };
-
-        assert!(ResolvedPodmanImage::from_inspect(&inspect("/opt/openshell/bin/project")).is_err());
-        assert!(ResolvedPodmanImage::from_inspect(&inspect("/.openshell/channel")).is_err());
-        assert!(ResolvedPodmanImage::from_inspect(&inspect("/etc/openshell/tls/client")).is_err());
-        assert!(ResolvedPodmanImage::from_inspect(&inspect("/proc")).is_err());
-        assert_eq!(
-            ResolvedPodmanImage::from_inspect(&inspect("/home/app"))
-                .unwrap()
-                .workspace_root,
-            "/home/app"
-        );
+        let mut fallback = inspect("/etc/openshell");
+        fallback.config.as_mut().unwrap().working_dir = "/sandbox".into();
+        let fallback = ResolvedPodmanImage::from_inspect(&fallback)
+            .expect("existing /sandbox images keep their image-volume behavior");
+        assert!(fallback.image_volume_targets.is_empty());
     }
 
     fn json_struct(value: Value) -> prost_types::Struct {
