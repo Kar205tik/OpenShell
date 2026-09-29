@@ -143,3 +143,4 @@ nv-vankit
 n1hility
 craig-armadin
 Joffref
+fede-kamel
