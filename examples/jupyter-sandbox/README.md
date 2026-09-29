@@ -14,7 +14,7 @@ Install the [Jupyter community notebook CLI](https://github.com/jupyter-ai-contr
 cargo install nb-cli --version 0.0.10 --locked
 ```
 
-OpenShell pulls the published `quay.io/jupyter/base-notebook:2026-04-27` image
+OpenShell pulls the published `quay.io/jupyter/base-notebook:2026-09-29` image
 when it creates the sandbox. The image includes Jupyter Server and a Python
 kernel, so no container build is needed.
 
@@ -24,7 +24,7 @@ kernel, so no container build is needed.
 JUPYTER_TOKEN="$(openssl rand -hex 32)"
 openshell sandbox create \
   --name jupyter-demo \
-  --from quay.io/jupyter/base-notebook:2026-04-27 \
+  --from quay.io/jupyter/base-notebook:2026-09-29 \
   --policy policy.yaml \
   --expose 8888 \
   --detach --no-tty \
