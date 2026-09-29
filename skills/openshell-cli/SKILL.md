@@ -681,7 +681,8 @@ files, mounted volumes, or devices.
 Podman gateways use a normalized absolute OCI `WORKDIR` as the workspace.
 Empty, `/`, and explicit `/sandbox` declarations use the managed `/sandbox`
 fallback. For a custom path, the final identity must be able to traverse and
-write the directory in the persistent volume.
+write the existing directory in the container filesystem. A custom path does
+not use a workspace volume; only the managed `/sandbox` fallback does.
 
 ### Forward ports
 
