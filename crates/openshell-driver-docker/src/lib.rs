@@ -5657,7 +5657,11 @@ fn build_container_create_body_for_image(
     driver_mounts::validate_workspace_control_path(&workspace_root, BOUNDARY_MOUNT_PATH)
         .map_err(Status::failed_precondition)?;
     for volume in &image.volumes {
-        driver_mounts::validate_container_mount_target(volume).map_err(|error| {
+        driver_mounts::validate_container_mount_target_with_control_paths(
+            volume,
+            &[BOUNDARY_MOUNT_PATH],
+        )
+        .map_err(|error| {
             Status::failed_precondition(format!(
                 "invalid image-declared volume '{volume}': {error}"
             ))
@@ -5667,8 +5671,6 @@ fn build_container_create_body_for_image(
                 "image-declared volume '{volume}' masks OCI WorkingDir '{workspace_root}' before workspace validation"
             ))
         })?;
-        driver_mounts::validate_mount_control_path(volume, BOUNDARY_MOUNT_PATH)
-            .map_err(Status::failed_precondition)?;
     }
     for mount in &driver_config.mounts {
         let target = match mount {
@@ -5679,8 +5681,11 @@ fn build_container_create_body_for_image(
         };
         driver_mounts::validate_workspace_mount_target(target, &workspace_root)
             .map_err(Status::failed_precondition)?;
-        driver_mounts::validate_mount_control_path(target, BOUNDARY_MOUNT_PATH)
-            .map_err(Status::failed_precondition)?;
+        driver_mounts::validate_container_mount_target_with_control_paths(
+            target,
+            &[BOUNDARY_MOUNT_PATH],
+        )
+        .map_err(Status::failed_precondition)?;
     }
     let mut user_mounts = docker_driver_mounts(driver_config)?;
     user_mounts.push(Mount {

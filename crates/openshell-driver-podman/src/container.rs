@@ -6,7 +6,9 @@
 use crate::client::ImageInspect;
 use crate::config::PodmanComputeConfig;
 use openshell_core::ComputeDriverError;
-use openshell_core::driver_mounts::SelinuxLabel;
+use openshell_core::driver_mounts::{
+    SelinuxLabel, validate_container_mount_target_with_control_paths as validate_mount_target,
+};
 #[cfg(test)]
 use openshell_core::gpu::{driver_gpu_requirements, validate_specific_gpu_device_request};
 use openshell_core::proto::compute::v1::{DriverSandbox, DriverSandboxTemplate};
@@ -50,6 +52,10 @@ const CONTAINER_PREFIX: &str = "openshell-";
 
 /// Volume name prefix.
 const VOLUME_PREFIX: &str = "openshell-sandbox-";
+const WORKLOAD_CONTROL_PATHS: &[&str] = &[
+    "/.openshell",
+    openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_ROOT,
+];
 
 /// Secret name prefix for per-sandbox gateway JWTs.
 const TOKEN_SECRET_PREFIX: &str = "openshell-token-";
@@ -239,10 +245,7 @@ impl ResolvedPodmanImage {
             image_config.map_or("", |config| config.working_dir.as_str()),
         )
         .map_err(ComputeDriverError::Precondition)?;
-        for control_path in [
-            "/.openshell",
-            openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_ROOT,
-        ] {
+        for control_path in WORKLOAD_CONTROL_PATHS {
             driver_mounts::validate_workspace_control_path(&workspace_root, control_path)
                 .map_err(ComputeDriverError::Precondition)?;
         }
@@ -251,7 +254,7 @@ impl ResolvedPodmanImage {
             && let Some(volumes) = image_config.and_then(|config| config.volumes.as_ref())
         {
             for volume in volumes.keys() {
-                validate_podman_mount_target(volume).map_err(|error| {
+                validate_mount_target(volume, WORKLOAD_CONTROL_PATHS).map_err(|error| {
                     ComputeDriverError::Precondition(format!(
                         "invalid image-declared volume '{volume}': {error}"
                     ))
@@ -840,17 +843,6 @@ pub fn podman_driver_image_mount_sources(
         .collect())
 }
 
-fn validate_podman_mount_target(target: &str) -> Result<(), String> {
-    driver_mounts::validate_container_mount_target(target)?;
-    for control_path in [
-        "/.openshell",
-        openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_ROOT,
-    ] {
-        driver_mounts::validate_mount_control_path(target, control_path)?;
-    }
-    Ok(())
-}
-
 fn podman_user_mounts(
     sandbox: &DriverSandbox,
     enable_bind_mounts: bool,
@@ -882,7 +874,7 @@ fn podman_user_mounts(
                     None => {}
                 }
                 driver_mounts::validate_absolute_mount_source(&source, "bind source")?;
-                validate_podman_mount_target(&target)?;
+                validate_mount_target(&target, WORKLOAD_CONTROL_PATHS)?;
                 result.mounts.push(Mount {
                     kind: "bind".into(),
                     source,
@@ -898,7 +890,7 @@ fn podman_user_mounts(
             } => {
                 reject_subpath(subpath.as_deref(), "podman volume mounts")?;
                 driver_mounts::validate_mount_source(&source, "volume source")?;
-                validate_podman_mount_target(&target)?;
+                validate_mount_target(&target, WORKLOAD_CONTROL_PATHS)?;
                 result.volumes.push(NamedVolume {
                     name: source,
                     dest: target,
@@ -924,7 +916,7 @@ fn podman_user_mounts(
                 {
                     options.push(format!("mode={mode:o}"));
                 }
-                validate_podman_mount_target(&target)?;
+                validate_mount_target(&target, WORKLOAD_CONTROL_PATHS)?;
                 result.mounts.push(Mount {
                     kind: "tmpfs".into(),
                     source: "tmpfs".into(),
@@ -940,7 +932,7 @@ fn podman_user_mounts(
             } => {
                 reject_subpath(subpath.as_deref(), "podman image mounts")?;
                 driver_mounts::validate_mount_source(&source, "image source")?;
-                validate_podman_mount_target(&target)?;
+                validate_mount_target(&target, WORKLOAD_CONTROL_PATHS)?;
                 result.image_volumes.push(ImageVolume {
                     source,
                     destination: target,
@@ -1015,7 +1007,7 @@ fn validate_podman_driver_mounts(
                 target
             }
         };
-        validate_podman_mount_target(target)?;
+        validate_mount_target(target, WORKLOAD_CONTROL_PATHS)?;
         let normalized_target = driver_mounts::normalize_mount_target(target);
         if !targets.insert(normalized_target.clone()) {
             return Err(format!(

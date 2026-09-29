@@ -98,6 +98,18 @@ pub fn validate_container_mount_target(target: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate a mount target against shared and driver-specific control paths.
+pub fn validate_container_mount_target_with_control_paths(
+    target: &str,
+    control_paths: &[&str],
+) -> Result<(), String> {
+    validate_container_mount_target(target)?;
+    for control_path in control_paths {
+        validate_mount_control_path(target, control_path)?;
+    }
+    Ok(())
+}
+
 /// Resolve an OCI image working directory to the internal workspace root used
 /// by local container drivers.
 ///
@@ -358,6 +370,27 @@ mod tests {
             );
         }
         validate_mount_control_path("/custom-other", "/custom/ssh.sock").unwrap();
+    }
+
+    #[test]
+    fn container_target_checks_shared_and_driver_control_paths() {
+        let control_paths = &["/.openshell/channel"];
+        assert!(
+            validate_container_mount_target_with_control_paths(
+                "/etc/openshell/tls/client",
+                control_paths,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_container_mount_target_with_control_paths(
+                "/.openshell/channel/sandbox",
+                control_paths,
+            )
+            .is_err()
+        );
+        validate_container_mount_target_with_control_paths("/workspace/cache", control_paths)
+            .unwrap();
     }
 
     #[test]
