@@ -31,6 +31,8 @@ type EventStream = ReceiverStream<Result<proto::ExecSandboxEvent, Status>>;
 enum Scenario {
     Echo,
     Count,
+    AwaitCancellation,
+    ReadAfterCancellation,
     EarlyExit,
     ErrorAfterExit,
     MissingExit,
@@ -43,7 +45,9 @@ struct Calls {
     unary: Vec<proto::ExecSandboxRequest>,
     starts: Vec<proto::ExecSandboxRequest>,
     input_bytes: usize,
-    clean_eof: bool,
+    request_ended: bool,
+    request_error: bool,
+    response_cancelled: bool,
 }
 
 #[derive(Clone)]
@@ -113,11 +117,26 @@ impl MockGateway {
                     .await;
                 return;
             }
-            Scenario::Echo | Scenario::Count => {}
+            Scenario::Echo | Scenario::Count | Scenario::AwaitCancellation => {}
+            Scenario::ReadAfterCancellation => {
+                // Delay request polling until the client has cancelled its
+                // response. Tonic can then expose CANCEL as request EOF, even
+                // though the CLI never queued its explicit stdin EOF marker.
+                output.closed().await;
+                self.calls.lock().unwrap().response_cancelled = true;
+            }
         }
 
         loop {
-            match input.message().await {
+            let message = tokio::select! {
+                biased;
+                () = output.closed(), if !matches!(self.scenario, Scenario::ReadAfterCancellation) => {
+                    self.calls.lock().unwrap().response_cancelled = true;
+                    return;
+                }
+                message = input.message() => message,
+            };
+            match message {
                 Ok(Some(frame)) => match frame.payload {
                     Some(exec_sandbox_input::Payload::Stdin(bytes)) => {
                         self.calls.lock().unwrap().input_bytes += bytes.len();
@@ -127,16 +146,26 @@ impl MockGateway {
                             return;
                         }
                     }
-                    // Cancellation is deliberately not clean EOF. A local read
-                    // failure must not tell the remote command that input succeeded.
+                    // The malformed abort frame can arrive before cancellation
+                    // or be discarded by it. Neither outcome proves clean EOF.
+                    None if matches!(self.scenario, Scenario::ReadAfterCancellation) => {}
+                    None if matches!(self.scenario, Scenario::AwaitCancellation) => break,
                     None => return,
                     unexpected => panic!("unexpected input after start: {unexpected:?}"),
                 },
                 Ok(None) => {
-                    self.calls.lock().unwrap().clean_eof = true;
+                    // Request completion alone cannot distinguish clean stdin
+                    // EOF from HTTP/2 cancellation. Observe the response too.
+                    self.calls.lock().unwrap().request_ended = true;
                     break;
                 }
-                Err(_) => return,
+                Err(_) => {
+                    self.calls.lock().unwrap().request_error = true;
+                    if matches!(self.scenario, Scenario::AwaitCancellation) {
+                        break;
+                    }
+                    return;
+                }
             }
         }
 
@@ -160,6 +189,12 @@ impl MockGateway {
                     .send(Ok(stdout(format!("{total}\n").into_bytes())))
                     .await;
                 let _ = output.send(Ok(exit(0))).await;
+            }
+            Scenario::AwaitCancellation | Scenario::ReadAfterCancellation => {
+                // Keep the response open so this witness cannot be caused by
+                // the mock finishing normally after an ambiguous request end.
+                output.closed().await;
+                self.calls.lock().unwrap().response_cancelled = true;
             }
             _ => unreachable!(),
         }
@@ -512,7 +547,7 @@ async fn streaming_exchanges_two_requests_before_eof_and_drains_final_output() {
     assert_eq!(final_stdout, "after-eof\n");
     assert_eq!(output.stderr, b"remote-stderr\n");
     gateway.assert_one_stream();
-    assert!(gateway.calls.lock().unwrap().clean_eof);
+    assert!(gateway.calls.lock().unwrap().request_ended);
 }
 
 #[tokio::test]
@@ -527,7 +562,7 @@ async fn streaming_remote_exit_does_not_wait_for_idle_open_stdin() {
         String::from_utf8_lossy(&output.stderr)
     );
     gateway.assert_one_stream();
-    assert!(!gateway.calls.lock().unwrap().clean_eof);
+    assert!(!gateway.calls.lock().unwrap().request_ended);
     drop(held_open);
 }
 
@@ -607,12 +642,12 @@ async fn streaming_accepts_exact_input_limit() {
     );
     assert_eq!(output.stdout, format!("{STDIN_LIMIT}\n").as_bytes());
     gateway.assert_one_stream();
-    assert!(gateway.calls.lock().unwrap().clean_eof);
+    assert!(gateway.calls.lock().unwrap().request_ended);
 }
 
 #[tokio::test]
-async fn streaming_rejects_excess_input_without_clean_eof() {
-    let gateway = TestGateway::start(Scenario::Count).await;
+async fn streaming_rejects_excess_input_and_cancels_response() {
+    let gateway = TestGateway::start(Scenario::AwaitCancellation).await;
     let mut child = gateway.spawn(true);
     send_input(&mut child, &vec![b'x'; STDIN_LIMIT + 1]).await;
     let output = finish(child).await;
@@ -627,12 +662,12 @@ async fn streaming_rejects_excess_input_without_clean_eof() {
     gateway.assert_one_stream();
     let calls = gateway.calls.lock().unwrap();
     assert!(calls.input_bytes <= STDIN_LIMIT);
-    assert!(!calls.clean_eof);
+    assert!(calls.response_cancelled);
 }
 
 #[tokio::test]
-async fn streaming_reports_unreadable_stdin_without_clean_eof() {
-    let gateway = TestGateway::start(Scenario::Count).await;
+async fn streaming_reports_unreadable_stdin_and_cancels_response() {
+    let gateway = TestGateway::start(Scenario::AwaitCancellation).await;
     let input = std::fs::File::open(gateway.config.path()).unwrap();
     let child = gateway
         .command(Path::new(env!("CARGO_BIN_EXE_openshell")), true)
@@ -645,7 +680,62 @@ async fn streaming_reports_unreadable_stdin_without_clean_eof() {
     assert!(stderr.contains("Is a directory"), "{stderr}");
     gateway.wait_for_stream_end().await;
     gateway.assert_one_stream();
-    assert!(!gateway.calls.lock().unwrap().clean_eof);
+    let calls = gateway.calls.lock().unwrap();
+    assert_eq!(calls.input_bytes, 0);
+    assert!(calls.response_cancelled);
+}
+
+#[tokio::test]
+async fn streaming_cancelled_request_ends_after_delayed_poll() {
+    let gateway = TestGateway::start(Scenario::ReadAfterCancellation).await;
+    let input = std::fs::File::open(gateway.config.path()).unwrap();
+    let child = gateway
+        .command(Path::new(env!("CARGO_BIN_EXE_openshell")), true)
+        .stdin(Stdio::from(input))
+        .spawn()
+        .unwrap();
+    let output = finish(child).await;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Is a directory"));
+    gateway.wait_for_stream_end().await;
+    gateway.assert_one_stream();
+    let calls = gateway.calls.lock().unwrap();
+    assert_eq!(calls.input_bytes, 0);
+    assert!(calls.response_cancelled);
+    assert!(
+        calls.request_ended || calls.request_error,
+        "cancellation must terminate the request, whether as EOF or a transport error"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_tonic_request_can_decode_as_end_of_input() {
+    struct NoFrames;
+    impl tonic::codec::Decoder for NoFrames {
+        type Item = ();
+        type Error = Status;
+
+        fn decode(&mut self, _: &mut tonic::codec::DecodeBuf<'_>) -> Result<Option<()>, Status> {
+            Err(Status::internal("the cancelled body contains no message"))
+        }
+    }
+
+    // Inject cancellation at the decoder boundary rather than relying on the
+    // HTTP/2 transport to choose the same terminal outcome on every platform.
+    let cancelled: Result<hyper::body::Frame<bytes::Bytes>, Status> =
+        Err(Status::cancelled("synthetic request cancellation"));
+    let body = http_body_util::StreamBody::new(futures::stream::iter([cancelled]));
+    let mut request = tonic::Streaming::new_request(NoFrames, body, None, None);
+    assert!(request.message().await.unwrap().is_none());
+
+    let unavailable: Result<hyper::body::Frame<bytes::Bytes>, Status> =
+        Err(Status::unavailable("synthetic transport failure"));
+    let body = http_body_util::StreamBody::new(futures::stream::iter([unavailable]));
+    let mut request = tonic::Streaming::new_request(NoFrames, body, None, None);
+    assert_eq!(
+        request.message().await.unwrap_err().code(),
+        tonic::Code::Unavailable,
+    );
 }
 
 #[tokio::test]
@@ -679,7 +769,7 @@ async fn default_large_finite_pipe_retains_streaming_transport() {
     );
     assert_eq!(output.stdout, format!("{STDIN_LIMIT}\n").as_bytes());
     gateway.assert_one_stream();
-    assert!(gateway.calls.lock().unwrap().clean_eof);
+    assert!(gateway.calls.lock().unwrap().request_ended);
 }
 
 #[tokio::test]

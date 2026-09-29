@@ -2297,9 +2297,8 @@ impl Drop for TaskGuard {
     }
 }
 
-// Only an explicit EOF may close the RPC request successfully. If a reader
-// fails or the operation is cancelled, dropping senders must not make the
-// gateway execute partially delivered input as though stdin completed cleanly.
+// Only an explicit local EOF closes this request-body stream. A failed reader
+// drops its sender while the RPC remains open until response cancellation.
 enum ExecInputMessage {
     Frame(Box<openshell_core::proto::ExecSandboxInput>),
     Eof,
@@ -2360,6 +2359,27 @@ fn forward_exec_stdin(
             }
         }
     }
+}
+
+// Keep the EOF decision beside the reader result so failures cannot queue a
+// successful end-of-input marker before the response loop cancels the RPC.
+fn write_exec_stdin_frames(
+    reader: impl Read,
+    prefix: &[u8],
+    limit: Option<usize>,
+    sender: &tokio::sync::mpsc::Sender<ExecInputMessage>,
+) -> std::io::Result<()> {
+    use openshell_core::proto::{ExecSandboxInput, exec_sandbox_input};
+
+    forward_exec_stdin(reader, prefix, limit, |chunk| {
+        sender
+            .blocking_send(ExecInputMessage::Frame(Box::new(ExecSandboxInput {
+                payload: Some(exec_sandbox_input::Payload::Stdin(chunk.to_vec())),
+            })))
+            .is_ok()
+    })?;
+    let _ = sender.blocking_send(ExecInputMessage::Eof);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2431,21 +2451,12 @@ async fn sandbox_exec_streaming_grpc(
     let stdin_tx = input_tx.clone();
     let (stdin_result_tx, mut stdin_result_rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
-        let result = forward_exec_stdin(
+        let result = write_exec_stdin_frames(
             std::io::stdin().lock(),
             &stdin_prefix,
             stdin_limit,
-            |chunk| {
-                stdin_tx
-                    .blocking_send(ExecInputMessage::Frame(Box::new(ExecSandboxInput {
-                        payload: Some(exec_sandbox_input::Payload::Stdin(chunk.to_vec())),
-                    })))
-                    .is_ok()
-            },
+            &stdin_tx,
         );
-        if result.is_ok() {
-            let _ = stdin_tx.blocking_send(ExecInputMessage::Eof);
-        }
         let _ = stdin_result_tx.send(result);
     });
 
@@ -2497,8 +2508,8 @@ async fn sandbox_exec_streaming_grpc(
                     Ok(()) => {}
                     Err(error) => {
                         // An invalid frame aborts the command if it reaches the
-                        // gateway. If delivery is blocked, response cancellation
-                        // still ends the relay without synthesizing stdin EOF.
+                        // gateway. If delivery is blocked, closing the response
+                        // cancels the relay independently of request termination.
                         let abort = ExecInputMessage::Frame(Box::new(ExecSandboxInput { payload: None }));
                         let _ = tokio::time::timeout(Duration::from_secs(5), input_tx.send(abort)).await;
                         drop(stream);
@@ -6528,6 +6539,80 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(10), stream.next())
                 .await
                 .is_err()
+        );
+    }
+
+    fn assert_exec_stdin_writer_error(reader: impl std::io::Read, prefix: &[u8]) -> std::io::Error {
+        use futures::{FutureExt, StreamExt};
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let error = super::write_exec_stdin_frames(reader, prefix, Some(2), &sender)
+            .expect_err("a failed reader must not queue EOF");
+        drop(sender);
+        let mut stream = Box::pin(super::exec_input_stream(receiver));
+        let frame = stream
+            .next()
+            .now_or_never()
+            .expect("the permitted bytes are already queued")
+            .expect("the request body must contain its input frame");
+        assert_eq!(
+            frame.payload,
+            Some(openshell_core::proto::exec_sandbox_input::Payload::Stdin(
+                b"ab".to_vec()
+            )),
+        );
+        assert!(
+            stream.next().now_or_never().is_none(),
+            "a failed reader must leave the request pending, not queue an explicit EOF",
+        );
+        error
+    }
+
+    #[test]
+    fn exec_stdin_writer_overflow_does_not_queue_eof() {
+        let error = assert_exec_stdin_writer_error(&b"abc"[..], &[]);
+        assert!(error.to_string().contains("partial input"));
+    }
+
+    #[test]
+    fn exec_stdin_writer_read_error_does_not_queue_eof() {
+        struct FailedReader;
+        impl std::io::Read for FailedReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("synthetic read failure"))
+            }
+        }
+
+        let error = assert_exec_stdin_writer_error(FailedReader, b"ab");
+        assert_eq!(error.to_string(), "synthetic read failure");
+    }
+
+    #[test]
+    fn exec_stdin_writer_exact_limit_queues_eof() {
+        use futures::{FutureExt, StreamExt};
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        super::write_exec_stdin_frames(&b"ab"[..], &[], Some(2), &sender)
+            .expect("the exact limit followed by EOF is valid");
+        drop(sender);
+        let mut stream = Box::pin(super::exec_input_stream(receiver));
+        let frame = stream
+            .next()
+            .now_or_never()
+            .expect("the input is already queued")
+            .expect("the request body must contain its input frame");
+        assert_eq!(
+            frame.payload,
+            Some(openshell_core::proto::exec_sandbox_input::Payload::Stdin(
+                b"ab".to_vec()
+            )),
+        );
+        assert!(
+            stream
+                .next()
+                .now_or_never()
+                .expect("EOF is already queued")
+                .is_none(),
         );
     }
 
