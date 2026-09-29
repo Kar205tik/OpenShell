@@ -523,6 +523,67 @@ fn sandbox_environment(sandbox: &DriverSandbox) -> Vec<String> {
     environment
 }
 
+/// Values that must never appear verbatim in the gateway log: the
+/// caller-injected per-sandbox environment (`--env`/`--env-from`/template
+/// environment) and the generated egress-proxy password. Both reach the
+/// sandboxed process's own environment for its own legitimate use, but the
+/// whole point of injecting them as environment variables rather than baking
+/// them into a logged command line is that they must never surface in
+/// gateway/trace/audit output either. `cmd.exe` (and any other shell) echoes
+/// its own expanded command line to stdout by default, so a workload that
+/// merely references an injected variable (e.g. `echo %SECRET%`) leaks it
+/// straight into the `wxc-exec stdout:` log line -- twice, once in the
+/// echoed command and once in the command's own output -- unless the value
+/// is redacted before logging. See nvbugs 6843156.
+///
+/// Provider credentials are deliberately excluded here: per
+/// `append_provider_child_env`'s doc comment, those values are
+/// revision-scoped placeholders by the time they reach `process.env`, not
+/// the raw secret, so redacting them here would be pointless.
+fn secret_redaction_values(
+    injected_environment: &[String],
+    proxy_auth: Option<&SandboxProxyAuth>,
+) -> Vec<String> {
+    // Below this length a "secret" is common enough (e.g. "1", "true", a
+    // short flag value) that redacting it would mangle unrelated log lines
+    // without protecting anything meaningful.
+    const MIN_SECRET_LEN: usize = 4;
+    let mut values: Vec<String> = injected_environment
+        .iter()
+        .filter_map(|entry| entry.split_once('=').map(|(_, v)| v.to_string()))
+        .collect();
+    if let Some(auth) = proxy_auth {
+        values.push(auth.password.clone());
+    }
+    values.retain(|v| v.len() >= MIN_SECRET_LEN);
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+/// Replaces every occurrence of a redaction value in `line` with
+/// `[REDACTED]`. Longest values first, so a value that happens to be a
+/// substring of another redaction value doesn't get partially replaced,
+/// leaving a fragment of the longer secret behind.
+fn redact_secrets<'a>(line: &'a str, secrets: &[String]) -> std::borrow::Cow<'a, str> {
+    if secrets.is_empty() {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let mut ordered: Vec<&String> = secrets.iter().collect();
+    ordered.sort_unstable_by_key(|s| std::cmp::Reverse(s.len()));
+    let mut result: Option<String> = None;
+    for secret in ordered {
+        let haystack = result.as_deref().unwrap_or(line);
+        if haystack.contains(secret.as_str()) {
+            result = Some(haystack.replace(secret.as_str(), "[REDACTED]"));
+        }
+    }
+    match result {
+        Some(redacted) => std::borrow::Cow::Owned(redacted),
+        None => std::borrow::Cow::Borrowed(line),
+    }
+}
+
 /// Merge provider-owned child environment values into MXC `process.env`.
 ///
 /// Provider entries win case-insensitively, matching Windows environment
@@ -1721,7 +1782,8 @@ async fn run_lifecycle(
             .collect()
     };
 
-    for entry in sandbox_environment(&sandbox) {
+    let injected_environment = sandbox_environment(&sandbox);
+    for entry in &injected_environment {
         if let Some(pos) = entry.find('=') {
             env_map.insert(entry[..pos].to_string(), entry[pos + 1..].to_string());
         }
@@ -1909,6 +1971,17 @@ async fn run_lifecycle(
     // unread in the OS pipe until the process exits.
     let mut child = child;
 
+    // A shell entry point (e.g. `cmd.exe /c script.cmd` with no `@echo off`)
+    // echoes its own expanded command line to its stdout by default, so an
+    // injected secret referenced by the workload's command surfaces in the
+    // captured stdout below even though it was never explicitly logged by
+    // name -- redact known secret values from every captured line before
+    // they reach the gateway log. See nvbugs 6843156.
+    let secret_values = Arc::new(secret_redaction_values(
+        &injected_environment,
+        proxy_auth.as_ref(),
+    ));
+
     // Control channel: correlate JSON responses in the stdout stream with
     // pending requests sent over stdin (see control_channel.rs). Only
     // meaningful when the process on the other end is
@@ -1968,6 +2041,7 @@ async fn run_lifecycle(
         let sandbox_name_out = sandbox_name.clone();
         let ready_slot = ready_slot.clone();
         let target_ready_slot = target_ready_slot.clone();
+        let secret_values_out = secret_values.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             loop {
@@ -1992,6 +2066,7 @@ async fn run_lifecycle(
                                 None => false,
                             };
                         if !routed {
+                            let line = redact_secrets(&line, &secret_values_out);
                             info!(sandbox = %sandbox_name_out, "wxc-exec stdout: {line}");
                         }
                     }
@@ -2021,11 +2096,15 @@ async fn run_lifecycle(
     drop(target_ready_slot);
     if let Some(stderr) = child.stderr.take() {
         let sandbox_name_err = sandbox_name.clone();
+        let secret_values_err = secret_values.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             loop {
                 match lines.next_line().await {
-                    Ok(Some(line)) => warn!(sandbox = %sandbox_name_err, "wxc-exec stderr: {line}"),
+                    Ok(Some(line)) => {
+                        let line = redact_secrets(&line, &secret_values_err);
+                        warn!(sandbox = %sandbox_name_err, "wxc-exec stderr: {line}");
+                    }
                     Ok(None) => break,
                     Err(e) => {
                         warn!(sandbox = %sandbox_name_err, "wxc-exec stderr read error: {e}");
@@ -3390,6 +3469,60 @@ mod lifecycle_tests {
             let key = entry.split_once('=').map_or(entry.as_str(), |(key, _)| key);
             key == "SHARED" || key == "TOKEN"
         }));
+    }
+
+    #[test]
+    fn redact_secrets_covers_both_echoed_command_and_command_output() {
+        // Mirrors nvbugs 6843156: cmd.exe with no `@echo off` writes the
+        // literal secret twice -- once as part of the echoed, expanded
+        // command line, once again as the command's own output.
+        let secrets = vec!["SuperSecretValue12345".to_owned()];
+        let echoed_command =
+            "C:\\work\\share>echo checking secret SuperSecretValue12345".to_owned();
+        let command_output = "checking secret SuperSecretValue12345".to_owned();
+
+        assert_eq!(
+            redact_secrets(&echoed_command, &secrets),
+            "C:\\work\\share>echo checking secret [REDACTED]"
+        );
+        assert_eq!(
+            redact_secrets(&command_output, &secrets),
+            "checking secret [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn redact_secrets_is_a_no_op_when_nothing_matches() {
+        let secrets = vec!["SuperSecretValue12345".to_owned()];
+        let line = "nothing sensitive here".to_owned();
+        assert_eq!(redact_secrets(&line, &secrets), line);
+    }
+
+    #[test]
+    fn redact_secrets_prefers_the_longest_match_so_no_fragment_survives() {
+        // A short secret that happens to be a substring of a longer one must
+        // not get replaced first and leave a `[REDACTED]`-tail fragment of
+        // the longer secret behind.
+        let secrets = vec!["abc".to_owned(), "abcdef".to_owned()];
+        let line = "value=abcdef".to_owned();
+        assert_eq!(redact_secrets(&line, &secrets), "value=[REDACTED]");
+    }
+
+    #[test]
+    fn secret_redaction_values_collects_injected_env_and_proxy_password_only() {
+        let injected_environment = vec![
+            "SECRET_VAR=SuperSecretValue12345".to_owned(),
+            "SHORT=abc".to_owned(), // below MIN_SECRET_LEN, must be dropped
+        ];
+        let proxy_auth = SandboxProxyAuth {
+            password: "sandbox-secret".to_owned(),
+        };
+
+        let values = secret_redaction_values(&injected_environment, Some(&proxy_auth));
+
+        assert!(values.contains(&"SuperSecretValue12345".to_owned()));
+        assert!(values.contains(&"sandbox-secret".to_owned()));
+        assert!(!values.iter().any(|v| v == "abc"));
     }
 
     #[test]
