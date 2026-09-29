@@ -6,9 +6,7 @@
 use crate::client::ImageInspect;
 use crate::config::PodmanComputeConfig;
 use openshell_core::ComputeDriverError;
-use openshell_core::driver_mounts::{
-    SelinuxLabel, validate_container_mount_target_with_control_paths as validate_mount_target,
-};
+use openshell_core::driver_mounts::SelinuxLabel;
 #[cfg(test)]
 use openshell_core::gpu::{driver_gpu_requirements, validate_specific_gpu_device_request};
 use openshell_core::proto::compute::v1::{DriverSandbox, DriverSandboxTemplate};
@@ -254,7 +252,11 @@ impl ResolvedPodmanImage {
             && let Some(volumes) = image_config.and_then(|config| config.volumes.as_ref())
         {
             for volume in volumes.keys() {
-                validate_mount_target(volume, WORKLOAD_CONTROL_PATHS).map_err(|error| {
+                driver_mounts::validate_container_mount_target_with_control_paths(
+                    volume,
+                    WORKLOAD_CONTROL_PATHS,
+                )
+                .map_err(|error| {
                     ComputeDriverError::Precondition(format!(
                         "invalid image-declared volume '{volume}': {error}"
                     ))
@@ -874,7 +876,10 @@ fn podman_user_mounts(
                     None => {}
                 }
                 driver_mounts::validate_absolute_mount_source(&source, "bind source")?;
-                validate_mount_target(&target, WORKLOAD_CONTROL_PATHS)?;
+                driver_mounts::validate_container_mount_target_with_control_paths(
+                    &target,
+                    WORKLOAD_CONTROL_PATHS,
+                )?;
                 result.mounts.push(Mount {
                     kind: "bind".into(),
                     source,
@@ -890,7 +895,10 @@ fn podman_user_mounts(
             } => {
                 reject_subpath(subpath.as_deref(), "podman volume mounts")?;
                 driver_mounts::validate_mount_source(&source, "volume source")?;
-                validate_mount_target(&target, WORKLOAD_CONTROL_PATHS)?;
+                driver_mounts::validate_container_mount_target_with_control_paths(
+                    &target,
+                    WORKLOAD_CONTROL_PATHS,
+                )?;
                 result.volumes.push(NamedVolume {
                     name: source,
                     dest: target,
@@ -916,7 +924,10 @@ fn podman_user_mounts(
                 {
                     options.push(format!("mode={mode:o}"));
                 }
-                validate_mount_target(&target, WORKLOAD_CONTROL_PATHS)?;
+                driver_mounts::validate_container_mount_target_with_control_paths(
+                    &target,
+                    WORKLOAD_CONTROL_PATHS,
+                )?;
                 result.mounts.push(Mount {
                     kind: "tmpfs".into(),
                     source: "tmpfs".into(),
@@ -932,7 +943,10 @@ fn podman_user_mounts(
             } => {
                 reject_subpath(subpath.as_deref(), "podman image mounts")?;
                 driver_mounts::validate_mount_source(&source, "image source")?;
-                validate_mount_target(&target, WORKLOAD_CONTROL_PATHS)?;
+                driver_mounts::validate_container_mount_target_with_control_paths(
+                    &target,
+                    WORKLOAD_CONTROL_PATHS,
+                )?;
                 result.image_volumes.push(ImageVolume {
                     source,
                     destination: target,
@@ -1007,7 +1021,10 @@ fn validate_podman_driver_mounts(
                 target
             }
         };
-        validate_mount_target(target, WORKLOAD_CONTROL_PATHS)?;
+        driver_mounts::validate_container_mount_target_with_control_paths(
+            target,
+            WORKLOAD_CONTROL_PATHS,
+        )?;
         let normalized_target = driver_mounts::normalize_mount_target(target);
         if !targets.insert(normalized_target.clone()) {
             return Err(format!(
