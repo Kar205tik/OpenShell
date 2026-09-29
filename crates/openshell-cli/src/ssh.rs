@@ -1829,12 +1829,13 @@ mod tests {
     #[test]
     fn render_ssh_config_includes_workspace_in_proxy_command() {
         let config = render_ssh_config("my-gw", "demo", "beta");
+        let escaped_workspace = proxy_command_escape("beta");
         assert!(
             config.contains("Host openshell-demo.beta"),
             "host alias should be workspace-qualified: {config}"
         );
         assert!(
-            config.contains("--workspace beta"),
+            config.contains(&format!("--workspace {escaped_workspace}")),
             "ProxyCommand should include --workspace: {config}"
         );
     }
