@@ -678,12 +678,6 @@ Explicit numeric fields may use any UID/GID from `1` through
 Warn users that low IDs can inherit permissions from matching accounts, image
 files, mounted volumes, or devices.
 
-Podman gateways use a normalized absolute OCI `WORKDIR` as the workspace.
-Empty, `/`, and explicit `/sandbox` declarations use the managed `/sandbox`
-fallback. For a custom path, the final identity must be able to traverse and
-write the existing directory in the container filesystem. A custom path does
-not use a workspace volume; only the managed `/sandbox` fallback does.
-
 ### Forward ports
 
 ```bash

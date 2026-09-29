@@ -1215,7 +1215,7 @@ impl DockerComputeDriver {
             .ok_or_else(|| Status::failed_precondition("sandbox lacks resource identity record"))?;
         let mut actual = std::collections::BTreeMap::new();
         let anonymous_targets: Vec<String> = labels
-            .get(openshell_core::resource_admission::PRIVATE_IMAGE_VOLUME_TARGETS_LABEL)
+            .get("openshell.ai/private-image-volume-targets")
             .and_then(|value| serde_json::from_str(value).ok())
             .unwrap_or_default();
         for mount in container.mounts.as_deref().unwrap_or_default() {
@@ -5657,11 +5657,7 @@ fn build_container_create_body_for_image(
     driver_mounts::validate_workspace_control_path(&workspace_root, BOUNDARY_MOUNT_PATH)
         .map_err(Status::failed_precondition)?;
     for volume in &image.volumes {
-        driver_mounts::validate_container_mount_target_with_control_paths(
-            volume,
-            &[BOUNDARY_MOUNT_PATH],
-        )
-        .map_err(|error| {
+        driver_mounts::validate_container_mount_target(volume).map_err(|error| {
             Status::failed_precondition(format!(
                 "invalid image-declared volume '{volume}': {error}"
             ))
@@ -5671,6 +5667,8 @@ fn build_container_create_body_for_image(
                 "image-declared volume '{volume}' masks OCI WorkingDir '{workspace_root}' before workspace validation"
             ))
         })?;
+        driver_mounts::validate_mount_control_path(volume, BOUNDARY_MOUNT_PATH)
+            .map_err(Status::failed_precondition)?;
     }
     for mount in &driver_config.mounts {
         let target = match mount {
@@ -5681,11 +5679,8 @@ fn build_container_create_body_for_image(
         };
         driver_mounts::validate_workspace_mount_target(target, &workspace_root)
             .map_err(Status::failed_precondition)?;
-        driver_mounts::validate_container_mount_target_with_control_paths(
-            target,
-            &[BOUNDARY_MOUNT_PATH],
-        )
-        .map_err(Status::failed_precondition)?;
+        driver_mounts::validate_mount_control_path(target, BOUNDARY_MOUNT_PATH)
+            .map_err(Status::failed_precondition)?;
     }
     let mut user_mounts = docker_driver_mounts(driver_config)?;
     user_mounts.push(Mount {
@@ -5709,7 +5704,7 @@ fn build_container_create_body_for_image(
     });
     let mut labels = template.labels.clone();
     labels.insert(
-        openshell_core::resource_admission::PRIVATE_IMAGE_VOLUME_TARGETS_LABEL.into(),
+        "openshell.ai/private-image-volume-targets".into(),
         serde_json::to_string(&image.volumes)
             .map_err(|error| Status::internal(error.to_string()))?,
     );

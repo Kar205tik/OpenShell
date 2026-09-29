@@ -93,7 +93,6 @@ impl std::str::FromStr for DriverAdmissionConfig {
 /// Reserved driver-owned runtime metadata; caller labels must never override it.
 pub const CONFIG_USED_LABEL: &str = "openshell.ai/caller-driver-config-used";
 pub const IDENTITIES_LABEL: &str = "openshell.ai/resource-admission-identities";
-pub const PRIVATE_IMAGE_VOLUME_TARGETS_LABEL: &str = "openshell.ai/private-image-volume-targets";
 
 pub fn check_config_provenance(allowed: bool, recorded: Option<&str>) -> Result<(), tonic::Status> {
     match recorded {

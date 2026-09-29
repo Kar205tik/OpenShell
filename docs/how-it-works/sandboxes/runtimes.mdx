@@ -267,12 +267,4 @@ Set `process.run_as_user` and `process.run_as_group` in the sandbox policy to ch
 | Kubernetes | OpenShift SCC namespace annotations, otherwise `1000`. Override with `sandbox_uid` and `sandbox_gid`. |
 | MicroVM | The image's `sandbox` account, otherwise `1000`. Override with `sandbox_uid` and `sandbox_gid`. |
 
-On Docker, the image's `WORKDIR` becomes the workspace. Images with no `WORKDIR`, `/`, or `/sandbox` use `/sandbox`. Any other `WORKDIR` must exist in the image and be writable by the sandbox user.
-
-Podman also uses the image's `WORKDIR` as the workspace, falling back to
-`/sandbox` for an empty, `/`, or `/sandbox` value. A custom path must be an
-absolute, normalized path outside system and OpenShell-reserved paths.
-Image volumes and driver mounts cannot cover it. Podman uses the image's
-container filesystem directly and requires the final non-root user to be able
-to write the existing directory. The managed `/sandbox` fallback uses a
-workspace volume. Kubernetes and MicroVM continue to use `/sandbox`.
+On Docker and Podman, the image's `WORKDIR` becomes the workspace. Images with no `WORKDIR`, `/`, or `/sandbox` use `/sandbox`. Any other `WORKDIR` must exist in the image and be writable by the sandbox user. Kubernetes and MicroVM always use `/sandbox`.

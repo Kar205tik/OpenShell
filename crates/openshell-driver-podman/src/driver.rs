@@ -761,10 +761,6 @@ impl PodmanComputeDriver {
             .get(openshell_core::resource_admission::IDENTITIES_LABEL)
             .and_then(|value| serde_json::from_str(value).ok())
             .ok_or_else(missing)?;
-        let anonymous_targets: Vec<String> = labels
-            .get(openshell_core::resource_admission::PRIVATE_IMAGE_VOLUME_TARGETS_LABEL)
-            .and_then(|value| serde_json::from_str(value).ok())
-            .unwrap_or_default();
         let mut actual = std::collections::BTreeMap::new();
         for mount in mounts {
             match mount["Type"].as_str() {
@@ -792,16 +788,6 @@ impl PodmanComputeDriver {
                         });
                         if !owned || volume.driver != "local" || !volume.options.is_empty() {
                             return Err(missing());
-                        }
-                    } else if !expected.contains_key(name)
-                        && mount["Destination"].as_str().is_some_and(|destination| {
-                            anonymous_targets.iter().any(|target| target == destination)
-                        })
-                    {
-                        if volume.driver != "local" || !volume.options.is_empty() {
-                            return Err(ComputeDriverError::Precondition(
-                                "image-private volume backing changed".into(),
-                            ));
                         }
                     } else {
                         actual.insert(name.to_string(), volume.admission_identity());
@@ -1236,11 +1222,7 @@ impl PodmanComputeDriver {
                         .await?;
                     if managed_workspace {
                         self.client
-                            .copy_to_container(
-                                &workload_id,
-                                &resolved_image.workspace_root,
-                                archives.workspace,
-                            )
+                            .copy_to_container(&workload_id, "/sandbox", archives.workspace)
                             .await?;
                     }
                     let supervisor_id = self
@@ -3113,55 +3095,6 @@ mod tests {
             );
             let _ = fs::remove_file(socket);
         }
-    }
-
-    #[tokio::test]
-    async fn admission_accepts_image_declared_volume_below_custom_workdir() {
-        let (socket, requests, handle) = spawn_podman_stub(
-            "image-volume-admission",
-            vec![
-                StubResponse::new(
-                    StatusCode::OK,
-                    serde_json::json!({
-                        "Id": "workload-1",
-                        "Name": "workload-1",
-                        "State": {"Status": "created", "Running": false},
-                        "Config": {"Labels": {
-                            "openshell.ai/sandbox-workspace": "team-a",
-                            "openshell.ai/sandbox-id": "sandbox-1",
-                            "openshell.ai/caller-driver-config-used": "false",
-                            "openshell.ai/resource-admission-identities": "{}",
-                            "openshell.ai/private-image-volume-targets": "[\"/home/app/project/cache\"]"
-                        }},
-                        "Mounts": [{
-                            "Type": "volume",
-                            "Name": "anonymous-1",
-                            "Destination": "/home/app/project/cache"
-                        }]
-                    })
-                    .to_string(),
-                ),
-                StubResponse::new(
-                    StatusCode::OK,
-                    serde_json::json!({
-                        "Name": "anonymous-1", "Driver": "local", "Options": {}, "Labels": {}
-                    })
-                    .to_string(),
-                ),
-            ],
-        );
-        let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
-            socket_path: Some(socket.clone()),
-            ..Default::default()
-        });
-
-        driver
-            .admit_container_resources("workload-1")
-            .await
-            .expect("a local image-declared volume is private to the workload");
-        handle.await.unwrap();
-        assert_eq!(requests.lock().unwrap().len(), 2);
-        let _ = fs::remove_file(socket);
     }
 
     #[tokio::test]

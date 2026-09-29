@@ -56,12 +56,11 @@ impl ImageGuard {
             format!(
                 r"FROM {BASE_IMAGE}
 USER 0:0
-RUN mkdir -p /home/app/project/cache && \
-    chown {OCI_UID}:{OCI_GID} /home/app /home/app/project /home/app/project/cache && \
-    chmod 0700 /home/app /home/app/project /home/app/project/cache
+RUN mkdir -p /home/app/project && \
+    chown {OCI_UID}:{OCI_GID} /home/app /home/app/project && \
+    chmod 0700 /home/app /home/app/project
 WORKDIR /home/app/project
-RUN printf root-owned > root-owned.txt && chown {OCI_UID}:{OCI_GID} .
-VOLUME /home/app/project/cache
+RUN printf root-owned > root-owned.txt
 USER {OCI_UID}:{OCI_GID}
 "
             ),
@@ -99,6 +98,7 @@ USER {OCI_UID}:{OCI_GID}
                 "Podman-built image has OCI user '{user}', expected {OCI_UID}:{OCI_GID}"
             ));
         }
+
         Ok(Self { engine, tag, id })
     }
 }
@@ -206,7 +206,6 @@ async fn podman_uses_oci_identity_image_workdir_and_inspected_image_id() {
              test \"$(pwd -P)\" = /home/app/project; \
              test \"$(cat root-owned.txt)\" = root-owned; \
              touch direct-workspace-write; \
-             touch cache/from-create; \
              printf 'direct-identity=%s:%s\n' \"$(id -u)\" \"$(id -g)\"; \
              echo podman-oci-identity-ready; sleep infinity",
         ],
@@ -229,9 +228,7 @@ async fn podman_uses_oci_identity_image_workdir_and_inspected_image_id() {
              test \"$(id -u):$(id -g)\" = 2345:2346; \
              test \"$(pwd -P)\" = /home/app/project; \
              test -f direct-workspace-write; \
-             test -f cache/from-create; \
              touch ssh-workspace-write; \
-             touch cache/from-ssh; \
              echo podman-ssh-identity-ok",
         ])
         .await
@@ -317,7 +314,6 @@ async fn assert_isolated_pair(image: &ImageGuard, sandbox: &SandboxGuard, contai
     assert!(!mounts.contains("/etc/openshell/tls"));
     assert!(!mounts.contains("/.openshell/supervisor"));
     assert!(!mounts.lines().any(|path| path == "/home/app/project"));
-    assert!(mounts.lines().any(|path| path == "/home/app/project/cache"));
     assert!(!mounts.lines().any(|path| path == "/sandbox"));
     let posture = sandbox.exec(&["sh", "-c", "set -eu; awk '/^CapEff:|^CapBnd:|^NoNewPrivs:/ {print}' /proc/self/status; test ! -r /.openshell/channel/sandbox/server.key; test ! -r /.openshell/supervisor/runtime-descriptor.json"]).await.expect("workload cannot read either control credential set");
     assert!(posture.contains("0000000000000000"));

@@ -37,12 +37,13 @@ The supervisor joins the workload's **user namespace only** to preserve UID/GID
 mapping for shared-volume access. PID, mount, and network namespaces remain
 separate. The channel volume uses shared SELinux relabeling (`:z`).
 
-Before starting either container, the driver uploads bootstrap files to the
-channel volume. For managed `/sandbox`, it also prepares the workspace volume;
-custom image workspaces need no upload. Restart restores only the channel
-bootstrap, preserving the workspace. The workload starts before the supervisor
-so its user namespace exists when the supervisor joins it; a stopped supervisor
-resolves that namespace again on its next start.
+Before starting either container, the driver uploads volume-relative archives
+directly to the channel and workspace volume destinations. A rootfs upload on a
+stopped Podman container does not populate nested named volumes. Restart restores
+only the channel bootstrap into the existing channel volume, preserving the
+workspace. The workload starts before the supervisor so its user namespace exists
+when the supervisor joins it; a stopped supervisor resolves that namespace again
+on its next start. Custom image workspaces have no workspace volume or upload.
 
 The runtime must pass the sandbox's unprivileged enforcement probe, including
 nested seccomp notification and Landlock. Unsupported runtime defaults fail
@@ -92,22 +93,16 @@ environment belong to agent children, never the supervisor process.
 ## OCI working directory
 
 OpenShell reads `WORKDIR` from the workload image. If it is unset, `/`, or
-`/sandbox`, OpenShell uses its managed `/sandbox` workspace. A custom path must
-be absolute, with no `.` or `..` segments. It cannot overlap `/proc`, `/sys`,
+`/sandbox`, OpenShell uses its managed `/sandbox` workspace volume. A custom
+path must be absolute and normalized, and cannot overlap `/proc`, `/sys`,
 `/dev`, OpenShell-reserved paths, or the workload's private control and CA
-mounts. For a custom path, image volumes and driver mounts cannot cover the
-workspace or one of its parents; mounts nested below it remain valid. Podman
-creates a private volume for each image-declared path nested below it.
+mounts. Image volumes and driver mounts cannot cover it; mounts nested below it
+remain valid.
 
-For a custom path, Podman uses the image's container filesystem directly.
-OpenShell keeps the image directory's ownership and permissions, starts as the
-final non-root user, and rejects the image if that user cannot reach and write
-the directory. Agent commands use the path as their working directory;
-`filesystem.include_workdir` grants access to it when enabled.
-
-For `/sandbox`, OpenShell creates a workspace volume and prepares it before
-switching to the non-root user. The separate supervisor receives the path but
-does not mount the workspace.
+A custom path stays in the image's container filesystem with its ownership and
+permissions. The workload starts as the final non-root user, which must be able
+to reach and write the directory. Agent commands use the path as their working
+directory.
 
 ## Lifecycle and readiness
 
@@ -135,8 +130,8 @@ User `bind`, `volume`, `tmpfs`, and `image` mounts and CDI GPU selection remain
 native Podman features and apply only to the workload. Bind mounts require the
 operator's `enable_bind_mounts` opt-in and disabled label admission. Supplemental
 image mounts also require disabled admission. Driver JSON requires
-`allow_driver_config = true`. The workload's private mounts cannot be
-replaced. User-owned volumes are never created or deleted.
+`allow_driver_config = true`. Reserved control paths and the workspace
+root cannot be replaced. User-owned volumes are never created or deleted.
 
 See [gateway configuration](../../docs/how-it-works/gateways/configuration.mdx) for
 operator settings and [NETWORKING.md](NETWORKING.md) for supervisor networking.

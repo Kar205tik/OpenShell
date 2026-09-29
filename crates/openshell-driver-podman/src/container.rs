@@ -229,7 +229,6 @@ pub struct ResolvedPodmanImage {
     pub(crate) oci_user: String,
     pub(crate) environment: Vec<String>,
     pub(crate) workspace_root: String,
-    image_volume_targets: Vec<String>,
 }
 
 impl ResolvedPodmanImage {
@@ -247,16 +246,11 @@ impl ResolvedPodmanImage {
             driver_mounts::validate_workspace_control_path(&workspace_root, control_path)
                 .map_err(ComputeDriverError::Precondition)?;
         }
-        let mut image_volume_targets = Vec::new();
         if workspace_root != driver_mounts::DEFAULT_WORKSPACE_ROOT
             && let Some(volumes) = image_config.and_then(|config| config.volumes.as_ref())
         {
             for volume in volumes.keys() {
-                driver_mounts::validate_container_mount_target_with_control_paths(
-                    volume,
-                    PODMAN_WORKLOAD_CONTROL_PATHS,
-                )
-                .map_err(|error| {
+                validate_podman_mount_target(volume).map_err(|error| {
                     ComputeDriverError::Precondition(format!(
                         "invalid image-declared volume '{volume}': {error}"
                     ))
@@ -268,9 +262,7 @@ impl ResolvedPodmanImage {
                         ))
                     },
                 )?;
-                image_volume_targets.push(volume.clone());
             }
-            image_volume_targets.sort();
         }
         Ok(Self {
             id: inspected.id.clone(),
@@ -279,8 +271,18 @@ impl ResolvedPodmanImage {
                 .to_string(),
             environment: image_config.map_or_else(Vec::new, |config| config.env.clone()),
             workspace_root,
-            image_volume_targets,
         })
+    }
+
+    /// Image reference without inspected metadata; uses the managed workspace.
+    #[cfg(test)]
+    fn unpinned(image: &str) -> Self {
+        Self {
+            id: image.to_string(),
+            oci_user: String::new(),
+            environment: Vec::new(),
+            workspace_root: driver_mounts::DEFAULT_WORKSPACE_ROOT.to_string(),
+        }
     }
 
     pub(crate) fn uses_managed_workspace(&self) -> bool {
@@ -301,11 +303,15 @@ pub struct ContainerSpec {
     volumes: Vec<NamedVolume>,
     image_volumes: Vec<ImageVolume>,
     hostname: String,
-    /// Start trusted runtime binaries independently of the image-selected
-    /// workspace. The resolved workspace is applied to untrusted children.
+    /// Start trusted runtime binaries from `/` instead of the image
+    /// `WORKDIR`, so Podman neither creates a missing workdir nor fails to
+    /// `chdir` before `OpenShell` validates it. Children use the resolved
+    /// workspace.
     work_dir: String,
     /// Overrides the image's ENTRYPOINT. In Podman's libpod API, `command`
-    /// only overrides CMD (appended as args to the entrypoint).
+    /// only overrides CMD (appended as args to the entrypoint). We must set
+    /// `entrypoint` explicitly so the supervisor binary runs directly,
+    /// regardless of what ENTRYPOINT the sandbox image defines.
     entrypoint: Vec<String>,
     command: Vec<String>,
     user: String,
@@ -876,10 +882,7 @@ fn podman_user_mounts(
                     None => {}
                 }
                 driver_mounts::validate_absolute_mount_source(&source, "bind source")?;
-                driver_mounts::validate_container_mount_target_with_control_paths(
-                    &target,
-                    PODMAN_WORKLOAD_CONTROL_PATHS,
-                )?;
+                driver_mounts::validate_container_mount_target(&target)?;
                 result.mounts.push(Mount {
                     kind: "bind".into(),
                     source,
@@ -895,10 +898,7 @@ fn podman_user_mounts(
             } => {
                 reject_subpath(subpath.as_deref(), "podman volume mounts")?;
                 driver_mounts::validate_mount_source(&source, "volume source")?;
-                driver_mounts::validate_container_mount_target_with_control_paths(
-                    &target,
-                    PODMAN_WORKLOAD_CONTROL_PATHS,
-                )?;
+                driver_mounts::validate_container_mount_target(&target)?;
                 result.volumes.push(NamedVolume {
                     name: source,
                     dest: target,
@@ -924,10 +924,7 @@ fn podman_user_mounts(
                 {
                     options.push(format!("mode={mode:o}"));
                 }
-                driver_mounts::validate_container_mount_target_with_control_paths(
-                    &target,
-                    PODMAN_WORKLOAD_CONTROL_PATHS,
-                )?;
+                driver_mounts::validate_container_mount_target(&target)?;
                 result.mounts.push(Mount {
                     kind: "tmpfs".into(),
                     source: "tmpfs".into(),
@@ -943,10 +940,7 @@ fn podman_user_mounts(
             } => {
                 reject_subpath(subpath.as_deref(), "podman image mounts")?;
                 driver_mounts::validate_mount_source(&source, "image source")?;
-                driver_mounts::validate_container_mount_target_with_control_paths(
-                    &target,
-                    PODMAN_WORKLOAD_CONTROL_PATHS,
-                )?;
+                driver_mounts::validate_container_mount_target(&target)?;
                 result.image_volumes.push(ImageVolume {
                     source,
                     destination: target,
@@ -970,6 +964,14 @@ fn podman_driver_config(
         .map_err(|err| format!("invalid podman driver_config: {err}"))?;
     validate_podman_driver_mounts(&config.mounts, enable_bind_mounts)?;
     Ok(config)
+}
+
+fn validate_podman_mount_target(target: &str) -> Result<(), String> {
+    driver_mounts::validate_container_mount_target(target)?;
+    for control_path in PODMAN_WORKLOAD_CONTROL_PATHS {
+        driver_mounts::validate_mount_control_path(target, control_path)?;
+    }
+    Ok(())
 }
 
 fn validate_podman_driver_mounts(
@@ -1021,10 +1023,7 @@ fn validate_podman_driver_mounts(
                 target
             }
         };
-        driver_mounts::validate_container_mount_target_with_control_paths(
-            target,
-            PODMAN_WORKLOAD_CONTROL_PATHS,
-        )?;
+        validate_podman_mount_target(target)?;
         let normalized_target = driver_mounts::normalize_mount_target(target);
         if !targets.insert(normalized_target.clone()) {
             return Err(format!(
@@ -1148,10 +1147,7 @@ pub fn build_container_spec_with_token_and_gpu_devices(
     gpu_device_ids: Option<&[String]>,
 ) -> Result<Value, ComputeDriverError> {
     let image = resolve_image(sandbox, config);
-    let resolved_image = ResolvedPodmanImage::from_inspect(&ImageInspect {
-        id: image.to_string(),
-        config: None,
-    })?;
+    let resolved_image = ResolvedPodmanImage::unpinned(image);
     build_container_spec_for_image(
         sandbox,
         config,
@@ -1214,23 +1210,10 @@ fn build_base_spec(
     let resource_limits = build_resource_limits(sandbox, config);
     let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
         .map_err(ComputeDriverError::InvalidArgument)?;
-    for target in user_mounts
-        .mounts
-        .iter()
-        .map(|mount| mount.destination.as_str())
-        .chain(
-            user_mounts
-                .volumes
-                .iter()
-                .map(|volume| volume.dest.as_str()),
-        )
-        .chain(
-            user_mounts
-                .image_volumes
-                .iter()
-                .map(|volume| volume.destination.as_str()),
-        )
-    {
+    let mount_targets = user_mounts.mounts.iter().map(|m| &m.destination);
+    let volume_targets = user_mounts.volumes.iter().map(|v| &v.dest);
+    let image_targets = user_mounts.image_volumes.iter().map(|v| &v.destination);
+    for target in mount_targets.chain(volume_targets).chain(image_targets) {
         driver_mounts::validate_workspace_mount_target(target, &image.workspace_root)
             .map_err(ComputeDriverError::Precondition)?;
     }
@@ -1595,11 +1578,6 @@ pub fn build_isolation_specs(
     workload
         .labels
         .insert(crate::isolation::LABEL_ROLE.into(), "sandbox".into());
-    workload.labels.insert(
-        openshell_core::resource_admission::PRIVATE_IMAGE_VOLUME_TARGETS_LABEL.into(),
-        serde_json::to_string(&input.image.image_volume_targets)
-            .map_err(|error| ComputeDriverError::Message(error.to_string()))?,
-    );
     workload.env = BTreeMap::new();
     workload.unsetenv = input
         .image
@@ -2032,10 +2010,7 @@ mod tests {
                 driver_mounts::DEFAULT_WORKSPACE_ROOT,
             ]
         );
-        let mut custom_image = resolved_image("sha256:image", "1000:1001", "/workspace/project");
-        custom_image
-            .image_volume_targets
-            .push("/workspace/project/cache".into());
+        let custom_image = resolved_image("sha256:image", "1000:1001", "/workspace/project");
         let custom_specs = build_isolation_specs(IsolationSpecInput {
             sandbox: &sandbox,
             config: &config,
@@ -2051,14 +2026,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(custom_specs.workload.user, "1000:1001");
-        assert_eq!(
-            custom_specs
-                .workload
-                .labels
-                .get(openshell_core::resource_admission::PRIVATE_IMAGE_VOLUME_TARGETS_LABEL)
-                .map(String::as_str),
-            Some("[\"/workspace/project/cache\"]")
-        );
         assert!(custom_specs.workload.cap_add.is_empty());
         assert_eq!(
             custom_specs.workload.command,
@@ -2160,13 +2127,11 @@ mod tests {
         let image = ResolvedPodmanImage::from_inspect(&inspect("/workspace/project/cache"))
             .expect("image volumes nested below the workspace remain valid");
         assert_eq!(image.workspace_root, "/workspace/project");
-        assert_eq!(image.image_volume_targets, vec!["/workspace/project/cache"]);
 
         let mut fallback = inspect("/etc/openshell");
         fallback.config.as_mut().unwrap().working_dir = "/sandbox".into();
-        let fallback = ResolvedPodmanImage::from_inspect(&fallback)
+        ResolvedPodmanImage::from_inspect(&fallback)
             .expect("existing /sandbox images keep their image-volume behavior");
-        assert!(fallback.image_volume_targets.is_empty());
     }
 
     fn json_struct(value: Value) -> prost_types::Struct {
@@ -3509,7 +3474,7 @@ mod tests {
                     "mounts": [{
                         "type": "volume",
                         "source": "work-nfs",
-                        "target": "/opt/openshell/bin"
+                        "target": "/etc/openshell/tls/client"
                     }]
                 }))),
                 ..Default::default()
@@ -3520,19 +3485,6 @@ mod tests {
 
         let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
 
-        assert!(err.to_string().contains("reserved OpenShell path"));
-
-        sandbox
-            .spec
-            .as_mut()
-            .unwrap()
-            .template
-            .as_mut()
-            .unwrap()
-            .driver_config = Some(json_struct(serde_json::json!({
-            "mounts": [{"type": "volume", "source": "work-nfs", "target": "/etc/openshell/tls/client"}]
-        })));
-        let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
         assert!(err.to_string().contains("reserved OpenShell path"));
     }
 
