@@ -49,6 +49,14 @@ entry count and size, image and resource field sizes, driver-config serialized
 size, and GPU count. Template names use the same DNS-style resource-name rules
 as other named gateway resources.
 
+## Exec Input
+
+The process supervisor retains at most 4 MiB of pending stdin payload per ordinary SSH exec channel, including the chunk being written to the boundary. Packets share a byte buffer so tiny packets cannot grow queue metadata without consuming the byte budget. This is a pending-input bound; input already written releases capacity for longer transfers. It is separate from the CLI's total piped-input limit and from downstream transport buffers.
+
+The SSH data callback never waits for stdin capacity because it also handles signals, channel close, and output window updates. Overflow returns exit status 74, logs `process stdin buffer is full` in the supervisor, cancels the input writer, and requests backend termination for that exec. It adds no stderr data that could block other channels when the client's output window is empty. Output already pending can delay channel close; the failure status does not require output credit. EOF drains accepted input; channel close, disconnect, and completed output delivery release a stalled input writer. Canonical-process attachments use their own input ownership and buffering rules.
+
+This bound rejects overload rather than slowing the sender. A slow consumer can trigger it when the sender gets more than 4 MiB ahead, including SSH uploads and SFTP requests that use ordinary exec channels. Callers must treat the nonzero result as an incomplete operation. It is not a guarantee that every transfer below a particular rate will succeed.
+
 ## Middleware
 
 Middleware limits are process-wide per sandbox. Registry replacement preserves

@@ -324,6 +324,8 @@ size. Piped input is limited to 4 MiB; use `sandbox upload` for larger files.
 The CLI closes remote stdin when the pipe reaches EOF and continues
 reading command output until the command finishes.
 
+The supervisor also limits pending stdin to 4 MiB per exec channel. If input arrives faster than the command consumes it and this buffer fills, further input fails the exec with exit code 74. The supervisor logs `process stdin buffer is full`. This also applies to SSH file transfers that use exec channels. The limit counts input waiting to be written, so clients that support larger transfers can continue as the command consumes data. Input EOF drains bytes already accepted; cancelling the exec discards pending input.
+
 The command's exit code is propagated to the CLI, so `exec` works in scripts that check return codes.
 Large stdout and stderr streams are delivered before a successful exit. A slow
 reader backpressures the command. If output delivery fails, `exec` returns a
