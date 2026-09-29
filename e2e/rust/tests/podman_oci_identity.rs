@@ -3,13 +3,15 @@
 
 #![cfg(feature = "e2e-podman")]
 
-//! Podman-specific E2E coverage for OCI identity/workspace inspection,
-//! direct image-workspace access, and immutable-image launch.
+//! Podman-specific E2E coverage for OCI identity inspection and immutable-image
+//! launch.
 //!
 //! The test builds an image through the selected Podman engine, creates a
-//! sandbox from its mutable tag, and verifies the child identity, image
-//! content, workspace placement, and image ID recorded on the real sandbox
-//! container.
+//! sandbox from its mutable tag, and verifies both the child identity and the
+//! image ID recorded on the real sandbox container. This exercises the Podman
+//! API inspect → protected metadata → create path rather than only its unit
+//! serialization boundaries. Workspace behavior shared with Docker is covered
+//! by the `oci-image` feature suite in `tests/suites/features`.
 
 use std::process::Stdio;
 
@@ -60,7 +62,6 @@ RUN mkdir -p /home/app/project && \
     chown {OCI_UID}:{OCI_GID} /home/app /home/app/project && \
     chmod 0700 /home/app /home/app/project
 WORKDIR /home/app/project
-RUN printf root-owned > root-owned.txt
 USER {OCI_UID}:{OCI_GID}
 "
             ),
@@ -184,7 +185,7 @@ fn normalized_image_id(image_id: &str) -> &str {
 }
 
 #[tokio::test]
-async fn podman_uses_oci_identity_image_workdir_and_inspected_image_id() {
+async fn podman_uses_oci_identity_and_inspected_image_id() {
     if !is_e2e_driver("podman") {
         eprintln!("Skipping Podman OCI identity test: e2e driver is not podman");
         return;
@@ -202,12 +203,7 @@ async fn podman_uses_oci_identity_image_workdir_and_inspected_image_id() {
         &[
             "sh",
             "-c",
-            "set -eu; \
-             test \"$(pwd -P)\" = /home/app/project; \
-             test \"$(cat root-owned.txt)\" = root-owned; \
-             touch direct-workspace-write; \
-             printf 'direct-identity=%s:%s\n' \"$(id -u)\" \"$(id -g)\"; \
-             echo podman-oci-identity-ready; sleep infinity",
+            "set -eu; printf 'direct-identity=%s:%s\n' \"$(id -u)\" \"$(id -g)\"; echo podman-oci-identity-ready; sleep infinity",
         ],
         READY_MARKER,
     )
@@ -224,12 +220,7 @@ async fn podman_uses_oci_identity_image_workdir_and_inspected_image_id() {
         .exec(&[
             "sh",
             "-c",
-            "set -eu; \
-             test \"$(id -u):$(id -g)\" = 2345:2346; \
-             test \"$(pwd -P)\" = /home/app/project; \
-             test -f direct-workspace-write; \
-             touch ssh-workspace-write; \
-             echo podman-ssh-identity-ok",
+            "test \"$(id -u):$(id -g)\" = 2345:2346; echo podman-ssh-identity-ok",
         ])
         .await
         .expect("SSH child should use Podman OCI identity");
