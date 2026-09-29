@@ -96,9 +96,8 @@ OpenShell reads `WORKDIR` from the workload image. If it is unset, `/`, or
 `/sandbox`, OpenShell uses its managed `/sandbox` workspace. A custom path must
 be absolute, with no `.` or `..` segments. It cannot overlap `/proc`, `/sys`,
 `/dev`, OpenShell-reserved paths, or the workload's private control and CA
-mounts. Driver-configured mounts cannot cover the workspace or one of its
-parents; mounts nested below it remain valid. Podman handles image-declared
-volumes without OpenShell inspecting them.
+mounts. Image volumes and driver mounts cannot cover the workspace or one of
+its parents; mounts nested below it remain valid.
 
 For a custom path, Podman mounts a persistent workspace volume there. When the
 volume is first created, Podman copies any files already in that image directory

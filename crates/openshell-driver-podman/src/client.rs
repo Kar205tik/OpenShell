@@ -187,6 +187,8 @@ pub struct ImageConfig {
     pub env: Vec<String>,
     #[serde(default)]
     pub working_dir: String,
+    #[serde(default)]
+    pub volumes: Option<HashMap<String, Value>>,
 }
 
 /// A container summary returned by the list API.
@@ -1165,7 +1167,7 @@ mod tests {
             "inspect-image",
             vec![StubResponse::new(
                 StatusCode::OK,
-                r#"{"Id":"sha256:immutable","Config":{"User":"app:staff","Env":["A=one"],"WorkingDir":"/workspace/project"}}"#,
+                r#"{"Id":"sha256:immutable","Config":{"User":"app:staff","Env":["A=one"],"WorkingDir":"/workspace/project","Volumes":{"/workspace/project/cache":{}}}}"#,
             )],
         );
         let client = PodmanClient::new(socket_path.clone());
@@ -1186,6 +1188,13 @@ mod tests {
                 .as_ref()
                 .map(|config| config.working_dir.as_str()),
             Some("/workspace/project")
+        );
+        assert!(
+            image
+                .config
+                .as_ref()
+                .and_then(|config| config.volumes.as_ref())
+                .is_some_and(|volumes| volumes.contains_key("/workspace/project/cache"))
         );
         handle.await.expect("stub task should finish");
         assert_eq!(

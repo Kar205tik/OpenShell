@@ -430,11 +430,10 @@ resolved identity.
 Podman reads the image user and working directory from one pinned image. Empty,
 `/`, and explicit `/sandbox` values use the managed `/sandbox` workspace. A
 custom path must be absolute, normalized, and outside system and OpenShell
-reserved paths. Driver-configured mounts cannot cover the workspace. Podman
-handles image-declared volumes, mounts the persistent workspace volume at the
-resolved path, and copies any existing image files into it on first use.
-OpenShell preserves their ownership and permissions; the final non-root user
-must be able to write the resulting workspace.
+reserved paths. Image and driver mounts cannot cover the workspace. Podman
+mounts the persistent workspace volume there and copies any existing image
+files into it on first use. OpenShell preserves their ownership and permissions;
+the final non-root user must be able to write the resulting workspace.
 Kubernetes and VM use `/sandbox`.
 
 ### Executable Identity Binding

@@ -272,8 +272,8 @@ On Docker, the image's `WORKDIR` becomes the workspace. Images with no `WORKDIR`
 Podman also uses the image's `WORKDIR` as the workspace, falling back to
 `/sandbox` for an empty, `/`, or `/sandbox` value. A custom path must be an
 absolute, normalized path outside system and OpenShell-reserved paths.
-Driver-configured mounts cannot cover it; Podman handles image-declared volumes.
-Podman mounts the persistent workspace volume there and copies existing
-image-directory files into a new volume. OpenShell preserves their permissions
-and requires the final non-root user to be able to write there. Kubernetes and
-MicroVM continue to use `/sandbox`.
+Image volumes and driver mounts cannot cover it. Podman mounts the persistent
+workspace volume there and copies existing image-directory files into a new
+volume. OpenShell preserves their permissions and requires the final non-root
+user to be able to write there. Kubernetes and MicroVM continue to use
+`/sandbox`.
