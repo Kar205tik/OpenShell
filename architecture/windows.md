@@ -257,6 +257,9 @@ Windows validation separates source correctness from host capability:
   lifecycle coverage independent from restart/exec coverage and ensure that
   file-transfer and policy failures identify the public unsupported operation
   rather than an invalid Unix workload definition.
+  The Windows CLI quotes OpenSSH `ProxyCommand` arguments for `CreateProcessW`
+  and recognizes both Windows and Unix separators in sandbox transfer paths,
+  allowing file-transfer scenarios to reach the MXC supervisor boundary.
   The mock verifies public CLI, gateway, driver, lifecycle, and policy wiring;
   it does not claim Windows OS enforcement.
 - Mock MXC E2E validates gateway, CLI, driver, lifecycle, and policy wiring but
