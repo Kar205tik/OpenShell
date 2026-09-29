@@ -416,32 +416,25 @@ and supplementary-group set before creating the immutable workload:
   namespace ranges.
 - VM uses the configured numeric guest identity.
 
-UID/GID zero and `u32::MAX` are invalid. Before any untrusted instruction runs,
-the sandbox runtime and every child use the resolved identity with zero
-capability masks. The managed Podman `/sandbox` fallback may start its trusted
-runtime bootstrap as container root with narrowly scoped identity and ownership
-capabilities; it prepares the driver-owned workspace and drops irreversibly to
-the resolved identity before reading bootstrap material or accepting control
-traffic. No untrusted child performs an identity transition. Identity-changing
-policy updates require sandbox recreation, while other policy updates remain
-live.
+UID/GID zero and `u32::MAX` are invalid. Agent commands run as the resolved
+non-root user. For Podman's managed `/sandbox` workspace, trusted setup briefly
+starts as root to prepare the workspace, then switches to that user before
+reading bootstrap material or accepting commands. Identity-changing policy
+updates require sandbox recreation, while other policy updates remain live.
 
-Docker retains its existing working-directory and mount validation. Podman
-resolves OCI `Config.User` and `Config.WorkingDir` from one immutable image
-inspection. Empty, `/`, and explicit `/sandbox` values use the managed
-`/sandbox` workspace. Custom paths must be normalized absolute paths that do
-not overlap private mounts inside the Podman workload. Other paths are not
-reserved merely because the separate supervisor uses them. Podman image and
-driver mounts may cover the workspace; conflicting mounts can make the workload
-unusable.
+Docker uses an absolute OCI working directory as the workspace. Empty, root,
+and explicit `/sandbox` values select `/sandbox`; other paths must already
+exist without symlink or reserved-mount collisions and must be usable by the
+resolved identity.
 
-Podman mounts its persistent workspace volume at a custom root. When the volume
-is first created, Podman copies existing image-directory contents into it.
-OpenShell preserves their ownership and mode and starts directly as the final
-non-root identity. An unusable path fails closed. Only the managed `/sandbox`
-fallback uses the root/chown bootstrap. The separate supervisor receives the
-path but does not mount the workspace. Kubernetes and VM continue to use
-`/sandbox`.
+Podman reads the image user and working directory from one pinned image. Empty,
+`/`, and explicit `/sandbox` values use the managed `/sandbox` workspace. A
+custom path must be absolute, normalized, and outside system and OpenShell
+reserved paths. Image and driver mounts cannot cover the workspace. Podman
+mounts the persistent workspace volume there and copies any existing image
+files into it on first use. OpenShell preserves their ownership and permissions;
+the final non-root user must be able to write the resulting workspace.
+Kubernetes and VM use `/sandbox`.
 
 ### Executable Identity Binding
 

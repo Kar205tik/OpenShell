@@ -84,17 +84,9 @@ pub fn validate_mount_subpath(subpath: &str) -> Result<(), String> {
 /// Workspace collisions depend on the inspected image's resolved working
 /// directory and are checked separately by `validate_workspace_mount_target`.
 pub fn validate_container_mount_target(target: &str) -> Result<(), String> {
-    validate_container_mount_target_for_workload(target, CONTROL_ROOTS)
-}
-
-/// Validate a mount target against paths used by this specific workload.
-pub fn validate_container_mount_target_for_workload(
-    target: &str,
-    workload_reserved_paths: &[&str],
-) -> Result<(), String> {
     let normalized = normalize_absolute_container_path(target, "mount target")?;
     let path = Path::new(&normalized);
-    for reserved in workload_reserved_paths {
+    for reserved in CONTROL_ROOTS {
         let reserved = Path::new(reserved);
         if paths_overlap(path, reserved) {
             return Err(format!(
@@ -122,22 +114,6 @@ pub fn resolve_oci_workspace_root(working_dir: &str) -> Result<String, String> {
         validate_workspace_reserved_path(&workspace_root, runtime_path, "OCI runtime mount")?;
     }
     for control_path in CONTROL_ROOTS {
-        validate_workspace_control_path(&workspace_root, control_path)?;
-    }
-
-    Ok(workspace_root)
-}
-
-/// Resolve a workspace against paths still mounted inside this workload.
-pub fn resolve_oci_workspace_root_for_workload(
-    working_dir: &str,
-    workload_reserved_paths: &[&str],
-) -> Result<String, String> {
-    if working_dir.is_empty() || working_dir == "/" {
-        return Ok(DEFAULT_WORKSPACE_ROOT.to_string());
-    }
-    let workspace_root = normalize_absolute_container_path(working_dir, "OCI WorkingDir")?;
-    for control_path in workload_reserved_paths {
         validate_workspace_control_path(&workspace_root, control_path)?;
     }
 
@@ -382,35 +358,6 @@ mod tests {
             );
         }
         validate_mount_control_path("/custom-other", "/custom/ssh.sock").unwrap();
-    }
-
-    #[test]
-    fn oci_workspace_root_only_reserves_selected_workload_paths() {
-        let reserved = &["/control"];
-        for invalid in ["/control", "/control/data"] {
-            assert!(
-                resolve_oci_workspace_root_for_workload(invalid, reserved).is_err(),
-                "expected workspace '{invalid}' to be rejected"
-            );
-        }
-        assert_eq!(
-            resolve_oci_workspace_root_for_workload("/etc/openshell", reserved).unwrap(),
-            "/etc/openshell"
-        );
-        for path in ["/proc", "/sys", "/dev/shm"] {
-            assert_eq!(
-                resolve_oci_workspace_root_for_workload(path, reserved).unwrap(),
-                path
-            );
-        }
-    }
-
-    #[test]
-    fn container_target_uses_selected_workload_paths() {
-        let reserved = &["/control"];
-        assert!(validate_container_mount_target_for_workload("/control/data", reserved).is_err());
-        validate_container_mount_target_for_workload("/control-tools", reserved).unwrap();
-        validate_container_mount_target_for_workload("/etc/openshell", reserved).unwrap();
     }
 
     #[test]

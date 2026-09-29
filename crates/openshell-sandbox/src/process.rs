@@ -1623,11 +1623,8 @@ fn validated_workspace_components(
     let root_str = root
         .to_str()
         .ok_or_else(|| miette::miette!("workspace path must be valid UTF-8"))?;
-    // The driver has already checked collisions with its workload mounts.
-    // Recheck syntax here without imposing Docker's broader path reservations.
-    let validated_root =
-        openshell_core::driver_mounts::resolve_oci_workspace_root_for_workload(root_str, &[])
-            .map_err(|error| miette::miette!(error))?;
+    let validated_root = openshell_core::driver_mounts::resolve_oci_workspace_root(root_str)
+        .map_err(|error| miette::miette!(error))?;
     if Path::new(&validated_root) != root
         || (!allow_managed_fallback
             && validated_root == openshell_core::driver_mounts::DEFAULT_WORKSPACE_ROOT)

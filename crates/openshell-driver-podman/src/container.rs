@@ -75,11 +75,6 @@ const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
 const SUPERVISOR_MOUNT_DIR: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_DIR;
 /// Full path to the supervisor binary inside sandbox containers.
 const SUPERVISOR_BINARY_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY;
-const WORKLOAD_RESERVED_PATHS: &[&str] = &[
-    "/.openshell",
-    SUPERVISOR_MOUNT_DIR,
-    openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_ROOT,
-];
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -234,27 +229,36 @@ pub struct ResolvedPodmanImage {
 
 impl ResolvedPodmanImage {
     /// Resolve the image metadata and reject:
-    /// - a malformed or relative working directory, or one overlapping the
-    ///   workload's trusted runtime, control channel, or CA mount;
-    /// - an image volume with an invalid or reserved target.
+    /// - a malformed or reserved working directory;
+    /// - an image volume with an invalid or reserved target, or one covering
+    ///   the resolved workspace.
     pub fn from_inspect(inspected: &ImageInspect) -> Result<Self, ComputeDriverError> {
         let image_config = inspected.config.as_ref();
-        let workspace_root = driver_mounts::resolve_oci_workspace_root_for_workload(
+        let workspace_root = driver_mounts::resolve_oci_workspace_root(
             image_config.map_or("", |config| config.working_dir.as_str()),
-            WORKLOAD_RESERVED_PATHS,
         )
         .map_err(ComputeDriverError::Precondition)?;
+        for control_path in [
+            "/.openshell",
+            openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_ROOT,
+        ] {
+            driver_mounts::validate_workspace_control_path(&workspace_root, control_path)
+                .map_err(ComputeDriverError::Precondition)?;
+        }
         if let Some(volumes) = image_config.and_then(|config| config.volumes.as_ref()) {
             for volume in volumes.keys() {
-                driver_mounts::validate_container_mount_target_for_workload(
-                    volume,
-                    WORKLOAD_RESERVED_PATHS,
-                )
-                .map_err(|error| {
+                validate_podman_mount_target(volume).map_err(|error| {
                     ComputeDriverError::Precondition(format!(
                         "invalid image-declared volume '{volume}': {error}"
                     ))
                 })?;
+                driver_mounts::validate_workspace_mount_target(volume, &workspace_root).map_err(
+                    |_| {
+                        ComputeDriverError::Precondition(format!(
+                            "image-declared volume '{volume}' masks OCI WorkingDir '{workspace_root}' before workspace validation"
+                        ))
+                    },
+                )?;
             }
         }
 
@@ -830,6 +834,17 @@ pub fn podman_driver_image_mount_sources(
         .collect())
 }
 
+fn validate_podman_mount_target(target: &str) -> Result<(), String> {
+    driver_mounts::validate_container_mount_target(target)?;
+    for control_path in [
+        "/.openshell",
+        openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_ROOT,
+    ] {
+        driver_mounts::validate_mount_control_path(target, control_path)?;
+    }
+    Ok(())
+}
+
 fn podman_user_mounts(
     sandbox: &DriverSandbox,
     enable_bind_mounts: bool,
@@ -861,10 +876,7 @@ fn podman_user_mounts(
                     None => {}
                 }
                 driver_mounts::validate_absolute_mount_source(&source, "bind source")?;
-                driver_mounts::validate_container_mount_target_for_workload(
-                    &target,
-                    WORKLOAD_RESERVED_PATHS,
-                )?;
+                validate_podman_mount_target(&target)?;
                 result.mounts.push(Mount {
                     kind: "bind".into(),
                     source,
@@ -880,10 +892,7 @@ fn podman_user_mounts(
             } => {
                 reject_subpath(subpath.as_deref(), "podman volume mounts")?;
                 driver_mounts::validate_mount_source(&source, "volume source")?;
-                driver_mounts::validate_container_mount_target_for_workload(
-                    &target,
-                    WORKLOAD_RESERVED_PATHS,
-                )?;
+                validate_podman_mount_target(&target)?;
                 result.volumes.push(NamedVolume {
                     name: source,
                     dest: target,
@@ -909,10 +918,7 @@ fn podman_user_mounts(
                 {
                     options.push(format!("mode={mode:o}"));
                 }
-                driver_mounts::validate_container_mount_target_for_workload(
-                    &target,
-                    WORKLOAD_RESERVED_PATHS,
-                )?;
+                validate_podman_mount_target(&target)?;
                 result.mounts.push(Mount {
                     kind: "tmpfs".into(),
                     source: "tmpfs".into(),
@@ -928,10 +934,7 @@ fn podman_user_mounts(
             } => {
                 reject_subpath(subpath.as_deref(), "podman image mounts")?;
                 driver_mounts::validate_mount_source(&source, "image source")?;
-                driver_mounts::validate_container_mount_target_for_workload(
-                    &target,
-                    WORKLOAD_RESERVED_PATHS,
-                )?;
+                validate_podman_mount_target(&target)?;
                 result.image_volumes.push(ImageVolume {
                     source,
                     destination: target,
@@ -1006,10 +1009,7 @@ fn validate_podman_driver_mounts(
                 target
             }
         };
-        driver_mounts::validate_container_mount_target_for_workload(
-            target,
-            WORKLOAD_RESERVED_PATHS,
-        )?;
+        validate_podman_mount_target(target)?;
         let normalized_target = driver_mounts::normalize_mount_target(target);
         if !targets.insert(normalized_target.clone()) {
             return Err(format!(
@@ -1199,6 +1199,26 @@ fn build_base_spec(
     let resource_limits = build_resource_limits(sandbox, config);
     let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
         .map_err(ComputeDriverError::InvalidArgument)?;
+    for target in user_mounts
+        .mounts
+        .iter()
+        .map(|mount| mount.destination.as_str())
+        .chain(
+            user_mounts
+                .volumes
+                .iter()
+                .map(|volume| volume.dest.as_str()),
+        )
+        .chain(
+            user_mounts
+                .image_volumes
+                .iter()
+                .map(|volume| volume.destination.as_str()),
+        )
+    {
+        driver_mounts::validate_workspace_mount_target(target, &image.workspace_root)
+            .map_err(ComputeDriverError::Precondition)?;
+    }
     if sandbox
         .spec
         .as_ref()
@@ -2089,7 +2109,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_image_allows_volumes_covering_or_nested_in_working_dir() {
+    fn resolved_image_rejects_volumes_covering_working_dir() {
         let inspect = |volume: &str| ImageInspect {
             id: "sha256:image".into(),
             config: Some(ImageConfig {
@@ -2102,15 +2122,14 @@ mod tests {
             }),
         };
 
-        ResolvedPodmanImage::from_inspect(&inspect("/workspace"))
-            .expect("image volumes may cover a workload-owned workspace");
+        assert!(ResolvedPodmanImage::from_inspect(&inspect("/workspace")).is_err());
         let image = ResolvedPodmanImage::from_inspect(&inspect("/workspace/project/cache"))
             .expect("image volumes nested below the workspace remain valid");
         assert_eq!(image.workspace_root, "/workspace/project");
     }
 
     #[test]
-    fn resolved_image_allows_supervisor_only_workdir_but_reserves_workload_mounts() {
+    fn resolved_image_reuses_reserved_workdir_validation() {
         let inspect = |working_dir: &str| ImageInspect {
             id: "sha256:image".into(),
             config: Some(ImageConfig {
@@ -2121,17 +2140,13 @@ mod tests {
 
         assert!(ResolvedPodmanImage::from_inspect(&inspect("/opt/openshell/bin/project")).is_err());
         assert!(ResolvedPodmanImage::from_inspect(&inspect("/.openshell/channel")).is_err());
+        assert!(ResolvedPodmanImage::from_inspect(&inspect("/etc/openshell/tls/client")).is_err());
+        assert!(ResolvedPodmanImage::from_inspect(&inspect("/proc")).is_err());
         assert_eq!(
-            ResolvedPodmanImage::from_inspect(&inspect("/etc/openshell/tls/client"))
+            ResolvedPodmanImage::from_inspect(&inspect("/home/app"))
                 .unwrap()
                 .workspace_root,
-            "/etc/openshell/tls/client"
-        );
-        assert_eq!(
-            ResolvedPodmanImage::from_inspect(&inspect("/proc"))
-                .unwrap()
-                .workspace_root,
-            "/proc"
+            "/home/app"
         );
     }
 
@@ -3226,7 +3241,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_workspace_allows_covering_driver_mount() {
+    fn resolved_workspace_rejects_covering_driver_mount() {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let image = resolved_image("sha256:immutable", "1000:1000", "/workspace/project");
@@ -3240,7 +3255,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        build_container_spec_for_image(
+        let error = build_container_spec_for_image(
             &sandbox,
             &test_config(),
             None,
@@ -3250,7 +3265,12 @@ mod tests {
             None,
             None,
         )
-        .expect("driver mounts may cover a workload-owned workspace");
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reserved for the OpenShell workspace")
+        );
     }
 
     #[test]
@@ -3498,8 +3518,8 @@ mod tests {
             .driver_config = Some(json_struct(serde_json::json!({
             "mounts": [{"type": "volume", "source": "work-nfs", "target": "/etc/openshell/tls/client"}]
         })));
-        try_build_container_spec_with_token(&sandbox, &config, None)
-            .expect("supervisor-only paths are not reserved in the workload");
+        let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
+        assert!(err.to_string().contains("reserved OpenShell path"));
     }
 
     #[test]
