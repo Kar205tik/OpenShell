@@ -1,29 +1,31 @@
 # Jupyter Sandbox
 
-Build a Jupyter image, expose its server through a local OpenShell gateway,
-then execute a local notebook on a kernel inside the sandbox.
+Run a published Jupyter image in OpenShell, expose its server locally, and
+execute a local notebook on the sandboxed kernel.
 
-Run these commands from `examples/jupyter-sandbox`. You need a local,
-loopback-bound OpenShell gateway backed by Docker, plus Docker, the `openshell`
-CLI, and [uv](https://docs.astral.sh/uv/) on the host.
+Run these commands from `examples/jupyter-sandbox`. You need a local OpenShell
+gateway, the `openshell` CLI, Cargo, and OpenSSL on the host.
 
-## 1. Build the container
+## 1. Install the notebook CLI
+
+Install the [Jupyter community notebook CLI](https://github.com/jupyter-ai-contrib/nb-cli):
 
 ```shell
-docker build -t openshell-jupyter-sandbox:local .
-uv venv
-source .venv/bin/activate
-uv pip install jupyter-server==2.20.0 nbconvert==7.17.1
+cargo install nb-cli --version 0.0.10 --locked
 ```
+
+OpenShell pulls the published `quay.io/jupyter/base-notebook:2026-04-27` image
+when it creates the sandbox. The image includes Jupyter Server and a Python
+kernel, so no container build is needed.
 
 ## 2. Launch the service
 
 ```shell
+JUPYTER_TOKEN="$(openssl rand -hex 32)"
 openshell sandbox create \
   --name jupyter-demo \
-  --from openshell-jupyter-sandbox:local \
+  --from quay.io/jupyter/base-notebook:2026-04-27 \
   --policy policy.yaml \
-  --env HOME=/sandbox \
   --expose 8888 \
   --detach --no-tty \
   -- jupyter server \
@@ -31,34 +33,30 @@ openshell sandbox create \
     --ServerApp.port=8888 \
     --ServerApp.port_retries=0 \
     --ServerApp.open_browser=False \
-    --ServerApp.root_dir=/sandbox \
+    --ServerApp.root_dir=/home/jovyan \
     --ServerApp.terminals_enabled=False \
     --ServerApp.allow_remote_access=True \
-    --ServerApp.disable_check_xsrf=True \
-    --IdentityProvider.token=''
+    --IdentityProvider.token="$JUPYTER_TOKEN"
 ```
 
-The CLI prints the exposed service URL after the sandbox is ready. Jupyter
-starts as the sandbox's main process and listens on its loopback port.
-
-This example disables Jupyter authentication and XSRF checks because Jupyter's
-remote kernel client does not authenticate its WebSocket connection. Use it only
-with a local, loopback-bound gateway: any local process that can reach the
-service URL can run code in the sandbox.
+The CLI prints the service URL after the sandbox is ready. Jupyter starts as
+the sandbox's main process and listens on its loopback port. Keep the token in
+this shell for step 3.
 
 ## 3. Execute the notebook on the remote kernel
 
-Set `JUPYTER_GATEWAY_URL` to the service URL printed in step 2:
+Use the service URL printed in step 2 as the `--gateway` value:
 
 ```shell
-export JUPYTER_GATEWAY_URL='http://default--jupyter-demo.openshell.localhost:<gateway-port>/'
-export JUPYTER_CONFIG_PATH="$PWD"
-jupyter nbconvert --execute --to notebook demo.ipynb
+cp demo.ipynb demo.executed.ipynb
+nb execute demo.executed.ipynb \
+  --gateway 'http://default--jupyter-demo.openshell.localhost:<gateway-port>/' \
+  --gateway-token "$JUPYTER_TOKEN"
 ```
 
-The JSON config in this directory selects Jupyter's remote kernel manager.
-`demo.nbconvert.ipynb` stays on your computer and contains the output `285`;
-its code runs in the sandbox kernel.
+The command writes `285` into `demo.executed.ipynb` on your computer. Its code
+runs in a Jupyter kernel inside the sandbox. The `nb` CLI accepts the service
+URL as a flag and authenticates its REST and WebSocket connections.
 
 When finished, delete the sandbox and its service:
 
