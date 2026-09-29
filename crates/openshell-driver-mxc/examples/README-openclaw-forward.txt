@@ -40,7 +40,26 @@ PREREQUISITES (on this test box)
     ownership. Non-elevated fails both with ERROR_ACCESS_DENIED (0x5), the
     second as "Network proxy error: Failed to set loopback exemption:
     0x00000005". -Backend isolation_session does not hit either path.
-  - wxc-exec.exe present (default expected: C:\mxc-kit\bin\wxc-exec.exe)
+  - wxc-exec.exe present (default expected: C:\mxc-kit\bin\wxc-exec.exe).
+    Use a standalone copy in a regular directory, not a copy inside an
+    installed MSIX or WindowsApps package directory. If CreateSandbox reports
+    "wxc-exec spawn failed: Access is denied. (os error 5)", check this path.
+  - Before the first process_container run, check the selected isolation tier
+    and host-preparation warnings in PowerShell:
+      & "C:\path\to\wxc-exec.exe" --probe
+    Only if the probe selects AppContainer + DACL (appcontainer-dacl) and
+    recommends prepare-system-drive, obtain wxc-host-prep.exe from the MXC
+    binaries distribution and run this once in elevated PowerShell:
+      & "C:\path\to\wxc-host-prep.exe" prepare-system-drive
+    BaseContainer and AppContainer + BFS do not require this preparation.
+    The persistent, host-wide ACL change grants the AppContainer well-known
+    SIDs metadata access to the system-drive root only; it does not grant
+    directory listing or write access, or change descendant ACLs.
+    If wxc-exec starts but the agent exits with "wxc-exec stderr: Access is
+    denied." or exit code 1, check the probe warnings before changing host
+    ACLs; these errors alone do not identify missing host preparation.
+    For verification, other host prerequisites, and rollback, see:
+      https://github.com/microsoft/mxc/blob/main/docs/host-prep.md
   - process_container or isolation_session backend live (whichever -Backend
     you pass)
   - Your own OpenClaw install: a node.exe binary + the openclaw npm package
