@@ -71,11 +71,13 @@ The local gateway auto-detects an available runtime. To pin one, set `compute_dr
 |---|---|
 | Docker | Docker Desktop or Docker Engine 28.0 or later. |
 | Podman | Linux with Podman 5.x, cgroups v2, and an active Podman user socket. |
-| MicroVM | Host virtualization: Hypervisor.framework on macOS or KVM on Linux. |
+| MicroVM | Host virtualization: Hypervisor.framework on macOS or KVM on Linux; e2fsprogs 1.43 or newer on the host. |
 
 ## macOS
 
 The script installs OpenShell with Homebrew and runs the gateway as a Homebrew service at `https://localhost:17670`.
+
+The Homebrew formula installs `e2fsprogs` for MicroVM image preparation. The service adds that dependency's `bin` and `sbin` directories to its `PATH`, including when Homebrew uses a custom prefix. It does not depend on your interactive shell configuration.
 
 ```shell
 brew services list
@@ -83,6 +85,16 @@ brew services restart openshell
 ```
 
 The gateway reads `~/.config/openshell/gateway.toml` if it exists, otherwise the Homebrew config at `$(brew --prefix)/var/openshell/gateway.toml`.
+
+When installing release archives manually, install `e2fsprogs` separately and include its `bin` and `sbin` directories in the gateway service's `PATH`. For an interactive fish session:
+
+```shell
+brew install e2fsprogs
+set -l e2fs_prefix (brew --prefix e2fsprogs)
+set -gx PATH $PATH $e2fs_prefix/sbin $e2fs_prefix/bin
+```
+
+The VM driver checks `mke2fs` (or `mkfs.ext4`), `debugfs`, and `e2fsck` before image preparation. Its logs identify the selected paths. A missing executable, a failed version check, or an unsupported version rejects the request with a correction to make on the gateway host. Later filesystem-operation failures retain the selected tool's error.
 
 ## Linux
 

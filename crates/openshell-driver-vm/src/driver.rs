@@ -14,10 +14,10 @@ use crate::lifecycle::{
 use crate::rootfs::{
     clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
     ext4_image_has_directory, extract_host_supervisor, extract_rootfs_archive_to,
-    prepare_sandbox_rootfs_from_image_root, recover_rootfs_image, remove_rootfs_image_file,
-    sandbox_guest_init_path, sandbox_guest_runtime_identity, sandbox_guest_user_ids_from_image,
-    sandbox_guest_user_ids_from_overlay_image, set_rootfs_image_file_mode,
-    validate_host_supervisor, write_rootfs_image_file,
+    preflight_filesystem_tools, prepare_sandbox_rootfs_from_image_root, recover_rootfs_image,
+    remove_rootfs_image_file, sandbox_guest_init_path, sandbox_guest_runtime_identity,
+    sandbox_guest_user_ids_from_image, sandbox_guest_user_ids_from_overlay_image,
+    set_rootfs_image_file_mode, validate_host_supervisor, write_rootfs_image_file,
 };
 use crate::runtime::VmBackend;
 use bollard::Docker;
@@ -1103,6 +1103,9 @@ impl VmDriver {
     #[allow(clippy::result_large_err)]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<CreateSandboxResponse, Status> {
         self.validate_sandbox(sandbox)?;
+        preflight_filesystem_tools()
+            .await
+            .map_err(Status::failed_precondition)?;
         info!(
             sandbox_id = %sandbox.id,
             sandbox_name = %sandbox.name,
@@ -1293,6 +1296,11 @@ impl VmDriver {
         overlay_preparation: OverlayPreparation,
     ) -> Result<(), Status> {
         self.ensure_provisioning_active(&sandbox.id).await?;
+        // Archive recovery resolves its bootstrap directly and does not call
+        // prepare_runtime_images. Check both provisioning routes here.
+        preflight_filesystem_tools()
+            .await
+            .map_err(Status::failed_precondition)?;
         let is_gpu = sandbox
             .spec
             .as_ref()
@@ -2240,6 +2248,10 @@ impl VmDriver {
     ) -> bool {
         if let Err(error) = self.validate_sandbox(&sandbox) {
             warn!(sandbox_id = %sandbox.id, reason = %error.message(), "VM recovery denied by admission");
+            return false;
+        }
+        if let Err(error) = preflight_filesystem_tools().await {
+            warn!(sandbox_id = %sandbox.id, error = %error, "VM recovery denied by filesystem tool preflight");
             return false;
         }
         let has_rootfs_tar = VmSandboxDriverConfig::from_sandbox(&sandbox)
@@ -4377,6 +4389,9 @@ impl ComputeDriver for VmDriver {
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         self.validate_sandbox(&sandbox)?;
+        preflight_filesystem_tools()
+            .await
+            .map_err(Status::failed_precondition)?;
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
@@ -9964,6 +9979,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[test]
+    fn create_admission_rejects_unusable_filesystem_tools() {
+        const CHILD_ENV: &str = "OPENSHELL_TEST_E2FS_PREFLIGHT_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // Isolate PATH from concurrently running library tests.
+            let tools = tempfile::tempdir().expect("tool directory");
+            fs::write(tools.path().join("mke2fs"), b"not executable").expect("broken tool");
+            let result =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "driver::tests::create_admission_rejects_unusable_filesystem_tools",
+                        "--nocapture",
+                    ])
+                    .env("PATH", tools.path())
+                    .env(CHILD_ENV, "1")
+                    .output()
+                    .expect("run admission regression");
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+            driver.config.default_image = "registry.example.test/agent:latest".to_string();
+            let error = ComputeDriver::validate_sandbox_create(
+                &driver,
+                Request::new(ValidateSandboxCreateRequest {
+                    sandbox: Some(Sandbox {
+                        id: "filesystem-tool-preflight".to_string(),
+                        spec: Some(SandboxSpec::default()),
+                        ..Default::default()
+                    }),
+                }),
+            )
+            .await
+            .expect_err("the driver must reject before the gateway admits image preparation");
+            assert_eq!(error.code(), Code::FailedPrecondition);
+            assert!(error.message().contains("is not an executable file"));
+            assert!(driver.registry.lock().await.is_empty());
+        });
+    }
+
     #[tokio::test]
     async fn remove_sandbox_state_dir_rejects_paths_outside_state_root() {
         let base = unique_temp_dir();
@@ -9977,6 +10043,99 @@ mod tests {
         assert!(err.message().contains("outside vm state root"));
 
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn rootfs_tar_restore_rejects_unusable_tools_before_disk_changes() {
+        const CHILD_ENV: &str = "OPENSHELL_TEST_E2FS_RESTORE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let tools = tempfile::tempdir().expect("tool directory");
+            fs::write(tools.path().join("mke2fs"), b"not executable").expect("broken tool");
+            let result = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "driver::tests::rootfs_tar_restore_rejects_unusable_tools_before_disk_changes",
+                    "--nocapture",
+                ])
+                .env("PATH", tools.path())
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("run restore regression");
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let temp = tempfile::tempdir().expect("persisted state");
+                let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+                driver.config.state_dir = temp.path().to_path_buf();
+                driver.config.allow_driver_config = true;
+                // If recovery incorrectly advances, fail image parsing locally
+                // rather than contacting a registry during the regression.
+                driver.config.bootstrap_image = "invalid bootstrap image reference".to_string();
+                let (launch_authentication, _) = test_launch_authentication("e2fs-restore");
+                let sandbox = Sandbox {
+                    id: "rootfs-tar-restore-preflight".to_string(),
+                    spec: Some(SandboxSpec {
+                        launch_authentication,
+                        template: Some(SandboxTemplate {
+                            driver_config: Some(Struct {
+                                fields: std::iter::once((
+                                    "rootfs_tar_path".to_string(),
+                                    Value {
+                                        kind: Some(Kind::StringValue(
+                                            "/consumed/archive.tar".to_string(),
+                                        )),
+                                    },
+                                ))
+                                .collect(),
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let state_dir = temp.path().join("sandboxes").join(&sandbox.id);
+                create_private_dir_all(&state_dir)
+                    .await
+                    .expect("state directory");
+                fs::write(state_dir.join(IMAGE_IDENTITY_FILE), b"persisted-rootfs-tar")
+                    .expect("identity");
+                fs::write(state_dir.join(SANDBOX_STOPPED_FILE), b"stopped\n").expect("stop marker");
+                fs::write(state_dir.join(SANDBOX_OVERLAY_IMAGE), b"preserved overlay")
+                    .expect("overlay");
+                let accepted = driver
+                    .restore_persisted_sandbox(
+                        sandbox,
+                        state_dir.clone(),
+                        true,
+                        &tracing::Span::none(),
+                    )
+                    .await;
+                assert!(
+                    !accepted,
+                    "recovery must reject unusable tools before starting image work"
+                );
+                assert!(driver.registry.lock().await.is_empty());
+                assert_eq!(
+                    fs::read(state_dir.join(SANDBOX_STOPPED_FILE)).expect("stop marker preserved"),
+                    b"stopped\n"
+                );
+                assert_eq!(
+                    fs::read(state_dir.join(SANDBOX_OVERLAY_IMAGE)).expect("overlay preserved"),
+                    b"preserved overlay"
+                );
+                assert!(!image_cache_root_dir(temp.path()).exists());
+            });
     }
 
     #[cfg(unix)]

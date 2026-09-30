@@ -332,6 +332,7 @@ class Openshell < Formula
 
   depends_on macos: :big_sur
   depends_on arch: :arm64
+  depends_on "e2fsprogs"
 
   resource "openshell-gateway" do
     url "{_asset_url(release_tag, HOMEBREW_GATEWAY_ASSET)}"
@@ -386,6 +387,10 @@ class Openshell < Formula
         . "${{prefix_gateway_env}}"
         set +a
       fi
+
+      # launchd does not load shell startup files. Use this formula's dependency
+      # prefix, including installations outside the standard Homebrew prefixes.
+      export PATH="${{PATH:-/usr/bin:/bin:/usr/sbin:/sbin}}:#{{Formula["e2fsprogs"].opt_sbin}}:#{{Formula["e2fsprogs"].opt_bin}}"
 
       docker_tls_dir="${{HOME}}/.local/state/openshell/homebrew/tls"
       mkdir -p "${{docker_tls_dir}}/server"

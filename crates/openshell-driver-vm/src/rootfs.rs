@@ -9,6 +9,7 @@ use std::fs::File;
 #[cfg(test)]
 use std::io::BufWriter;
 use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -671,6 +672,7 @@ fn format_ext4_image_from_dir(source: &Path, image_path: &Path) -> Result<(), St
                 Ok(command) => command,
                 Err(error) => return FormatterAttempt::Failed(error),
             };
+            let resolved = Path::new(command.get_program()).is_absolute();
             let output = command
                 .arg("-q")
                 .arg("-F")
@@ -690,7 +692,7 @@ fn format_ext4_image_from_dir(source: &Path, image_path: &Path) -> Result<(), St
                         String::from_utf8_lossy(&output.stdout),
                         String::from_utf8_lossy(&output.stderr)
                     )),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && !resolved => {
                     FormatterAttempt::Unavailable(format!("{label} not found"))
                 }
                 Err(error) => FormatterAttempt::Failed(format!("run {label}: {error}")),
@@ -708,26 +710,23 @@ fn run_ext4_formatter_candidates(
     candidates: impl IntoIterator<Item = PathBuf>,
     mut run: impl FnMut(&Path) -> FormatterAttempt,
 ) -> Result<(), String> {
-    let mut failures = Vec::new();
     let mut unavailable = Vec::new();
 
     for candidate in candidates {
         match run(&candidate) {
             FormatterAttempt::Succeeded => return Ok(()),
-            FormatterAttempt::Failed(error) => failures.push(error),
+            // Only an absent tool permits an alias fallback. Retrying after a
+            // real failure can hide corruption or overwrite a partial image.
+            FormatterAttempt::Failed(error) => return Err(error),
             FormatterAttempt::Unavailable(error) => unavailable.push(error),
         }
     }
 
-    if failures.is_empty() {
-        Err(if unavailable.is_empty() {
-            "no ext4 formatter candidates configured".to_string()
-        } else {
-            unavailable.join("\n")
-        })
+    Err(if unavailable.is_empty() {
+        "no ext4 formatter candidates configured".to_string()
     } else {
-        Err(failures.join("\n"))
-    }
+        unavailable.join("\n")
+    })
 }
 
 fn ensure_rootfs_image_parent_dirs(image_path: &Path, guest_path: &str) {
@@ -1053,9 +1052,192 @@ fn run_debugfs(image_path: &Path, command: &str) -> Result<(), String> {
 
 fn e2fs_command(tool: impl AsRef<OsStr>) -> Result<Command, String> {
     let path = e2fs_search_path(std::env::var_os("PATH").as_deref())?;
-    let mut command = Command::new(tool);
+    e2fs_command_with_path(tool.as_ref(), &path)
+}
+
+fn e2fs_command_with_path(tool: &OsStr, path: &OsStr) -> Result<Command, String> {
+    // Resolve before spawning so preflight and image operations use the same
+    // file. A broken first installation must not silently select another copy.
+    let selected = resolve_e2fs_tool(tool, path)?;
+    let mut command = Command::new(selected.as_deref().map_or(tool, Path::as_os_str));
     command.env("PATH", path);
     Ok(command)
+}
+
+fn resolve_e2fs_tool(tool: &OsStr, search_path: &OsStr) -> Result<Option<PathBuf>, String> {
+    for directory in std::env::split_paths(search_path) {
+        let candidate = directory.join(tool);
+        let metadata = match fs::metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("inspect {}: {error}", candidate.display())),
+        };
+        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            return Err(format!(
+                "{} is not an executable file; repair this e2fsprogs installation or the gateway service PATH",
+                candidate.display()
+            ));
+        }
+        return candidate
+            .canonicalize()
+            .map(Some)
+            .map_err(|error| format!("resolve {}: {error}", candidate.display()));
+    }
+    Ok(None)
+}
+
+/// Check host tools in the driver service's environment before accepting image work.
+/// This checks executable identity and a supported version; later image failures
+/// still return the selected tool's status and output without a retry.
+pub(crate) async fn preflight_filesystem_tools() -> Result<(), String> {
+    let path = e2fs_search_path(std::env::var_os("PATH").as_deref())?;
+    preflight_filesystem_tools_with_path(&path).await
+}
+
+async fn preflight_filesystem_tools_with_path(path: &OsStr) -> Result<(), String> {
+    for (names, identity) in [
+        (&["mke2fs", "mkfs.ext4"][..], "mke2fs"),
+        (&["debugfs"][..], "debugfs"),
+        (&["e2fsck"][..], "e2fsck"),
+    ] {
+        let mut selected = None;
+        for name in names {
+            let command = e2fs_command_with_path(OsStr::new(name), path)?;
+            if Path::new(command.get_program()).is_absolute() {
+                selected = Some(command);
+                break;
+            }
+        }
+        let command = selected.ok_or_else(|| {
+            format!(
+                "{} not found in the VM driver's search path: {}. Install e2fsprogs and include its bin/sbin directories in the gateway service PATH",
+                names.join(" or "),
+                path.to_string_lossy()
+            )
+        })?;
+        let selected_path = command.get_program().to_string_lossy().into_owned();
+        let output = tokio::time::timeout(std::time::Duration::from_secs(5), run_e2fs_version_probe(command))
+            .await
+            .map_err(|_| format!("e2fsprogs preflight: {selected_path} -V timed out after 5 seconds; repair this installation"))?
+            .map_err(|error| format!("e2fsprogs preflight: run {selected_path} -V: {error}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            return Err(format!(
+                "e2fsprogs preflight: {selected_path} -V failed with status {}\nstdout: {stdout}\nstderr: {stderr}",
+                output.status
+            ));
+        }
+        if !supported_e2fs_version(identity, &stdout) && !supported_e2fs_version(identity, &stderr)
+        {
+            return Err(format!(
+                "e2fsprogs preflight: {selected_path} is not a supported {identity} executable; install e2fsprogs 1.43 or newer\nstdout: {stdout}\nstderr: {stderr}"
+            ));
+        }
+        tracing::info!(tool = identity, path = %selected_path, "VM filesystem tool preflight passed");
+    }
+    Ok(())
+}
+
+// Version probes own a separate process group. Killing only the immediate
+// executable leaves children of operator wrappers running after cancellation.
+// This covers descendants that stay in the group; it is not host sandboxing.
+struct E2fsProbeProcess {
+    child: tokio::process::Child,
+    group: nix::unistd::Pid,
+}
+
+impl Drop for E2fsProbeProcess {
+    fn drop(&mut self) {
+        let _ = nix::sys::signal::killpg(self.group, nix::sys::signal::Signal::SIGKILL);
+        // kill_on_drop also schedules the direct child for reaping when the
+        // caller drops a pending probe rather than awaiting its result.
+    }
+}
+
+async fn run_e2fs_version_probe(command: Command) -> Result<std::process::Output, String> {
+    use std::process::Stdio;
+
+    let child = tokio::process::Command::from(command)
+        .arg("-V")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let group = child
+        .id()
+        .and_then(|id| i32::try_from(id).ok())
+        .ok_or_else(|| "version probe has no valid process ID".to_string())?;
+    let mut probe = E2fsProbeProcess {
+        child,
+        group: nix::unistd::Pid::from_raw(group),
+    };
+    let stdout = probe
+        .child
+        .stdout
+        .take()
+        .ok_or("version probe stdout is unavailable")?;
+    let stderr = probe
+        .child
+        .stderr
+        .take()
+        .ok_or("version probe stderr is unavailable")?;
+    let (stdout, stderr, status) = tokio::try_join!(
+        read_e2fs_probe_output(stdout, "stdout"),
+        read_e2fs_probe_output(stderr, "stderr"),
+        async { probe.child.wait().await.map_err(|error| error.to_string()) },
+    )?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+async fn read_e2fs_probe_output(
+    reader: impl tokio::io::AsyncRead + Unpin,
+    stream: &str,
+) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt as _;
+    // Both streams have this limit, so a concurrent probe retains at most
+    // 16 KiB of diagnostics. Stop early instead of draining an endless writer.
+    const MAX_BYTES: usize = 8 * 1024;
+    let mut output = Vec::new();
+    reader
+        .take((MAX_BYTES + 1) as u64)
+        .read_to_end(&mut output)
+        .await
+        .map_err(|error| format!("read version probe {stream}: {error}"))?;
+    if output.len() > MAX_BYTES {
+        output.truncate(MAX_BYTES);
+        return Err(format!(
+            "version probe {stream} exceeded {MAX_BYTES} bytes: {} [truncated]",
+            String::from_utf8_lossy(&output)
+        ));
+    }
+    Ok(output)
+}
+
+fn supported_e2fs_version(identity: &str, output: &str) -> bool {
+    output.lines().any(|line| {
+        let mut words = line.split_whitespace();
+        if words.next() != Some(identity) {
+            return false;
+        }
+        let Some(version) = words.next() else {
+            return false;
+        };
+        let mut parts = version.split('.');
+        let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
+            return false;
+        };
+        // mke2fs -d (populate from a directory) is required for rootfs creation
+        // and is available starting with e2fsprogs 1.43.
+        matches!((major.parse::<u32>(), minor.parse::<u32>()), (Ok(major), Ok(minor)) if (major, minor) >= (1, 43))
+    })
 }
 
 fn e2fs_search_path(existing: Option<&OsStr>) -> Result<OsString, String> {
@@ -1716,7 +1898,7 @@ mod tests {
             if candidate == Path::new("second") {
                 FormatterAttempt::Succeeded
             } else {
-                FormatterAttempt::Failed("first failed".to_string())
+                FormatterAttempt::Unavailable("first not found".to_string())
             }
         })
         .expect("fallback should succeed");
@@ -1725,6 +1907,218 @@ mod tests {
             attempted,
             vec![PathBuf::from("first"), PathBuf::from("second")]
         );
+    }
+
+    #[test]
+    fn formatter_does_not_retry_an_execution_failure() {
+        let mut attempted = Vec::new();
+        let error = run_ext4_formatter_candidates(
+            [PathBuf::from("mke2fs"), PathBuf::from("mkfs.ext4")],
+            |candidate| {
+                attempted.push(candidate.to_path_buf());
+                if candidate == Path::new("mke2fs") {
+                    FormatterAttempt::Failed("mke2fs: no space left".to_string())
+                } else {
+                    FormatterAttempt::Succeeded
+                }
+            },
+        )
+        .expect_err("an executed formatter failure must stop preparation");
+        assert_eq!(error, "mke2fs: no space left");
+        assert_eq!(attempted, [PathBuf::from("mke2fs")]);
+    }
+
+    fn fake_e2fs_tool(directory: &Path, name: &str, body: &str) {
+        let path = directory.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write tool");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("make executable");
+    }
+
+    fn fake_e2fs_installation(directory: &Path) {
+        for name in ["mke2fs", "debugfs", "e2fsck"] {
+            fake_e2fs_tool(
+                directory,
+                name,
+                &format!("test \"$1\" = -V || exit 64\necho '{name} 1.47.4' >&2"),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn filesystem_preflight_accepts_private_prefix_and_formatter_alias() {
+        let temp = tempfile::tempdir().expect("private prefix");
+        fake_e2fs_installation(temp.path());
+        fs::rename(temp.path().join("mke2fs"), temp.path().join("mkfs.ext4"))
+            .expect("use formatter alias");
+        preflight_filesystem_tools_with_path(temp.path().as_os_str())
+            .await
+            .expect("all required tools available");
+        let command = e2fs_command_with_path(OsStr::new("debugfs"), temp.path().as_os_str())
+            .expect("execution uses same resolver");
+        let expected = temp
+            .path()
+            .join("debugfs")
+            .canonicalize()
+            .expect("tool path");
+        assert_eq!(command.get_program(), expected.as_os_str());
+    }
+
+    #[tokio::test]
+    async fn filesystem_preflight_rejects_missing_tools() {
+        let temp = tempfile::tempdir().expect("clean host search path");
+        let error = preflight_filesystem_tools_with_path(temp.path().as_os_str())
+            .await
+            .expect_err("missing formatter must reject preparation");
+        assert!(error.contains("mke2fs or mkfs.ext4 not found"), "{error}");
+        assert!(error.contains("gateway service PATH"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn filesystem_preflight_rejects_nonexecutable_before_another_installation() {
+        let first = tempfile::tempdir().expect("first installation");
+        let second = tempfile::tempdir().expect("second installation");
+        fs::write(first.path().join("mke2fs"), b"not executable").expect("write broken tool");
+        fake_e2fs_installation(second.path());
+        let path = std::env::join_paths([first.path(), second.path()]).expect("search path");
+        let error = preflight_filesystem_tools_with_path(&path)
+            .await
+            .expect_err("broken installation must not fall back");
+        assert!(error.contains("is not an executable file"), "{error}");
+        assert!(
+            error.contains(&first.path().display().to_string()),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn filesystem_preflight_preserves_failed_tool_output() {
+        let first = tempfile::tempdir().expect("first installation");
+        let second = tempfile::tempdir().expect("second installation");
+        fake_e2fs_tool(first.path(), "mke2fs", "echo 'loader failed' >&2\nexit 42");
+        fake_e2fs_installation(second.path());
+        let path = std::env::join_paths([first.path(), second.path()]).expect("search path");
+        let error = preflight_filesystem_tools_with_path(&path)
+            .await
+            .expect_err("real execution failure must not fall back");
+        assert!(error.contains("42"), "{error}");
+        assert!(error.contains("loader failed"), "{error}");
+        assert!(
+            error.contains(&first.path().display().to_string()),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn filesystem_preflight_rejects_incompatible_tool() {
+        let temp = tempfile::tempdir().expect("old installation");
+        fake_e2fs_installation(temp.path());
+        fake_e2fs_tool(temp.path(), "debugfs", "echo 'debugfs 1.42.13' >&2");
+        let error = preflight_filesystem_tools_with_path(temp.path().as_os_str())
+            .await
+            .expect_err("old tool must reject preparation");
+        assert!(
+            error.contains("not a supported debugfs executable"),
+            "{error}"
+        );
+        assert!(error.contains("debugfs 1.42.13"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn filesystem_preflight_stops_a_hung_version_probe() {
+        let temp = tempfile::tempdir().expect("hung installation");
+        fake_e2fs_tool(temp.path(), "mke2fs", "exec /bin/sleep 30");
+        let error = preflight_filesystem_tools_with_path(temp.path().as_os_str())
+            .await
+            .expect_err("preflight must finish even if a tool hangs");
+        assert!(error.contains("timed out after 5 seconds"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn filesystem_preflight_bounds_each_output_stream() {
+        let temp = tempfile::tempdir().expect("noisy installation");
+        for (redirect, stream) in [("", "stdout"), (">&2", "stderr")] {
+            fake_e2fs_tool(
+                temp.path(),
+                "mke2fs",
+                &format!("/bin/dd if=/dev/zero bs=16384 count=4 {redirect} 2>/dev/null\nexit 42"),
+            );
+            let error = preflight_filesystem_tools_with_path(temp.path().as_os_str())
+                .await
+                .expect_err("oversized probe output must fail early");
+            assert!(error.contains(&format!("{stream} exceeded 8192 bytes")));
+            assert!(
+                error.len() < 9000,
+                "diagnostic grew to {} bytes",
+                error.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn filesystem_preflight_timeout_terminates_wrapper_descendants() {
+        let temp = tempfile::tempdir().expect("wrapper installation");
+        let marker = temp.path().join("survived-timeout");
+        fake_e2fs_tool(
+            temp.path(),
+            "mke2fs",
+            &format!(
+                "(/bin/sleep 6; echo survived > '{}') &\nwait",
+                marker.display()
+            ),
+        );
+        let error = preflight_filesystem_tools_with_path(temp.path().as_os_str())
+            .await
+            .expect_err("wrapper must time out");
+        assert!(error.contains("timed out after 5 seconds"), "{error}");
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+        assert!(
+            !marker.exists(),
+            "wrapper descendant survived its probe timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn filesystem_preflight_cancellation_terminates_wrapper_descendants() {
+        let temp = tempfile::tempdir().expect("wrapper installation");
+        let ready = temp.path().join("child-ready");
+        let marker = temp.path().join("survived-cancellation");
+        fake_e2fs_tool(
+            temp.path(),
+            "mke2fs",
+            &format!(
+                "(echo ready > '{}'; /bin/sleep 6; echo survived > '{}') &\nwait",
+                ready.display(),
+                marker.display()
+            ),
+        );
+        let path = temp.path().to_path_buf();
+        let probe =
+            tokio::spawn(
+                async move { preflight_filesystem_tools_with_path(path.as_os_str()).await },
+            );
+        for _ in 0..400 {
+            if ready.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        if !ready.exists() {
+            probe.abort();
+            let result = probe.await;
+            panic!("probe descendant did not start: {result:?}");
+        }
+        probe.abort();
+        assert!(probe.await.expect_err("cancelled task").is_cancelled());
+        tokio::time::sleep(std::time::Duration::from_millis(6300)).await;
+        assert!(!marker.exists(), "wrapper descendant survived cancellation");
+    }
+
+    #[test]
+    fn filesystem_preflight_requires_expected_identity_and_version() {
+        assert!(supported_e2fs_version("mke2fs", "mke2fs 1.43 (test)"));
+        for output in ["other 1.47.4", "mke2fs unknown", "mke2fs 1.42.13", ""] {
+            assert!(!supported_e2fs_version("mke2fs", output), "{output}");
+        }
     }
 
     fn unique_temp_dir() -> PathBuf {

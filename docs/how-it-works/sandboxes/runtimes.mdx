@@ -181,6 +181,8 @@ Podman also supports `image` mounts, which mount a container image read-only at 
 
 The MicroVM driver runs each sandbox in its own lightweight VM. It requires host virtualization: Apple Hypervisor on macOS or KVM on Linux.
 
+Image preparation also requires host `mke2fs` (or `mkfs.ext4`), `debugfs`, and `e2fsck` from e2fsprogs 1.43 or newer. Homebrew installs this dependency and configures the service search path. For manual archive installs or a Linux VM host, install the distribution's `e2fsprogs` package and make its tools available to the gateway service. The driver checks tool versions before preparing images and logs each selected path; changing your shell's `PATH` does not change an already running service.
+
 The VM driver is opt-in. Enable it in the gateway TOML file:
 
 ```toml

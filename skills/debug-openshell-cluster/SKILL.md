@@ -896,8 +896,7 @@ Use the VM driver logs and host diagnostics available in the user's environment.
 
 - The VM driver process is running and reachable by the gateway.
 - The runtime rootfs exists and matches the expected architecture.
-- `mke2fs` or `mkfs.ext4` and `debugfs` from e2fsprogs are installed; explicit
-  `sandbox_uid`/`sandbox_gid` does not remove this prerequisite.
+- `mke2fs` or `mkfs.ext4`, `debugfs`, and `e2fsck` from e2fsprogs 1.43 or newer are installed. Check the selected paths in the VM driver's preflight logs and fix the gateway service environment when lookup or version checks fail. Homebrew supplies the dependency and its service search path; explicit `sandbox_uid`/`sandbox_gid` does not remove this prerequisite.
 - A persisted overlay identity error is resolved from its owner marker, overlay
   upper layer, prepared rootfs, explicit config, or current image. Do not assign
   `10001:10001` unless the persisted state reports that legacy identity.
