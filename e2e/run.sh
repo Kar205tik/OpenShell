@@ -263,7 +263,8 @@ if [ "${mode}" = host ]; then
 	echo "==> Building native host openshell-gateway"
 	mise x -- cargo build "${cargo_jobs[@]}" \
 		-p openshell-gateway \
-		--bin openshell-gateway
+		--bin openshell-gateway \
+		--features vendored-z3
 	host_gateway_bin="${target_dir}/debug/openshell-gateway"
 else
 	echo "==> Building Linux openshell-gateway (${linux_gateway_zig_target})"
@@ -278,7 +279,8 @@ else
 			--release \
 			--target "${linux_gateway_zig_target}" \
 			-p openshell-gateway \
-			--bin openshell-gateway
+			--bin openshell-gateway \
+			--features vendored-z3
 	)
 	guest_gateway_bin="${target_dir}/${linux_gateway_rust_target}/release/openshell-gateway"
 fi

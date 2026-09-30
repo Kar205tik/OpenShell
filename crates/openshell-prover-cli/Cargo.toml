@@ -15,6 +15,7 @@ name = "openshell-prover"
 path = "src/main.rs"
 
 [features]
+vendored-z3 = ["openshell-prover/vendored-z3"]
 prebuilt-z3 = ["openshell-prover/prebuilt-z3"]
 
 [dependencies]

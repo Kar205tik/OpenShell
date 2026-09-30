@@ -143,7 +143,7 @@ k8s-openapi = { version = "0.24", features = ["v1_29"] }
 uuid = { version = "1.10", features = ["v4"] }
 signal-hook = "0.3"
 
-# SMT solver (uses system libz3; Windows build tasks enable the prebuilt release feature)
+# SMT solver (system libz3 by default; opt into vendored source or a prebuilt release)
 z3 = "0.21"
 
 [workspace.lints.rust]

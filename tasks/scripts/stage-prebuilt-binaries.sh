@@ -167,6 +167,9 @@ build_component_for_arch() {
   target="$(target_triple "$arch" "$target_libc")"
   stage="${ROOT}/deploy/docker/.build/prebuilt-binaries/${arch}"
   features="${EXTRA_CARGO_FEATURES:-}"
+  if [[ "$component" == "gateway" ]]; then
+    features="${features} vendored-z3"
+  fi
   current_host_os="$(host_os)"
   current_host_arch="$(host_arch)"
 

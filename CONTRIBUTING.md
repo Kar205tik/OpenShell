@@ -318,6 +318,8 @@ the `openshell-gateway` binary crate depends on `openshell-server` in turn.
 The `openshell-cli` crate does not depend on Z3. The Nix development shell
 supplies Z3. For builds outside that shell on macOS and Linux, install the
 system Z3 development package; `z3-sys` discovers it through `pkg-config`.
+The linker uses the installed static or shared library. The Nix development
+shell provides a static Z3 library.
 
 ```bash
 # macOS
@@ -329,6 +331,17 @@ sudo apt install libz3-dev
 # Fedora
 sudo dnf install z3-devel
 ```
+
+To build Z3 from source instead, enable `vendored-z3` (requires CMake and a C++
+compiler):
+
+```bash
+cargo build -p openshell-prover --features vendored-z3
+cargo build -p openshell-prover-cli --features vendored-z3
+```
+
+Local gateway image and E2E builds enable `vendored-z3` so their
+copied gateway binaries do not need a shared Z3 library in the runtime image.
 
 For x86-64 and ARM64 Windows MSVC builds, use one of these Z3 paths:
 

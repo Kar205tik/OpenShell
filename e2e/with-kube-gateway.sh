@@ -1045,11 +1045,9 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
     fi
     external_gateway="${OPENSHELL_GATEWAY_BIN:-${ROOT}/target/debug/openshell-gateway}"
     external_driver="${OPENSHELL_EXTERNAL_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-kubernetes}"
-    # The test image uses a distroless runtime, so build with the same
-    # toolchain-provided static Z3 used by production gateway artifacts.
     if [ -z "${OPENSHELL_GATEWAY_BIN:-}" ]; then
       cargo build -p openshell-gateway --bin openshell-gateway \
-        --no-default-features --features telemetry
+        --no-default-features --features telemetry,vendored-z3
     fi
     if [ -z "${OPENSHELL_EXTERNAL_DRIVER_BIN:-}" ]; then
       cargo build -p openshell-driver-kubernetes --bin openshell-driver-kubernetes
