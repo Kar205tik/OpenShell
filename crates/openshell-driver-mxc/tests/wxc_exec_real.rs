@@ -1031,9 +1031,9 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
                     host: "example.com".to_string(),
                     ports: vec![443],
                     protocol: "rest".to_string(),
-                    tls: "terminate".to_string(),
-                    enforcement: "enforce".to_string(),
-                    access: "read-only".to_string(),
+                    tls: openshell_core::proto::NetworkTlsMode::Terminate as i32,
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+                    access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
                     ..Default::default()
                 }],
                 binaries: vec![NetworkBinary { path: cmd_string }],
@@ -1061,8 +1061,6 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let config = MxcComputeConfig {
         wxc_exec_path: wxc.to_string_lossy().into_owned(),
-        egress_proxy: true,
-        egress_proxy_addr: "127.0.0.1:18080".to_string(),
         ..Default::default()
     };
     let backend = MxcComputeBackend::new(config);
@@ -1230,8 +1228,6 @@ async fn run_proxy_binary_scope_case(
     };
     let backend = MxcComputeBackend::new(MxcComputeConfig {
         wxc_exec_path: wxc.to_string_lossy().into_owned(),
-        egress_proxy: true,
-        egress_proxy_addr: "127.0.0.1:18080".to_string(),
         ..Default::default()
     });
     backend

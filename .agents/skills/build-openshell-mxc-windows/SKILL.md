@@ -17,10 +17,16 @@ supported deliverables:
 
 - `openshell-gateway.exe`
 - `openshell.exe`
-- `openshell-supervisor-relay.exe` (Windows-only MXC workload relay)
+- `openshell-supervisor.exe` (standard supervisor)
+- `openshell-mxc-isolation-backend.exe` (MXC native boundary)
+- `openshell-supervisor-relay.exe` (compatibility tool owned by the MXC driver)
 
 It intentionally does not make Windows a Docker, Kubernetes, Podman, or VM
 runtime host.
+
+The supervisor and process-supervisor crates are included in compilation checks.
+Do not exclude them to make a Windows check pass. MXC confirmation currently has
+explicit unverified-success TODOs; compilation is not enforcement qualification.
 
 ## Current Repository Shape
 
@@ -266,6 +272,10 @@ compatibility under emulation is not part of these tasks. The aggregate
 commands above on an ARM64 host.
 
 The repository-wide `mise run pre-commit` task is also supported on Windows.
+Run `rust:lockfiles:check`, `sdk:ts:ci`, `go:ci`, and `test:e2e-parity` through
+the Windows-aware tasks when validating those surfaces. Do not count the Go
+Windows ARM64 race-detector exclusion or POSIX permission-bit skips as security
+coverage. SDK test dependencies must remain at their lockfile versions.
 Its Rust check, Clippy, and test dependencies enter the same MSVC environment
 for the native host target and use an inherited compiler wrapper when it is
 available. Linux glibc
@@ -288,8 +298,8 @@ crypto dependency builds.
 |---|---|
 | `windows:check:x64` | `cargo check --workspace` for `x86_64-pc-windows-msvc`, excluding unsupported Windows packages as top-level workspace targets. |
 | `windows:check:arm64` | `cargo check --workspace` for `aarch64-pc-windows-msvc`, with the same top-level exclusions. |
-| `windows:build:x64` | Release-builds `openshell-gateway.exe`, `openshell.exe`, and `openshell-supervisor-relay.exe` for x64. |
-| `windows:build:arm64` | Release-builds `openshell-gateway.exe`, `openshell.exe`, and `openshell-supervisor-relay.exe` for ARM64. |
+| `windows:build:x64` | Release-builds `openshell-gateway.exe`, `openshell.exe`, `openshell-supervisor.exe`, `openshell-mxc-isolation-backend.exe`, and the compatibility relay for x64. |
+| `windows:build:arm64` | Release-builds `openshell-gateway.exe`, `openshell.exe`, `openshell-supervisor.exe`, `openshell-mxc-isolation-backend.exe`, and the compatibility relay for ARM64. |
 | `windows:test:x64` | Runs native x64 workspace tests with `--no-fail-fast`, excluding unsupported Windows packages as top-level workspace targets. |
 | `windows:test:arm64` | Runs native ARM64 workspace tests with `--no-fail-fast` and the same package exclusions. Rejects non-ARM64 hosts. |
 | `windows:test:unsupported:x64` | Re-runs focused `openshell-gateway` tests for unsupported Windows driver behavior. |

@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "openshell-isolation-backends"
+description = "Composition of first-party isolation protocol adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+[dependencies]
+openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
+openshell-mxc-isolation-backend = { path = "../openshell-mxc-isolation-backend" }
+openshell-isolation-interface = { path = "../openshell-isolation-interface" }
+[lints]
+workspace = true

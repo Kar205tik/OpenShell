@@ -36,7 +36,6 @@ pub(super) struct RelayContext<'a> {
     request: &'a L7EvalContext,
     policy: PreparedHttpPolicy,
     middleware_engine: &'a OpaEngine,
-    event_context: &'a openshell_ocsf::EventContext,
 }
 
 /// Non-blocking observation channels attached to an authorized HTTP relay.
@@ -77,12 +76,12 @@ pub(super) fn http_context(
         binary_path: decision
             .binary
             .as_ref()
-            .map(|path| crate::opa::network_binary_match_path(path))
+            .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default(),
         ancestors: decision
             .ancestors
             .iter()
-            .map(|path| crate::opa::network_binary_match_path(path))
+            .map(|path| path.to_string_lossy().into_owned())
             .collect(),
         cmdline_paths: decision
             .cmdline_paths
@@ -115,12 +114,9 @@ pub(super) fn pin_policy_generation(
 /// Clone an L7 evaluator for a relay or the forward HTTP single-request path.
 pub(super) fn pin_l7_evaluator(
     opa_engine: &OpaEngine,
-    decision: &EgressDecision,
+    expected_generation: u64,
 ) -> Result<TunnelPolicyEngine> {
-    opa_engine.clone_engine_for_tunnel_with_match_paths(
-        decision.policy_generation,
-        decision.binary_match_paths.clone(),
-    )
+    opa_engine.clone_engine_for_tunnel(expected_generation)
 }
 
 pub(super) fn validate_route_generation(
@@ -150,11 +146,9 @@ pub(super) fn prepare_http_relay<'a>(
     opa_engine: &'a OpaEngine,
     decision: &EgressDecision,
     request: &'a L7EvalContext,
-    event_context: &'a openshell_ocsf::EventContext,
 ) -> Option<RelayContext<'a>> {
     if let Err(error) = validate_route_generation(route, decision.policy_generation) {
         emit_l7_tunnel_close_after_policy_change(
-            event_context,
             &decision.intent.destination.host,
             decision.intent.destination.port,
             error,
@@ -163,11 +157,10 @@ pub(super) fn prepare_http_relay<'a>(
     }
 
     let policy = if let Some(route) = route.filter(|route| !route.configs.is_empty()) {
-        let evaluator = match pin_l7_evaluator(opa_engine, decision) {
+        let evaluator = match pin_l7_evaluator(opa_engine, decision.policy_generation) {
             Ok(evaluator) => evaluator,
             Err(error) => {
                 emit_l7_tunnel_close_after_policy_change(
-                    event_context,
                     &decision.intent.destination.host,
                     decision.intent.destination.port,
                     error,
@@ -189,7 +182,6 @@ pub(super) fn prepare_http_relay<'a>(
             Ok(guard) => guard,
             Err(error) => {
                 emit_l7_tunnel_close_after_policy_change(
-                    event_context,
                     &decision.intent.destination.host,
                     decision.intent.destination.port,
                     error,
@@ -204,7 +196,6 @@ pub(super) fn prepare_http_relay<'a>(
         request,
         policy,
         middleware_engine: opa_engine,
-        event_context,
     })
 }
 
@@ -215,11 +206,9 @@ pub(super) fn prepare_raw_relay(
     route: Option<&L7RouteSnapshot>,
     opa_engine: &OpaEngine,
     decision: &EgressDecision,
-    event_context: &openshell_ocsf::EventContext,
 ) -> Option<PolicyGenerationGuard> {
     if let Err(error) = validate_route_generation(route, decision.policy_generation) {
         emit_l7_tunnel_close_after_policy_change(
-            event_context,
             &decision.intent.destination.host,
             decision.intent.destination.port,
             error,
@@ -231,7 +220,6 @@ pub(super) fn prepare_raw_relay(
         Ok(guard) => Some(guard),
         Err(error) => {
             emit_l7_tunnel_close_after_policy_change(
-                event_context,
                 &decision.intent.destination.host,
                 decision.intent.destination.port,
                 error,
@@ -267,11 +255,7 @@ where
                     context.request,
                 ) => result,
                 () = generation_guard.wait_until_stale() => {
-                    emit_stale_relay_close(
-                        context.request,
-                        &generation_guard,
-                        context.event_context,
-                    );
+                    emit_stale_relay_close(context.request, &generation_guard);
                     Ok(())
                 }
             }
@@ -287,11 +271,7 @@ where
                     context.request,
                 ) => result,
                 () = generation_guard.wait_until_stale() => {
-                    emit_stale_relay_close(
-                        context.request,
-                        &generation_guard,
-                        context.event_context,
-                    );
+                    emit_stale_relay_close(context.request, &generation_guard);
                     Ok(())
                 }
             }
@@ -306,11 +286,7 @@ where
                     Some(context.middleware_engine),
                 ) => result,
                 () = generation_guard.wait_until_stale() => {
-                    emit_stale_relay_close(
-                        context.request,
-                        &generation_guard,
-                        context.event_context,
-                    );
+                    emit_stale_relay_close(context.request, &generation_guard);
                     Ok(())
                 }
             }
@@ -324,7 +300,6 @@ pub(super) async fn relay_tcp<C, U>(
     upstream: &mut U,
     generation_guard: &PolicyGenerationGuard,
     request: &L7EvalContext,
-    event_context: &openshell_ocsf::EventContext,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -335,19 +310,14 @@ where
             result.into_diagnostic()?;
         }
         () = generation_guard.wait_until_stale() => {
-            emit_stale_relay_close(request, generation_guard, event_context);
+            emit_stale_relay_close(request, generation_guard);
         }
     }
     Ok(())
 }
 
-fn emit_stale_relay_close(
-    request: &L7EvalContext,
-    guard: &PolicyGenerationGuard,
-    event_context: &openshell_ocsf::EventContext,
-) {
+fn emit_stale_relay_close(request: &L7EvalContext, guard: &PolicyGenerationGuard) {
     emit_l7_tunnel_close_after_policy_change(
-        event_context,
         &request.host,
         request.port,
         miette::miette!(
@@ -360,22 +330,16 @@ fn emit_stale_relay_close(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "windows")]
-    use super::super::query_l7_route_snapshot;
     use super::super::{EgressIntent, EndpointDecision, ProcessIdentityEvidence};
     use super::*;
-    #[cfg(target_os = "windows")]
-    use crate::opa::NetworkInput;
-    #[cfg(target_os = "windows")]
-    use std::path::PathBuf;
-    #[cfg(target_os = "windows")]
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const POLICY_REGO: &str = include_str!("../../data/sandbox-policy.rego");
     const EMPTY_POLICY_DATA: &str = "network_policies: {}\n";
 
     fn decision(policy_generation: u64) -> EgressDecision {
         EgressDecision {
+            binary_match_paths: Vec::default(),
+
             intent: EgressIntent::connect("example.com".to_string(), 80),
             action: NetworkAction::Allow {
                 matched_policy: Some("test".to_string()),
@@ -387,7 +351,6 @@ mod tests {
             binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
-            binary_match_paths: Vec::new(),
         }
     }
 
@@ -413,113 +376,99 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "windows")]
+    async fn assert_response_lifecycle<C, P>(mut caller: C, mut client: P)
+    where
+        C: AsyncRead + AsyncWrite + Unpin,
+        P: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut upstream, mut server) = tokio::io::duplex(1024);
+        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let decision = decision(engine.current_generation());
+        let request = request_context();
+        let context = prepare_http_relay(None, &engine, &decision, &request).unwrap();
+        let persistent = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        // Larger than either transport buffer: closing must drain the body.
+        let body = vec![b'x'; 64 * 1024];
+        let mut closing = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        closing.extend_from_slice(&body);
+        let relay = Box::pin(relay_http_stream(&mut client, &mut upstream, context));
+        let serve = async {
+            for response in [persistent.as_slice(), closing.as_slice()] {
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(server.read_u8().await.unwrap());
+                    assert!(request.len() < 4096);
+                }
+                assert!(request.starts_with(b"GET / HTTP/1.1\r\n"));
+                server.write_all(response).await.unwrap();
+                server.flush().await.unwrap();
+            }
+            // Retain the upstream socket: response headers decide persistence.
+        };
+        let receive = async {
+            let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+            caller.write_all(request).await.unwrap();
+            caller.flush().await.unwrap();
+            let mut first = vec![0; persistent.len()];
+            caller.read_exact(&mut first).await.unwrap();
+            assert_eq!(first, persistent);
+            // A real second exchange verifies reuse, without a timing assertion.
+            caller.write_all(request).await.unwrap();
+            caller.flush().await.unwrap();
+            let mut second = Vec::new();
+            // TLS must return clean EOF, not UnexpectedEof from a dropped socket.
+            caller.read_to_end(&mut second).await.unwrap();
+            assert_eq!(second, closing);
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (result, (), ()) = tokio::join!(relay, serve, receive);
+            result.unwrap();
+        })
+        .await
+        .expect("response delivery and EOF must not await another request");
+    }
+
     #[tokio::test]
-    async fn inspected_http_relay_matches_mixed_case_windows_binary_path() {
-        let (mut caller, mut relay_client) = tokio::io::duplex(4096);
-        let (mut relay_upstream, mut server) = tokio::io::duplex(4096);
-        let relay = tokio::spawn(async move {
-            let engine = OpaEngine::from_strings(
-                POLICY_REGO,
-                r"
-network_policies:
-  windows_binary:
-    endpoints:
-      - host: example.com
-        port: 80
-        protocol: rest
-        access: full
-    binaries:
-      - path: 'C:\WINDOWS\SYSTEM32\CURL.EXE'
-",
-            )
-            .expect("load Windows L7 policy");
-            let input = NetworkInput {
-                host: "example.com".to_string(),
-                port: 80,
-                binary_path: PathBuf::from("c:/windows/system32/curl.exe"),
-                binary_sha256: "unused".to_string(),
-                ancestors: Vec::new(),
-                cmdline_paths: Vec::new(),
-            };
-            let authorization = engine.authorize_egress(&input).expect("authorize egress");
-            assert!(matches!(authorization.action, NetworkAction::Allow { .. }));
-            let decision = EgressDecision {
-                intent: EgressIntent::connect("example.com".to_string(), 80),
-                action: authorization.action.clone(),
-                policy_generation: authorization.generation,
-                identity: ProcessIdentityEvidence::Available,
-                endpoint: EndpointDecision::from_authorization(&authorization),
-                binary: Some(input.binary_path),
-                binary_pid: None,
-                ancestors: Vec::new(),
-                cmdline_paths: Vec::new(),
-                binary_match_paths: authorization.binary_match_paths.clone(),
-            };
-            let route = query_l7_route_snapshot(&decision, "example.com", 80)
-                .expect("REST endpoint should produce an inspected route");
-            let mut request = http_context(
-                &decision,
-                None,
-                None,
-                None,
-                openshell_core::proposals::AgentProposals::default(),
-                String::new(),
-                RelaySignals {
-                    activity: None,
-                    endpoint_observation: None,
-                },
-            );
-            request.request_default_port = Some(80);
-            let context = prepare_http_relay(
-                Some(&route),
-                &engine,
-                &decision,
-                &request,
-                openshell_ocsf::ctx::ctx(),
-            )
-            .expect("current policy generation should prepare the relay");
-            relay_http_stream(&mut relay_client, &mut relay_upstream, context).await
-        });
+    async fn http_relay_reuses_then_closes_after_complete_response() {
+        let (caller, client) = tokio::io::duplex(1024);
+        assert_response_lifecycle(caller, client).await;
+    }
 
-        caller
-            .write_all(b"GET /v1 HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
-            .await
-            .expect("write client request");
-        let mut forwarded = [0_u8; 512];
-        let forwarded_len = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            server.read(&mut forwarded),
-        )
-        .await
-        .expect("request should reach upstream")
-        .expect("read relayed request");
-        assert!(
-            forwarded[..forwarded_len].starts_with(b"GET /v1 HTTP/1.1\r\n"),
-            "unexpected upstream request: {:?}",
-            String::from_utf8_lossy(&forwarded[..forwarded_len])
+    #[tokio::test]
+    async fn tls_http_relay_reuses_then_sends_close_notify_after_complete_response() {
+        use crate::l7::tls::{CertCache, ProxyTlsState, SandboxCa, tls_terminate_client};
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let ca = SandboxCa::generate().unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut ca.cert_pem().as_bytes()) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
         );
-        server
-            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .await
-            .expect("write upstream response");
-
-        let mut response = [0_u8; 512];
-        let response_len = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            caller.read(&mut response),
-        )
+        let state = ProxyTlsState::new(CertCache::new(ca), config.clone());
+        let connector = tokio_rustls::TlsConnector::from(config);
+        let (caller, client) = tokio::io::duplex(1024);
+        let (caller, client) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                connector.connect(
+                    rustls::pki_types::ServerName::try_from("example.com").unwrap(),
+                    caller
+                ),
+                tls_terminate_client(client, &state, "example.com"),
+            )
+        })
         .await
-        .expect("response should reach client")
-        .expect("read relay response");
-        assert!(response[..response_len].starts_with(b"HTTP/1.1 204 No Content"));
-        drop(caller);
-        drop(server);
-        tokio::time::timeout(std::time::Duration::from_secs(2), relay)
-            .await
-            .expect("HTTP relay should complete")
-            .expect("relay task should not panic")
-            .expect("HTTP relay should allow the normalized binary path");
+        .expect("TLS handshake must complete");
+        assert_response_lifecycle(caller.unwrap(), client.unwrap()).await;
     }
 
     #[test]
@@ -528,14 +477,8 @@ network_policies:
         let decision = decision(engine.current_generation());
         let request = request_context();
 
-        let context = prepare_http_relay(
-            None,
-            &engine,
-            &decision,
-            &request,
-            openshell_ocsf::ctx::ctx(),
-        )
-        .expect("current L4 generation should prepare a relay");
+        let context = prepare_http_relay(None, &engine, &decision, &request)
+            .expect("current L4 generation should prepare a relay");
         let PreparedHttpPolicy::Passthrough { generation_guard } = context.policy else {
             panic!("route-less relay should use a generation guard");
         };
@@ -557,14 +500,7 @@ network_policies:
         let request = request_context();
 
         assert!(
-            prepare_http_relay(
-                Some(&route),
-                &engine,
-                &decision,
-                &request,
-                openshell_ocsf::ctx::ctx(),
-            )
-            .is_none(),
+            prepare_http_relay(Some(&route), &engine, &decision, &request).is_none(),
             "a current L7 lookup must not freshen a stale L4 allow"
         );
     }
@@ -602,14 +538,7 @@ network_policies:
         let request = request_context();
 
         assert!(
-            prepare_http_relay(
-                Some(&route),
-                &engine,
-                &decision,
-                &request,
-                openshell_ocsf::ctx::ctx(),
-            )
-            .is_none(),
+            prepare_http_relay(Some(&route), &engine, &decision, &request).is_none(),
             "an inspected route must use the generation that authorized CONNECT"
         );
     }
@@ -624,8 +553,7 @@ network_policies:
         };
 
         assert!(
-            prepare_raw_relay(Some(&route), &engine, &decision, openshell_ocsf::ctx::ctx(),)
-                .is_none(),
+            prepare_raw_relay(Some(&route), &engine, &decision).is_none(),
             "a raw relay must not freshen a stale L4 allow"
         );
     }
@@ -638,14 +566,7 @@ network_policies:
         engine.reload(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
 
         assert!(
-            prepare_http_relay(
-                None,
-                &engine,
-                &decision,
-                &request,
-                openshell_ocsf::ctx::ctx(),
-            )
-            .is_none(),
+            prepare_http_relay(None, &engine, &decision, &request).is_none(),
             "policy reload must prevent a stale relay from starting"
         );
     }
@@ -661,14 +582,7 @@ network_policies:
         let (_upstream_peer, mut proxy_upstream) = tokio::io::duplex(64);
 
         let relay = tokio::spawn(async move {
-            relay_tcp(
-                &mut proxy_client,
-                &mut proxy_upstream,
-                &guard,
-                &request,
-                openshell_ocsf::ctx::ctx(),
-            )
-            .await
+            relay_tcp(&mut proxy_client, &mut proxy_upstream, &guard, &request).await
         });
         tokio::task::yield_now().await;
 

@@ -13,6 +13,7 @@ repository.workspace = true
 [dependencies]
 async-trait = "0.1"
 openshell-extension-core = { path = "../openshell-extension-core" }
+openshell-policy-schema = { path = "../openshell-policy-schema" }
 glob = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
@@ -28,14 +29,17 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true }
 ipnet = "2"
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 base64 = { workspace = true }
+jsonwebtoken = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 reqwest = { workspace = true, features = ["blocking", "rustls-tls-native-roots-no-provider"], optional = true }
 tar = { version = "0.4", optional = true }
-tempfile = { version = "3", optional = true }
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
@@ -49,10 +53,12 @@ default = ["telemetry"]
 ## Compile in anonymous telemetry emission support. On by default; disable with
 ## `--no-default-features` (plus any other features you need) for a build that
 ## contains no telemetry endpoint, no HTTP client, and no emission code at all.
-driver-extraction = ["dep:tar", "dep:tempfile"]
+driver-extraction = ["dep:tar"]
 telemetry = ["dep:reqwest", "dep:chrono", "reqwest?/blocking"]
 ## OAuth2 token request helpers used by supervisor and gateway.
 oauth = ["dep:reqwest"]
+## Strict Ed25519 JWT issuance and verification for authenticated sandbox sessions.
+jwt = ["dep:jsonwebtoken", "dep:zeroize"]
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }

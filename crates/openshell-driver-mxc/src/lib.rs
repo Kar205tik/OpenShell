@@ -3,24 +3,17 @@
 
 //! `OpenShell` MXC compute driver.
 //!
-//! Implements the gateway's `ComputeDriver` gRPC contract backed by Microsoft
-//! MXC (`wxc-exec`) on Windows. The driver is **in-process**, runs the agent
-//! directly (exec-in-driver), and self-reports `Ready` — there is no
-//! in-sandbox supervisor, no host-side surrogate, and no `ConnectSupervisor`
-//! relay.
-//!
-//! This crate compiles to an **empty stub** on non-Windows targets so the
-//! Linux build stays green. All implementation code is gated on
-//! `#[cfg(target_os = "windows")]`.
+//! Provisions MXC boundaries and standard host supervisors. Native isolation,
+//! process control and ingress live in `openshell-mxc-isolation-backend`.
 
 #![allow(clippy::result_large_err)]
 
 #[cfg(target_os = "windows")]
-mod control_channel;
-#[cfg(target_os = "windows")]
 mod driver;
 #[cfg(target_os = "windows")]
 mod grpc;
+#[cfg(target_os = "windows")]
+mod isolation;
 #[cfg(target_os = "windows")]
 mod mxc;
 #[cfg(target_os = "windows")]
@@ -34,17 +27,11 @@ mod policy_map;
 // Windows-only.
 #[cfg(target_os = "windows")]
 mod etw_consumer;
-#[cfg(target_os = "windows")]
-mod relay;
 
 #[cfg(target_os = "windows")]
-pub use driver::{
-    ForwardSink, MxcBackend, MxcComputeBackend, MxcComputeConfig, OpenDynamicForwardError,
-};
+pub use driver::{MxcBackend, MxcComputeBackend, MxcComputeConfig};
 #[cfg(target_os = "windows")]
 pub use grpc::ComputeDriverService;
-#[cfg(target_os = "windows")]
-pub use relay::RelayHandle;
 // Re-export the embedded mapper API so the windows-only example and integration
 // test can reach it without making `policy_map` a public module.
 #[cfg(target_os = "windows")]
@@ -55,3 +42,13 @@ pub use policy_map::{
     LossItem, MxcMappingOptions, MxcMappingResult, OPEN_SHELL_SUPERSET_GAPS, SplitPolicyResult,
     build_loss_report, map_to_mxc, render_readme, split_policy,
 };
+
+#[cfg(windows)]
+mod audit;
+#[cfg(windows)]
+pub use audit::audit_log_directory;
+
+#[cfg(windows)]
+mod integration;
+#[cfg(windows)]
+pub use integration::MxcIntegration;

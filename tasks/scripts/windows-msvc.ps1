@@ -50,7 +50,7 @@ if (-not [int]::TryParse($BuildJobsValue, [ref] $WindowsBuildJobs) -or $WindowsB
 }
 $WindowsCargoMutex = [System.Threading.Mutex]::new($false, "Local\OpenShellWindowsMsvcCargo")
 
-$UnsupportedDriverPackageExcludes = "--exclude openshell-driver-docker --exclude openshell-driver-kubernetes --exclude openshell-driver-kubernetes-secrets --exclude openshell-driver-podman --exclude openshell-driver-vault --exclude openshell-driver-vm --exclude openshell-sandbox --exclude openshell-supervisor-process --exclude openshell-vfio"
+$UnsupportedDriverPackageExcludes = "--exclude openshell-driver-docker --exclude openshell-driver-kubernetes --exclude openshell-driver-kubernetes-secrets --exclude openshell-driver-podman --exclude openshell-driver-vault --exclude openshell-driver-vm --exclude openshell-sandbox --exclude openshell-vfio"
 $WindowsClippyPackageExcludes = $UnsupportedDriverPackageExcludes
 $WindowsClippyLintArgs = "-D warnings -A dead-code -A unused-imports -A clippy::unused-async"
 $PrebuiltZ3WorkspaceFeatures = "--features openshell-prover/prebuilt-z3"
@@ -389,7 +389,6 @@ function Configure-Z3 {
     return [pscustomobject]@{
         WorkspaceFeatures = ""
         ServerFeatures = ""
-        GatewayFeatures = ""
     }
 }
 
@@ -516,7 +515,7 @@ function Invoke-Lint([string] $RustTarget) {
 function Invoke-Build([string] $RustTarget) {
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo build --release --target $RustTarget --bin openshell-gateway --bin openshell --bin openshell-supervisor-relay $Z3GatewayFeatures" `
+        -CargoArgs "cargo build --release --target $RustTarget --bin openshell-gateway --bin openshell --bin openshell-supervisor --bin openshell-mxc-isolation-backend --bin openshell-supervisor-relay $Z3GatewayFeatures" `
         -LogName "build-$RustTarget-release.log"
 
     $z3Runtime = if ([string]::IsNullOrWhiteSpace($env:Z3_LIBRARY_PATH_OVERRIDE)) {
@@ -569,7 +568,7 @@ function Invoke-UnsupportedContractTests([string] $RustTarget) {
     foreach ($test in $tests) {
         Invoke-VsCargo `
             -RustTarget $RustTarget `
-            -CargoArgs "cargo test -p openshell-gateway --target $RustTarget $test $Z3GatewayFeatures" `
+            -CargoArgs "cargo test -p openshell-driver-registry --target $RustTarget $test --features openshell-driver-registry/prebuilt-z3" `
             -LogName "test-$RustTarget-unsupported-$test.log"
     }
 
@@ -578,7 +577,7 @@ function Invoke-UnsupportedContractTests([string] $RustTarget) {
         $variant = if ($features) { $features.Replace(",", "-") } else { "protocol-only" }
         Invoke-VsCargo `
             -RustTarget $RustTarget `
-            -CargoArgs "cargo test -p openshell-gateway --lib --target $RustTarget --no-default-features $featureArgs $Z3GatewayFeatures" `
+            -CargoArgs "cargo test -p openshell-driver-registry --lib --target $RustTarget --no-default-features $featureArgs --features openshell-driver-registry/prebuilt-z3" `
             -LogName "test-$RustTarget-selective-$variant.log"
     }
 }
@@ -651,7 +650,7 @@ function Get-Sha256([string] $Path) {
 function Show-Artifacts([string[]] $RustTargets) {
     $rows = @()
     foreach ($rustTarget in $RustTargets) {
-        foreach ($binary in @("openshell-gateway.exe", "openshell.exe", "openshell-supervisor-relay.exe", "libz3.dll")) {
+        foreach ($binary in @("openshell-gateway.exe", "openshell.exe", "openshell-supervisor.exe", "openshell-mxc-isolation-backend.exe", "openshell-supervisor-relay.exe", "libz3.dll")) {
             $path = Join-Path $TargetDir "$rustTarget\release\$binary"
             if (-not (Test-Path $path)) {
                 continue
@@ -688,7 +687,6 @@ if ($Action -in @("check", "lint", "build", "test", "test-precommit", "test-unsu
     $z3Features = Configure-Z3
     $Z3WorkspaceFeatures = $z3Features.WorkspaceFeatures
     $Z3ServerFeatures = $z3Features.ServerFeatures
-    $Z3GatewayFeatures = $z3Features.GatewayFeatures
     $env:LIBCLANG_PATH = Resolve-LibclangPath
     Add-PathEntry $env:LIBCLANG_PATH
     Write-Host "==> LIBCLANG_PATH=$env:LIBCLANG_PATH"

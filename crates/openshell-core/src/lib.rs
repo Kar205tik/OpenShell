@@ -20,6 +20,7 @@ pub mod dynamic_string_allowlist;
 pub mod endpoint_path;
 pub mod endpoint_status;
 pub mod error;
+pub mod extension_protocol;
 #[cfg(unix)]
 pub mod external_driver_socket;
 pub mod forward;
@@ -44,8 +45,11 @@ pub mod proposals;
 pub mod proto;
 pub mod proto_struct;
 pub mod provider_credentials;
+pub mod resource_admission;
 pub mod rpc_error;
 pub mod sandbox_env;
+pub mod sandbox_generation;
+pub mod sandbox_session;
 pub mod secrets;
 pub mod settings;
 pub mod shell;
@@ -66,6 +70,7 @@ pub use error::{ComputeDriverError, Error, Result};
 pub use metadata::{
     GetResourceVersion, ObjectId, ObjectLabels, ObjectName, ObjectWorkspace, SetResourceVersion,
 };
+pub use sandbox_session::{SandboxSessionId, SandboxSessionIdError};
 
 /// Build version string derived from git metadata.
 ///
@@ -88,3 +93,21 @@ mod build_version;
 /// Used by tests in `openshell-server` to enumerate every RPC and verify that
 /// each one has an `#[rpc_auth(...)]` declaration on its handler.
 pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(env!("OPENSHELL_DESCRIPTOR_PATH"));
+
+/// Platform-neutral local control channels.
+pub mod local_transport;
+
+/// Platform support used by service runtimes.
+pub mod runtime_platform;
+
+/// Native command-line startup and browser integration.
+pub mod cli_platform;
+
+/// Platform path identity and matching support.
+pub mod path_identity;
+
+/// Embedded compute-driver composition contracts.
+pub mod driver_integration;
+
+/// Owned streams supplied by compute drivers.
+pub mod driver_runtime;

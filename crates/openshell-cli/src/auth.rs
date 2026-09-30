@@ -176,38 +176,7 @@ pub async fn browser_auth_flow(gateway_endpoint: &str) -> Result<String> {
 }
 
 /// Open a URL in the default browser.
-pub fn open_browser_url(url: &str) -> std::result::Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(url)
-            .spawn()
-            .map_err(|e| format!("failed to run `open`: {e}"))?;
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(url)
-            .spawn()
-            .map_err(|e| format!("failed to run `xdg-open`: {e}"))?;
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", url])
-            .spawn()
-            .map_err(|e| format!("failed to open browser: {e}"))?;
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        return Err("unsupported platform for browser opening".to_string());
-    }
-
-    Ok(())
-}
+pub(crate) use openshell_core::cli_platform::open_browser_url;
 
 /// Extract the origin (scheme + host) from a gateway endpoint URL.
 ///

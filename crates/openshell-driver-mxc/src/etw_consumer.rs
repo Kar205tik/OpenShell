@@ -2075,6 +2075,7 @@ fn gateway_hostname() -> &'static str {
 /// one gateway process hosts many sandboxes — wrinkle #1).
 fn etw_ctx(sandbox_id: &str, sandbox_name: &str) -> EventContext {
     EventContext {
+        origin: openshell_ocsf::EventOrigin::Supervisor,
         sandbox_id: sandbox_id.to_string(),
         sandbox_name: sandbox_name.to_string(),
         container_image: "mxc/appcontainer".to_string(),

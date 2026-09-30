@@ -22,6 +22,7 @@ use tracing::{debug, info};
 pub const MXC_SCHEMA_VERSION: &str = "0.8.0-alpha";
 
 /// Default `configurationId` for isolation session. Never use `"small"` (known OS bug).
+#[cfg(test)]
 pub const DEFAULT_CONFIGURATION_ID: &str = "composable";
 
 /// Environment flag selecting the in-process mock `wxc-exec` shim. When set to
@@ -221,9 +222,9 @@ fn network_json(network: &MxcNetwork) -> serde_json::Value {
     } else {
         serde_json::json!({ "egress": { "default": egress_default } })
     };
-    if network.proxy.is_none() && network.allow_local_network {
-        value["ingress"] = serde_json::json!({ "default": "allow", "hostLoopback": "allow" });
-    }
+    // The host supervisor always connects to the native Sandbox Protocol listener.
+    // This control-plane ingress is required even without a workload egress proxy.
+    value["ingress"] = serde_json::json!({ "default": "allow", "hostLoopback": "allow" });
     value
 }
 
@@ -421,6 +422,9 @@ pub struct WxcExecInvoker {
 }
 
 impl WxcExecInvoker {
+    pub(crate) fn is_mock(&self) -> bool {
+        self.mock
+    }
     pub fn new(exec_path: impl Into<PathBuf>, debug: bool) -> Self {
         Self {
             exec_path: exec_path.into(),
@@ -634,6 +638,7 @@ impl WxcExecInvoker {
             // required. Without this, pc_relay_spawner_path's control channel
             // (and therefore dynamic `openshell forward service`) silently
             // has nothing to attach to on this backend.
+            .kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -789,6 +794,7 @@ impl WxcExecInvoker {
             // channel into the AppContainer with no network capability
             // required at all -- see openshell-supervisor-relay's stdin/stdout
             // JSON control protocol.
+            .kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
