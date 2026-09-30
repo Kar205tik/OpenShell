@@ -107,7 +107,6 @@ enum SandboxUploadPlan {
         files: Vec<String>,
     },
     Regular,
-    GitFilteredEmpty,
 }
 
 enum ProgressOutput {
@@ -1055,29 +1054,18 @@ pub async fn sandbox_create(
                     );
                 }
                 let local = Path::new(local_path);
-                match sandbox_upload_plan(local, *git_ignore)? {
+                let upload_plan = sandbox_upload_plan(local, *git_ignore).wrap_err_with(|| {
+                    format!(
+                        "Sandbox '{sandbox_name}' was created and still exists.\nRetry the upload with 'openshell sandbox upload', or remove the sandbox with 'openshell sandbox delete'",
+                    )
+                })?;
+                match upload_plan {
                     SandboxUploadPlan::GitAware { base_dir, files } => {
                         sandbox_sync_up_files(
                             &effective_server,
                             &sandbox_name,
                             &base_dir,
                             &files,
-                            local,
-                            dest,
-                            &effective_tls,
-                            workspace,
-                        )
-                        .await?;
-                    }
-                    SandboxUploadPlan::GitFilteredEmpty => {
-                        eprintln!(
-                            "  {} .gitignore filtering excluded all files in {}; uploading unfiltered",
-                            "⚠".yellow().bold(),
-                            local.display(),
-                        );
-                        sandbox_sync_up(
-                            &effective_server,
-                            &sandbox_name,
                             local,
                             dest,
                             &effective_tls,
@@ -4614,20 +4602,12 @@ pub fn git_repo_root(local_path: &Path) -> Result<PathBuf> {
 }
 
 pub fn git_sync_files(local_path: &Path) -> Result<(PathBuf, Vec<String>)> {
-    let repo_root = std::fs::canonicalize(git_repo_root(local_path)?)
-        .into_diagnostic()
-        .wrap_err("failed to canonicalize git repository root")?;
-    let local_path = if local_path.is_absolute() {
-        local_path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .into_diagnostic()
-            .wrap_err("failed to resolve current directory")?
-            .join(local_path)
-    };
     let local_path = std::fs::canonicalize(local_path)
         .into_diagnostic()
         .wrap_err("failed to canonicalize local upload path")?;
+    let repo_root = std::fs::canonicalize(git_repo_root(&local_path)?)
+        .into_diagnostic()
+        .wrap_err("failed to canonicalize git repository root")?;
     let relative_path = local_path
         .strip_prefix(&repo_root)
         .into_diagnostic()
@@ -4713,17 +4693,24 @@ fn sandbox_upload_plan(local_path: &Path, git_ignore: bool) -> Result<SandboxUpl
         }
     })?;
 
-    if git_ignore
-        && !metadata.file_type().is_symlink()
-        && let Ok((base_dir, files)) = git_sync_files(local_path)
-    {
-        if files.is_empty() {
-            return Ok(SandboxUploadPlan::GitFilteredEmpty);
-        }
-        return Ok(SandboxUploadPlan::GitAware { base_dir, files });
+    if !git_ignore || metadata.file_type().is_symlink() {
+        return Ok(SandboxUploadPlan::Regular);
     }
 
-    Ok(SandboxUploadPlan::Regular)
+    let (base_dir, files) = git_sync_files(local_path).wrap_err_with(|| {
+        format!(
+            "Git filtering failed for {}; upload stopped.\nUse --no-git-ignore to upload intentionally without filtering",
+            local_path.display(),
+        )
+    })?;
+    if files.is_empty() {
+        return Err(miette::miette!(
+            "Git filtering selected no files for {}; upload stopped.\nGit returned 0 uploadable paths: the source may be empty or all files may be ignored.\nUse --no-git-ignore to upload intentionally without filtering",
+            local_path.display(),
+        ));
+    }
+
+    Ok(SandboxUploadPlan::GitAware { base_dir, files })
 }
 
 /// Upload a local path to a sandbox.
@@ -4760,14 +4747,6 @@ pub async fn sandbox_upload(
                 workspace,
             )
             .await?;
-        }
-        SandboxUploadPlan::GitFilteredEmpty => {
-            eprintln!(
-                "{} .gitignore filtering excluded all files in {}; uploading unfiltered",
-                "⚠".yellow().bold(),
-                local_path.display(),
-            );
-            sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace).await?;
         }
         SandboxUploadPlan::Regular => {
             sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace).await?;
@@ -7579,7 +7558,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_upload_plan_falls_back_when_all_files_gitignored() {
+    fn sandbox_upload_plan_rejects_empty_filtered_selections() {
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         let repo = tmpdir.path().join("repo");
         fs::create_dir_all(repo.join("runs")).expect("create repo");
@@ -7587,13 +7566,61 @@ mod tests {
         fs::write(repo.join(".gitignore"), "runs/\n").expect("write .gitignore");
         fs::write(repo.join("runs/test.json"), r#"{"key":"value"}"#).expect("write test.json");
 
-        let plan =
-            sandbox_upload_plan(&repo.join("runs"), true).expect("upload plan should succeed");
+        fs::create_dir(repo.join("empty")).expect("create empty directory");
+
+        for path in [
+            repo.join("runs"),
+            repo.join("runs/test.json"),
+            repo.join("empty"),
+        ] {
+            let err =
+                sandbox_upload_plan(&path, true).expect_err("empty selection must stop upload");
+            let message = err.to_string();
+            assert!(message.contains("filtering selected no files"), "{message}");
+            assert!(
+                message.contains("Git returned 0 uploadable paths"),
+                "{message}"
+            );
+            assert!(message.contains("--no-git-ignore"), "{message}");
+            assert_eq!(
+                sandbox_upload_plan(&path, false).expect("explicit unfiltered upload"),
+                super::SandboxUploadPlan::Regular,
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_upload_plan_requires_override_outside_git_repository() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        fs::write(tmpdir.path().join("file.txt"), "hello").expect("write file");
+
+        let err = sandbox_upload_plan(tmpdir.path(), true).expect_err("not a Git repository");
+        let message = format!("{err:?}");
+        assert!(message.contains("Git filtering failed"), "{message}");
+        assert!(message.contains("git rev-parse"), "{message}");
+        assert!(err.to_string().contains("--no-git-ignore"), "{message}");
+        assert_eq!(
+            sandbox_upload_plan(tmpdir.path(), false).expect("explicit unfiltered upload"),
+            super::SandboxUploadPlan::Regular,
+        );
+    }
+
+    #[test]
+    fn sandbox_upload_plan_selects_only_unignored_files() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let repo = tmpdir.path();
+        init_git_repo(repo);
+        fs::write(repo.join(".gitignore"), "*.log\n").expect("write .gitignore");
+        fs::create_dir(repo.join("files")).expect("create files directory");
+        fs::write(repo.join("files/keep.txt"), "keep").expect("write included file");
+        fs::write(repo.join("files/skip.log"), "skip").expect("write ignored file");
 
         assert_eq!(
-            plan,
-            super::SandboxUploadPlan::GitFilteredEmpty,
-            "gitignored directory should fall back with GitFilteredEmpty"
+            sandbox_upload_plan(&repo.join("files"), true).expect("filtered upload"),
+            super::SandboxUploadPlan::GitAware {
+                base_dir: fs::canonicalize(repo.join("files")).expect("canonical path"),
+                files: vec!["keep.txt".to_string()],
+            },
         );
     }
 
