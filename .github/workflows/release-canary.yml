@@ -25,6 +25,11 @@ jobs:
     runs-on: macos-latest-xlarge
     timeout-minutes: 20
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
       - name: Ensure VM driver
         run: |
           launchctl setenv OPENSHELL_COMPUTE_DRIVER vm
@@ -36,6 +41,11 @@ jobs:
           curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
           openshell --version
           openshell status
+
+      - name: Verify installed VM driver
+        run: |
+          bash tasks/scripts/verify-macos-vm-driver.sh "$(brew --prefix openshell)/libexec/openshell-driver-vm"
+          "$(brew --prefix openshell)/libexec/openshell-driver-vm" --version
 
       # GitHub-hosted macOS runners do not expose the Hypervisor.framework
       # support libkrun needs. Sandbox launch is covered by the VM E2E lane.
