@@ -1148,8 +1148,85 @@ async fn reconcile_pending_chunks_after_policy_change(
         .await
         .map_err(|error| Status::internal(format!("fetch latest policy failed: {error}")))?
         .map_or(0, |record| record.version);
-    reconcile_pending_chunks_covered_by_policy(state, sandbox.object_id(), &effective, version)
+    let reconciled =
+        reconcile_pending_chunks_covered_by_policy(state, sandbox.object_id(), &effective, version)
+            .await?;
+    refresh_pending_chunk_evaluations(state, workspace, sandbox).await?;
+    Ok(reconciled)
+}
+
+/// Re-evaluate every still-pending chunk against the live policy inputs and
+/// persist the result, so the review surface (`GetDraftPolicy`) shows the
+/// prover result and review token an approval will be checked against.
+///
+/// Without this, a policy change leaves other pending chunks carrying the
+/// evaluation from before the change, and the refresh only happens inside
+/// the next approval, which then fails with "proposal inputs changed".
+/// Approval still rejects a token that does not match the stored one, so a
+/// reviewer holding an evaluation from before the refresh must refetch.
+async fn refresh_pending_chunk_evaluations(
+    state: &Arc<ServerState>,
+    workspace: &str,
+    sandbox: &Sandbox,
+) -> Result<u32, Status> {
+    let pending = state
+        .store
+        .list_draft_chunks(sandbox.object_id(), Some("pending"))
         .await
+        .map_err(|error| Status::internal(format!("list pending chunks failed: {error}")))?;
+    let mut refreshed = 0;
+    for chunk in pending {
+        match refresh_pending_chunk_evaluation(state, workspace, sandbox, &chunk).await {
+            Ok(true) => refreshed += 1,
+            Ok(false) => {}
+            Err(error) => warn!(
+                sandbox_id = %sandbox.object_id(),
+                chunk_id = %chunk.id,
+                error = %error.message(),
+                "failed to refresh pending proposal evaluation after policy change"
+            ),
+        }
+    }
+    Ok(refreshed)
+}
+
+/// Refresh pending proposals after a policy change whose own result must not
+/// depend on the refresh. Failures are logged; the next approval still
+/// re-checks the proposal against live inputs.
+async fn refresh_pending_chunk_evaluations_best_effort(
+    state: &Arc<ServerState>,
+    workspace: &str,
+    sandbox: &Sandbox,
+) {
+    if let Err(error) = refresh_pending_chunk_evaluations(state, workspace, sandbox).await {
+        warn!(
+            sandbox_id = %sandbox.object_id(),
+            error = %error,
+            "failed to refresh pending policy proposals after policy change"
+        );
+    }
+}
+
+async fn refresh_pending_chunk_evaluation(
+    state: &Arc<ServerState>,
+    workspace: &str,
+    sandbox: &Sandbox,
+    chunk: &DraftChunkRecord,
+) -> Result<bool, Status> {
+    // Reuse the cached prover result to compute the live token cheaply; run
+    // the prover again only when the inputs behind the token changed.
+    let reuse = (!chunk.review_token.is_empty()).then_some(chunk.validation_result.as_str());
+    let live =
+        evaluate_stored_chunk_against_live_inputs(state, workspace, sandbox, chunk, reuse).await?;
+    let evaluation = if reuse.is_none() || live.review_token != chunk.review_token {
+        evaluate_stored_chunk_against_live_inputs(state, workspace, sandbox, chunk, None).await?
+    } else if live.application_error != chunk.application_error {
+        live
+    } else {
+        return Ok(false);
+    };
+    persist_refreshed_evaluation(state, chunk, &evaluation).await?;
+    Ok(true)
 }
 
 /// Auto-reject any pending chunks for the same sandbox that share the
@@ -3957,6 +4034,7 @@ async fn handle_update_config_inner(
             operation_count = merge_ops.len(),
             "UpdateConfig: merged incremental policy operations"
         );
+        refresh_pending_chunk_evaluations_best_effort(state, &workspace, &sandbox).await;
         emit_config_update_policy_success(sandbox_caller);
 
         return Ok(update_config_response(
@@ -4188,6 +4266,7 @@ async fn handle_update_config_inner(
         policy_hash = %hash,
         "UpdateConfig: new policy version persisted"
     );
+    refresh_pending_chunk_evaluations_best_effort(state, &workspace, &sandbox).await;
     emit_full_policy_update_success(sandbox_caller, next_version);
 
     Ok(update_config_response(
@@ -5552,6 +5631,9 @@ async fn handle_reject_draft_chunk_inner(
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
     state.sandbox_watch_bus.notify(&sandbox_id);
+    if was_approved {
+        refresh_pending_chunk_evaluations_best_effort(state, &workspace, &sandbox).await;
+    }
     emit_policy_decision_success(PolicyDecisionOperation::Reject, 1);
 
     Ok(Response::new(RejectDraftChunkResponse {}))
@@ -6018,6 +6100,7 @@ async fn handle_undo_draft_chunk_inner(
         policy_hash = %hash,
         "UndoDraftChunk: rule removed, chunk reverted to pending"
     );
+    refresh_pending_chunk_evaluations_best_effort(state, &workspace, &sandbox).await;
     emit_sandbox_policy_update_success();
     emit_policy_decision_success(PolicyDecisionOperation::Undo, 1);
 
@@ -16466,6 +16549,132 @@ mod tests {
                 .unwrap()
                 .policy_hash,
             changed_hash
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_refreshes_other_pending_proposals_for_sequential_review() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
+
+        let state = test_server_state().await;
+        let sandbox_id = "sb-sequential-approve";
+        let sandbox_name = "sequential-approve";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let submit = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: sandbox_name.to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: [("alpha", "alpha.example.com"), ("beta", "beta.example.com")]
+                    .into_iter()
+                    .map(|(name, host)| PolicyChunk {
+                        rule_name: name.to_string(),
+                        proposed_rule: Some(NetworkPolicyRule {
+                            name: name.to_string(),
+                            endpoints: vec![NetworkEndpoint {
+                                host: host.to_string(),
+                                port: 443,
+                                ..Default::default()
+                            }],
+                            binaries: vec![NetworkBinary {
+                                path: "/usr/bin/curl".to_string(),
+                            }],
+                        }),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(submit.accepted_chunk_ids.len(), 2);
+        let (alpha_id, beta_id) = (&submit.accepted_chunk_ids[0], &submit.accepted_chunk_ids[1]);
+
+        let draft_chunk = |chunk_id: String| {
+            let state = state.clone();
+            async move {
+                handle_get_draft_policy(
+                    &state,
+                    with_user(Request::new(GetDraftPolicyRequest {
+                        sandbox: sandbox_name.to_string(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector(
+                            "default".to_string(),
+                        )),
+                        status_filter: "pending".to_string(),
+                    })),
+                )
+                .await
+                .unwrap()
+                .into_inner()
+                .chunks
+                .into_iter()
+                .find(|chunk| chunk.id == chunk_id)
+                .expect("pending chunk")
+            }
+        };
+        let approve = |chunk_id: String, review_token: String| {
+            let state = state.clone();
+            async move {
+                handle_approve_draft_chunk(
+                    &state,
+                    with_user(Request::new(ApproveDraftChunkRequest {
+                        request_id: String::new(),
+                        sandbox: sandbox_name.to_string(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector(
+                            "default".to_string(),
+                        )),
+                        chunk_id,
+                        review_token,
+                    })),
+                )
+                .await
+            }
+        };
+
+        let alpha = draft_chunk(alpha_id.clone()).await;
+        let beta_before = draft_chunk(beta_id.clone()).await;
+        approve(alpha_id.clone(), alpha.review_token)
+            .await
+            .expect("first approval");
+
+        // Approving alpha changed the policy beta was evaluated against. The
+        // review surface must now show beta's refreshed evaluation.
+        let beta_after = draft_chunk(beta_id.clone()).await;
+        assert_ne!(beta_after.review_token, beta_before.review_token);
+
+        // A reviewer still holding the pre-approval evaluation must refetch.
+        let outdated = approve(beta_id.clone(), beta_before.review_token)
+            .await
+            .expect_err("pre-refresh token must not approve");
+        assert_eq!(outdated.code(), Code::FailedPrecondition);
+        assert!(outdated.message().contains("refetch and review again"));
+
+        // Approving the evaluation the review surface shows succeeds first time.
+        approve(beta_id.clone(), beta_after.review_token)
+            .await
+            .expect("approval of the refreshed evaluation");
+        assert_eq!(
+            state
+                .store
+                .get_draft_chunk(beta_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "approved"
         );
     }
 

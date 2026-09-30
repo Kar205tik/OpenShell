@@ -6249,7 +6249,7 @@ pub async fn sandbox_draft_approve(
             review_token,
         })
         .await
-        .into_diagnostic()?;
+        .map_err(|status| draft_approval_error(status, name))?;
 
     let inner = response.into_inner();
     println!(
@@ -6260,6 +6260,23 @@ pub async fn sandbox_draft_approve(
     );
 
     Ok(())
+}
+
+/// Explain an approval the gateway refused because the proposal's evaluation
+/// changed after it was fetched. The gateway has already stored the refreshed
+/// evaluation, so the reviewer needs to look at it before approving again.
+fn draft_approval_error(status: Status, name: &str) -> miette::Report {
+    if status.code() == Code::FailedPrecondition
+        && status.message().contains("refetch and review again")
+    {
+        return miette::miette!(
+            help = format!(
+                "review it with `openshell rule get {name} --status pending`, then approve again"
+            ),
+            "the sandbox policy or its inputs changed after this rule was fetched, so the gateway re-evaluated it"
+        );
+    }
+    miette::Report::from_err(status)
 }
 
 /// Reject a network rule.
@@ -6330,7 +6347,7 @@ pub async fn sandbox_draft_approve_all(
             approvals,
         })
         .await
-        .into_diagnostic()?;
+        .map_err(|status| draft_approval_error(status, name))?;
 
     let inner = response.into_inner();
     println!(
@@ -6489,6 +6506,26 @@ mod tests {
         sandbox_upload_plan, service_endpoint_to_json, service_expose_status_error,
         service_url_for_gateway, workspace_member_to_json,
     };
+
+    #[test]
+    fn draft_approval_error_explains_refreshed_evaluation() {
+        use super::draft_approval_error;
+        use tonic::Status;
+
+        let refreshed = draft_approval_error(
+            Status::failed_precondition(
+                "proposal inputs changed; evaluation refreshed, refetch and review again",
+            ),
+            "my-agent",
+        );
+        assert!(refreshed.to_string().contains("re-evaluated"));
+        let help = refreshed.help().expect("help text").to_string();
+        assert!(help.contains("openshell rule get my-agent --status pending"));
+
+        let other = draft_approval_error(Status::not_found("chunk not found"), "my-agent");
+        assert!(other.to_string().contains("chunk not found"));
+        assert!(other.help().is_none());
+    }
 
     #[test]
     fn zero_exec_timeout_is_omitted() {
