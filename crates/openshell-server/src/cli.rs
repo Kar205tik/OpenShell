@@ -3364,9 +3364,8 @@ mem_mib = "not-a-number"
                 "podman",
                 "--disable-tls",
             ]);
-            let error = match super::prepare_server_config(&mut args, &matches) {
-                Ok(_) => panic!("unbounded preparation must be rejected"),
-                Err(error) => error,
+            let Err(error) = super::prepare_server_config(&mut args, &matches) else {
+                panic!("unbounded preparation must be rejected");
             };
             assert!(
                 error

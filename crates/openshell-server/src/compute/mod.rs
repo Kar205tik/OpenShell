@@ -10483,18 +10483,19 @@ mod tests {
         assert!(!crate::policy_store::permits_initial_static_policy_repair(
             &blocked
         ));
-        // Simulate the supervisor's successful exact-generation admission report.
+        // The supervisor report records the preparation-to-admission transition
+        // together with acceptance of the exact configuration generation.
         runtime
             .store
             .update_message_cas::<Sandbox, _>(sandbox.object_id(), 0, |sandbox| {
-                sandbox
-                    .status
-                    .as_mut()
-                    .unwrap()
-                    .configuration_admission
-                    .as_mut()
-                    .unwrap()
-                    .state = openshell_core::proto::ConfigurationAdmissionState::Accepted.into();
+                let status = sandbox.status.as_mut().unwrap();
+                provisioning_deadline::record_admission_start(
+                    status.provisioning.as_mut().unwrap(),
+                    openshell_core::time::now_ms(),
+                )
+                .unwrap();
+                status.configuration_admission.as_mut().unwrap().state =
+                    openshell_core::proto::ConfigurationAdmissionState::Accepted.into();
             })
             .await
             .unwrap();
@@ -15285,13 +15286,12 @@ mod tests {
         );
         // The recovery RPC never receives its semaphore permit. The persisted
         // expiry must cancel its waiter and release the lifecycle gate itself.
-        match tokio::time::timeout(Duration::from_secs(3), &mut recovery).await {
-            Ok(result) => result.unwrap().unwrap(),
-            Err(_) => {
-                recovery.abort();
-                let _ = recovery.await;
-                panic!("expired recovery kept the lifecycle gate while the driver was blocked");
-            }
+        if let Ok(result) = tokio::time::timeout(Duration::from_secs(3), &mut recovery).await {
+            result.unwrap().unwrap();
+        } else {
+            recovery.abort();
+            let _ = recovery.await;
+            panic!("expired recovery kept the lifecycle gate while the driver was blocked");
         }
         runtime
             .reconcile_provisioning_deadlines(now + 1_800_001)
