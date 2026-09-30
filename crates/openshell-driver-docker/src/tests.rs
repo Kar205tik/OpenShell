@@ -24,6 +24,32 @@ use std::io::Read as _;
 use std::sync::Arc;
 use tempfile::TempDir;
 
+#[test]
+fn startup_error_log_tails_fit_grpc_header_budget() {
+    // Multibyte text exercises both the UTF-8 cut and worst-case gRPC message
+    // percent encoding. Preserve the final diagnostic from each container.
+    let logs = format!("{}\nstartup timed out", "🦀".repeat(8192));
+    let message = format!(
+        "Docker supervisor exited before becoming ready{}{}",
+        format_log_tail(&logs),
+        format_named_log_tail("sandbox log tail", &logs),
+    );
+    assert_eq!(message.matches("[truncated]").count(), 2);
+    assert_eq!(message.matches("startup timed out").count(), 2);
+    let response = Status::unavailable(message).into_http::<()>();
+    let header_bytes: usize = response
+        .headers()
+        .iter()
+        .map(|(name, value)| name.as_str().len() + value.as_bytes().len() + 32)
+        .sum();
+    assert!(
+        header_bytes < 16 * 1024,
+        "status headers: {header_bytes} bytes"
+    );
+    assert_eq!(format_log_tail("small error"), "; log tail: small error");
+    assert!(format_log_tail("").is_empty());
+}
+
 fn test_launch_authentication() -> Vec<u8> {
     serde_json::to_vec(&SandboxLaunchAuthentication {
         supervisor: SupervisorAuthBundle {

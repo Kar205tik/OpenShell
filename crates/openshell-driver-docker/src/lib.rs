@@ -5376,6 +5376,7 @@ async fn wait_for_docker_supervisor_ready(
             _ if state.running == Some(false) => {
                 let log_tail = docker_container_log_tail(docker, supervisor_id).await;
                 let sandbox_log_tail = docker_container_log_tail(docker, sandbox_id).await;
+                warn!(sandbox_id, supervisor_id, supervisor_logs = %log_tail, sandbox_logs = %sandbox_log_tail, "Docker supervisor exited before becoming ready");
                 return Err(Status::unavailable(format!(
                     "Docker supervisor exited before becoming ready{}{}",
                     format_log_tail(&log_tail),
@@ -5392,8 +5393,18 @@ fn format_log_tail(log_tail: &str) -> String {
 }
 
 fn format_named_log_tail(label: &str, log_tail: &str) -> String {
+    // gRPC status messages travel in HTTP/2 headers. Two 16 KiB container
+    // tails exceed the client's 16 KiB header budget and hide the real error
+    // behind PROTOCOL_ERROR. Allow for up to 3x percent-encoding expansion.
+    const MAX_STATUS_LOG_TAIL_BYTES: usize = 1024;
     if log_tail.is_empty() {
         String::new()
+    } else if log_tail.len() > MAX_STATUS_LOG_TAIL_BYTES {
+        let mut start = log_tail.len() - MAX_STATUS_LOG_TAIL_BYTES;
+        while !log_tail.is_char_boundary(start) {
+            start += 1;
+        }
+        format!("; {label}: [truncated] {}", &log_tail[start..])
     } else {
         format!("; {label}: {log_tail}")
     }

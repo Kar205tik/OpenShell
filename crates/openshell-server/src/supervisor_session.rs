@@ -933,7 +933,7 @@ impl SupervisorSessionRegistry {
                 payload: Some(gateway_message::Payload::RelayOpen(relay_open)),
             };
             if tx.send(msg).await.is_err() {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "supervisor session: failed to replay pending relay to superseding session");
+                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "supervisor session: failed to replay pending relay to connected session");
                 break;
             }
         }
@@ -1960,12 +1960,13 @@ async fn establish_supervisor_session(
     }
     state.telemetry.sandbox_session_connected(&sandbox_id);
 
-    if superseded {
-        state
-            .supervisor_sessions
-            .replay_pending_relays(&sandbox_id, &tx)
-            .await;
-    }
+    // A disconnected session may already have removed its registration while
+    // an unclaimed RelayOpen remains pending. Replay on every accepted session,
+    // including reconnects that did not supersede a live registration.
+    state
+        .supervisor_sessions
+        .replay_pending_relays(&sandbox_id, &tx)
+        .await;
 
     // Step 4: Spawn the session loop that reads inbound messages.
     let state_clone = Arc::clone(&state);
@@ -2918,6 +2919,32 @@ mod tests {
         shutdown_rx
             .await
             .expect("shutdown signal should arrive at superseded session");
+    }
+
+    #[tokio::test]
+    async fn replay_pending_relays_after_disconnected_session_was_removed() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx_old, mut rx_old) = mpsc::channel(4);
+        registry.register("sbx".into(), "old".into(), tx_old, make_shutdown());
+        let (channel_id, relay_rx) = registry
+            .open_relay("sbx", Duration::from_secs(1))
+            .await
+            .unwrap();
+        rx_old.recv().await.unwrap();
+        registry.remove_if_current("sbx", "old");
+
+        let (tx_new, mut rx_new) = mpsc::channel(4);
+        assert!(!registry.register("sbx".into(), "new".into(), tx_new.clone(), make_shutdown()));
+        registry.replay_pending_relays("sbx", &tx_new).await;
+        let replayed = rx_new.recv().await.unwrap();
+        let Some(gateway_message::Payload::RelayOpen(open)) = replayed.payload else {
+            panic!("expected replayed RelayOpen");
+        };
+        assert_eq!(open.channel_id, channel_id);
+        let _claimed = registry
+            .claim_relay(&channel_id, Some(&sandbox_principal("sbx")))
+            .unwrap();
+        assert!(relay_rx.await.unwrap().is_ok());
     }
 
     #[tokio::test]
