@@ -5302,12 +5302,6 @@ async fn spawn_docker_control_process(
                 if !log_tail.is_empty() {
                     write!(message, "; log tail: {log_tail}").ok();
                 }
-                let sandbox_log_tail =
-                    docker_container_log_tail(&monitored_docker, &failure_context.container_id)
-                        .await;
-                if !sandbox_log_tail.is_empty() {
-                    write!(message, "; sandbox log tail: {sandbox_log_tail}").ok();
-                }
                 let _ = monitored_docker.remove_container(
                     &monitored_supervisor_id,
                     Some(RemoveContainerOptionsBuilder::default().force(true).build()),
@@ -5358,11 +5352,9 @@ async fn wait_for_docker_supervisor_ready(
                 Status::internal(format!("inspect Docker sandbox container: {error}"))
             })?;
         if sandbox.state.unwrap_or_default().running == Some(false) {
-            let sandbox_log_tail = docker_container_log_tail(docker, sandbox_id).await;
-            return Err(Status::unavailable(format!(
-                "Docker sandbox exited before supervisor became ready{}",
-                format_named_log_tail("sandbox log tail", &sandbox_log_tail)
-            )));
+            return Err(Status::unavailable(
+                "Docker sandbox exited before supervisor became ready",
+            ));
         }
         let inspected = docker
             .inspect_container(supervisor_id, None)
@@ -5375,11 +5367,9 @@ async fn wait_for_docker_supervisor_ready(
             Some(HealthStatusEnum::HEALTHY) => return Ok(()),
             _ if state.running == Some(false) => {
                 let log_tail = docker_container_log_tail(docker, supervisor_id).await;
-                let sandbox_log_tail = docker_container_log_tail(docker, sandbox_id).await;
                 return Err(Status::unavailable(format!(
-                    "Docker supervisor exited before becoming ready{}{}",
-                    format_log_tail(&log_tail),
-                    format_named_log_tail("sandbox log tail", &sandbox_log_tail)
+                    "Docker supervisor exited before becoming ready{}",
+                    format_log_tail(&log_tail)
                 )));
             }
             _ => tokio::time::sleep(Duration::from_millis(100)).await,
@@ -5388,14 +5378,10 @@ async fn wait_for_docker_supervisor_ready(
 }
 
 fn format_log_tail(log_tail: &str) -> String {
-    format_named_log_tail("log tail", log_tail)
-}
-
-fn format_named_log_tail(label: &str, log_tail: &str) -> String {
     if log_tail.is_empty() {
         String::new()
     } else {
-        format!("; {label}: {log_tail}")
+        format!("; log tail: {log_tail}")
     }
 }
 
