@@ -238,15 +238,60 @@ impl Attempt {
         }
     }
 
-    fn kill_group(&self) -> io::Result<()> {
+    fn kill_group(&mut self) -> io::Result<()> {
         if let Some(id) = self.child.as_ref().and_then(Child::id) {
             let pid = i32::try_from(id).map_err(io::Error::other)?;
             match killpg(Pid::from_raw(pid), Signal::SIGKILL) {
                 Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                #[cfg(target_os = "macos")]
+                Err(nix::errno::Errno::EPERM)
+                    if self.exited_worker_has_no_descendant_owner(id)? => {}
                 Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
             }
         }
         Ok(())
+    }
+
+    /// Darwin rejects signals to a group containing only an exited leader.
+    /// Accept that case only while its PID remains reserved and no descendant
+    /// owns the inherited staging lease. Live or uncertain ownership still fails.
+    #[cfg(target_os = "macos")]
+    fn exited_worker_has_no_descendant_owner(&mut self, id: u32) -> io::Result<bool> {
+        // SAFETY: waitid writes into initialized storage. WNOWAIT observes the
+        // exit without reaping, so neither PID nor process group can be reused.
+        let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::waitid(
+                libc::P_PID,
+                id,
+                &raw mut status,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if !matches!(
+            status.si_code,
+            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+        ) {
+            return Ok(false);
+        }
+
+        // Open the probe before dropping our copy so a concurrent reconciler
+        // cannot remove the lease pathname between release and open. Reacquire
+        // ownership on success and retain it until the caller reaps the worker.
+        let lease = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&self.lease_path)?;
+        self.lease.take();
+        if !lock(&lease, true)? {
+            return Ok(false);
+        }
+        self.lease = Some(lease);
+        Ok(true)
     }
 }
 
@@ -402,11 +447,15 @@ pub(super) fn read_request(path: &Path) -> Result<(Request, PathBuf), String> {
     // SAFETY: fstat writes only to the supplied initialized stat storage. An
     // invalid inherited descriptor is rejected rather than taken into ownership.
     let mut inherited: libc::stat = unsafe { std::mem::zeroed() };
-    if request.lease_fd < 3
-        || unsafe { libc::fstat(request.lease_fd, &raw mut inherited) } != 0
-        || inherited.st_ino != lease.ino()
-        || inherited.st_dev as u64 != lease.dev()
-    {
+    if request.lease_fd < 3 || unsafe { libc::fstat(request.lease_fd, &raw mut inherited) } != 0 {
+        return Err("image preparation lease was not inherited".to_string());
+    }
+    // Match MetadataExt::dev's representation: Darwin dev_t is signed, while
+    // Linux dev_t is already u64. The cast intentionally preserves that API's
+    // conversion, including the sign extension of a signed device identifier.
+    #[allow(clippy::cast_sign_loss, trivial_numeric_casts)]
+    let inherited_device = inherited.st_dev as u64;
+    if inherited.st_ino != lease.ino() || inherited_device != lease.dev() {
         return Err("image preparation lease was not inherited".to_string());
     }
     Ok((request, directory.to_path_buf()))
@@ -472,6 +521,95 @@ mod tests {
         .expect("worker readiness");
     }
 
+    async fn wait_for_worker_exit_without_reaping(attempt: &Attempt) {
+        let id = attempt.child.as_ref().unwrap().id().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let exited = {
+                    // SAFETY: waitid writes initialized exit information and
+                    // WNOWAIT leaves the owned child's PID reserved for cleanup.
+                    let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    assert_eq!(
+                        unsafe {
+                            libc::waitid(
+                                libc::P_PID,
+                                id,
+                                &raw mut status,
+                                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                            )
+                        },
+                        0
+                    );
+                    matches!(
+                        status.si_code,
+                        libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+                    )
+                };
+                if exited {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker must exit without being reaped");
+    }
+
+    #[tokio::test]
+    async fn completed_worker_without_descendants_keeps_successful_exit_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = super::super::image_cache_root_dir(temp.path());
+        let launcher = temp.path().join("worker");
+        fs::write(&launcher, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut attempt = Attempt::create(&cache).unwrap();
+        let directory = attempt.directory.clone();
+        let _stdout = attempt.spawn(&launcher, request(temp.path())).unwrap();
+        wait_for_worker_exit_without_reaping(&attempt).await;
+
+        // macOS rejects killpg for a group containing only a zombie. The
+        // completed worker must still return its original successful status.
+        assert!(
+            attempt
+                .wait()
+                .await
+                .expect("completed worker status")
+                .success()
+        );
+        attempt.cleanup().await.expect("reclaim completed attempt");
+        assert!(!directory.exists());
+        assert!(attempt.child.as_ref().unwrap().id().is_none());
+    }
+
+    #[tokio::test]
+    async fn exited_worker_with_live_descendant_stops_writer_before_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = super::super::image_cache_root_dir(temp.path());
+        let launcher = temp.path().join("worker");
+        fs::write(&launcher, "#!/bin/sh\nsleep 300 &\nexit 0\n").unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut attempt = Attempt::create(&cache).unwrap();
+        let directory = attempt.directory.clone();
+        let _stdout = attempt.spawn(&launcher, request(temp.path())).unwrap();
+        wait_for_worker_exit_without_reaping(&attempt).await;
+
+        #[cfg(target_os = "macos")]
+        {
+            let id = attempt.child.as_ref().unwrap().id().unwrap();
+            assert!(
+                !attempt.exited_worker_has_no_descendant_owner(id).unwrap(),
+                "an exited leader cannot prove its live descendant stopped"
+            );
+            assert!(directory.exists());
+        }
+        attempt
+            .cleanup()
+            .await
+            .expect("kill the live descendant before reclaiming its staging");
+        assert!(!directory.exists());
+        assert!(attempt.child.as_ref().unwrap().id().is_none());
+    }
+
     #[tokio::test]
     async fn cleanup_kills_and_reaps_worker_and_formatter_before_removing_staging() {
         let temp = tempfile::tempdir().unwrap();
@@ -485,6 +623,12 @@ mod tests {
         let directory = attempt.directory.clone();
         let _stdout = attempt.spawn(&launcher, request(temp.path())).unwrap();
         wait_for_file(&directory.join("ready")).await;
+        #[cfg(target_os = "macos")]
+        {
+            let id = attempt.child.as_ref().unwrap().id().unwrap();
+            assert!(!attempt.exited_worker_has_no_descendant_owner(id).unwrap());
+            assert!(attempt.lease.is_some(), "a live worker retains its lease");
+        }
         reconcile(&cache).unwrap();
         assert!(directory.exists(), "a live formatter protects its staging");
         attempt

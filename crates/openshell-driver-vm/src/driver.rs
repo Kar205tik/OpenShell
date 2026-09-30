@@ -2968,14 +2968,16 @@ impl VmDriver {
     }
 
     fn image_staging_dir(&self, image_identity: &str) -> PathBuf {
-        match self.preparation_root.as_ref() {
-            Some(root) => root.join(format!(
-                "{}.staging-{}",
-                sanitize_image_identity(image_identity),
-                unique_image_cache_suffix()
-            )),
-            None => image_cache_staging_dir(&self.config.state_dir, image_identity),
-        }
+        self.preparation_root.as_ref().map_or_else(
+            || image_cache_staging_dir(&self.config.state_dir, image_identity),
+            |root| {
+                root.join(format!(
+                    "{}.staging-{}",
+                    sanitize_image_identity(image_identity),
+                    unique_image_cache_suffix()
+                ))
+            },
+        )
     }
 
     #[tracing::instrument(
@@ -3107,9 +3109,7 @@ impl VmDriver {
         let template_path = overlay_template_image(&self.config.state_dir, overlay_size_bytes);
         let overlay_metadata = tokio::fs::metadata(&overlay_disk).await;
         let recover_preserved_overlay = preparation == OverlayPreparation::PreserveExisting
-            && overlay_metadata
-                .as_ref()
-                .is_ok_and(|metadata| metadata.is_file());
+            && overlay_metadata.as_ref().is_ok_and(fs::Metadata::is_file);
         let publish_new_overlay = preparation == OverlayPreparation::Fresh
             || matches!(overlay_metadata, Err(error) if error.kind() == std::io::ErrorKind::NotFound);
         if !overlay_template_image_ready(&template_path, overlay_size_bytes).await? {
