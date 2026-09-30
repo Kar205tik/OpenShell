@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Drift guards for the two shipped Windows inference demos.
+//! Drift guards for the shipped Windows MXC demos.
 
 use std::path::{Path, PathBuf};
 
@@ -36,6 +36,105 @@ fn read_example(name: &str) -> String {
     let path = examples_root().join(name);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+}
+
+#[test]
+fn shipped_provider_credential_assets_support_mock_wiring_validation() {
+    for name in [
+        "mxc-provider-credential.toml",
+        "mxc-provider-credential-policy.yaml",
+        "mxc-github-provider-profile.yml",
+        "mxc-provider-credential-probe.ps1",
+        "run-provider-credential-test.ps1",
+    ] {
+        assert!(
+            examples_root().join(name).is_file(),
+            "shipped provider-credential asset is missing: {name}"
+        );
+    }
+
+    let runner = read_example("run-provider-credential-test.ps1");
+    let probe = read_example("mxc-provider-credential-probe.ps1");
+    let config: Value = toml::from_str(&read_example("mxc-provider-credential.toml"))
+        .expect("provider-credential config must parse");
+    assert_eq!(
+        config
+            .get("openshell")
+            .and_then(Value::as_table)
+            .and_then(|openshell| openshell.get("version"))
+            .and_then(Value::as_integer),
+        Some(2)
+    );
+    assert!(runner.contains("[switch] $Mock"));
+    assert!(runner.contains("OPENSHELL_MXC_MOCK_WXC"));
+    assert!(runner.contains("--provider"));
+    assert!(runner.contains("--credential"));
+    assert!(probe.contains("revision-scoped GITHUB_TOKEN placeholder"));
+    assert!(probe.contains("no external network request"));
+}
+
+#[test]
+fn shipped_ocsf_audit_assets_support_mock_diagnostic_validation() {
+    for name in [
+        "mxc-ocsf-audit.toml",
+        "ocsf-audit.yaml",
+        "run-ocsf-audit.ps1",
+    ] {
+        assert!(
+            examples_root().join(name).is_file(),
+            "shipped OCSF audit asset is missing: {name}"
+        );
+    }
+
+    let config: Value =
+        toml::from_str(&read_example("mxc-ocsf-audit.toml")).expect("OCSF audit config must parse");
+    assert_eq!(
+        config
+            .get("openshell")
+            .and_then(Value::as_table)
+            .and_then(|openshell| openshell.get("version"))
+            .and_then(Value::as_integer),
+        Some(2)
+    );
+    let runner = read_example("run-ocsf-audit.ps1");
+    assert!(runner.contains("[switch] $Mock"));
+    assert!(runner.contains("mxc-etw-zero-events"));
+    assert!(runner.contains("OPENSHELL_MXC_MOCK_WXC"));
+}
+
+#[test]
+fn shipped_aggregate_e2e_assets_support_mock_wiring_validation() {
+    for name in [
+        "mxc-gateway.toml",
+        "run-mxc-e2e.ps1",
+        "e2e-policies/fs-rw.yaml",
+        "e2e-policies/fs-readonly.yaml",
+        "e2e-policies/fs-empty.yaml",
+        "e2e-policies/network-reject.yaml",
+    ] {
+        assert!(
+            examples_root().join(name).is_file(),
+            "shipped aggregate E2E asset is missing: {name}"
+        );
+    }
+
+    let config: Value =
+        toml::from_str(&read_example("mxc-gateway.toml")).expect("MXC E2E config must parse");
+    assert_eq!(
+        config
+            .get("openshell")
+            .and_then(Value::as_table)
+            .and_then(|openshell| openshell.get("version"))
+            .and_then(Value::as_integer),
+        Some(2)
+    );
+    let runner = read_example("run-mxc-e2e.ps1");
+    assert!(runner.contains("[switch] $Mock"));
+    assert!(runner.contains("OPENSHELL_MXC_MOCK_WXC"));
+    for scenario in ["fs-rw", "fs-readonly", "fs-default-deny", "network-reject"] {
+        assert!(runner.contains(scenario));
+    }
+    assert!(runner.contains("not evidence of native MXC or OS enforcement"));
 }
 
 #[test]
@@ -194,7 +293,14 @@ fn shipped_runners_supply_sandbox_scoped_workload_configuration() {
 #[cfg(target_os = "windows")]
 #[test]
 fn shipped_runners_parse_in_windows_powershell() {
-    for name in ["run-ollama-test.ps1", "run-inference-test.ps1"] {
+    for name in [
+        "run-ollama-test.ps1",
+        "run-inference-test.ps1",
+        "run-provider-credential-test.ps1",
+        "mxc-provider-credential-probe.ps1",
+        "run-ocsf-audit.ps1",
+        "run-mxc-e2e.ps1",
+    ] {
         let path = examples_root().join(name);
         let script = r"
 $errors = $null

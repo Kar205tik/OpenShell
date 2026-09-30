@@ -248,6 +248,17 @@ Windows validation separates source correctness from host capability:
   workspace and unsupported-driver contract tests for x64 and ARM64.
 - Mock MXC E2E validates gateway, CLI, driver, lifecycle, and policy wiring but
   is not evidence of OS enforcement.
+- Hosted Windows CI runs the shipped provider-credential example with a
+  synthetic value. It verifies provider/profile/policy attachment and that the
+  mock workload receives only a revision-scoped placeholder. It makes no
+  external request and does not prove proxy substitution or MXC enforcement.
+- The shipped OCSF audit example also runs with mock MXC. It verifies ETW
+  consumer startup, mock workload wiring, durable JSONL output, and the
+  zero-provider-events finding. Real provider events and attribution still
+  require native MXC qualification.
+- The aggregate example runs its read-write, read-only, default-deny, and
+  unsupported-network-policy scenarios in mock mode. This validates the
+  shipped runner and expected policy paths without claiming native enforcement.
 - Hosted Windows CI runs the shipped Ollama and cloud-inference demos against
   that mock and a local compatible API. This proves both complete demo scripts,
   sandbox-scoped credential propagation, and response paths without a model or
