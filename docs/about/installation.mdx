@@ -112,8 +112,6 @@ sudo snap install openshell
 
 The snap does not migrate existing Debian, RPM, or Homebrew installs. Remove any existing installation first, then rerun the script with `OPENSHELL_INSTALL_METHOD=snap OPENSHELL_ACK_BREAKING_UPGRADE=1`.
 
-Snap refreshes keep the running gateway process active so they do not interrupt sandbox sessions. Run `sudo snap restart openshell.gateway` after a direct or automatic snap refresh when you need to activate the refreshed gateway immediately. Rerunning the OpenShell install script refreshes and restarts the gateway automatically. A refresh also restarts the gateway when it removes an insecure legacy configuration.
-
 The gateway runs as a system service at `https://127.0.0.1:17670` and reads `/var/snap/openshell/common/gateway.toml`. It requires a client certificate. The install script copies that certificate to the installing user's Snap state and registers the gateway automatically. If you installed with `sudo snap install openshell`, give each trusted user the certificate and register the gateway from that user's account:
 
 ```shell
