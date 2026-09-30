@@ -1089,7 +1089,7 @@ fn resolve_e2fs_tool(tool: &OsStr, search_path: &OsStr) -> Result<Option<PathBuf
 /// Check host tools in the driver service's environment before accepting image work.
 /// This checks executable identity and a supported version; later image failures
 /// still return the selected tool's status and output without a retry.
-pub(crate) async fn preflight_filesystem_tools() -> Result<(), String> {
+pub async fn preflight_filesystem_tools() -> Result<(), String> {
     let path = e2fs_search_path(std::env::var_os("PATH").as_deref())?;
     preflight_filesystem_tools_with_path(&path).await
 }

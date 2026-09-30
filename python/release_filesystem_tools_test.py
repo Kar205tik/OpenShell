@@ -12,7 +12,7 @@ import pytest
 
 
 @pytest.mark.parametrize("prefix", ["opt/homebrew", "usr/local", "private/tools"])
-@pytest.mark.parametrize("service_path", [None, "/usr/bin:/bin", ""])
+@pytest.mark.parametrize("service_path", [None, "/usr/bin:/bin", "", "operator"])
 def test_homebrew_service_finds_its_filesystem_tools_without_shell_setup(
     tmp_path: Path, prefix: str, service_path: str | None
 ) -> None:
@@ -33,17 +33,26 @@ def test_homebrew_service_finds_its_filesystem_tools_without_shell_setup(
     tools = tmp_path / prefix / "opt/e2fsprogs"
     (tools / "sbin").mkdir(parents=True)
     (tools / "bin").mkdir()
+    operator_bin = tmp_path / "operator/bin"
+    operator_bin.mkdir(parents=True)
+    selected_bin = operator_bin if service_path == "operator" else tools / "sbin"
+    # Unique fixture names keep a runner's preinstalled e2fsprogs from satisfying
+    # lookup. A conflicting operator copy still proves inherited PATH wins.
     for name in ("mke2fs", "debugfs", "e2fsck"):
-        tool = tools / "sbin" / name
-        tool.write_text(f"#!/bin/sh\necho '{name} 1.47.4'\n", encoding="utf-8")
-        tool.chmod(0o755)
-        wrapper += f"command -v {name}\n{name} -V\n"
+        command = f"openshell-test-{name}"
+        for directory in (tools / "sbin", operator_bin):
+            tool = directory / command
+            tool.write_text(f"#!/bin/sh\necho '{name} 1.47.4'\n", encoding="utf-8")
+            tool.chmod(0o755)
+        wrapper += f"command -v {command}\n{command} -V\n"
     wrapper = wrapper.replace('#{Formula["e2fsprogs"].opt_sbin}', str(tools / "sbin"))
     wrapper = wrapper.replace('#{Formula["e2fsprogs"].opt_bin}', str(tools / "bin"))
     wrapper = wrapper.replace("#{var}", str(tmp_path / "var"))
     environment = {"HOME": str(tmp_path)}
     if service_path is not None:
-        environment["PATH"] = service_path
+        environment["PATH"] = (
+            str(operator_bin) if service_path == "operator" else service_path
+        )
     completed = subprocess.run(
         ["/bin/sh", "-c", wrapper],
         env=environment,
@@ -52,5 +61,5 @@ def test_homebrew_service_finds_its_filesystem_tools_without_shell_setup(
         check=True,
     )
     for name in ("mke2fs", "debugfs", "e2fsck"):
-        assert str(tools / "sbin" / name) in completed.stdout
+        assert str(selected_bin / f"openshell-test-{name}") in completed.stdout
         assert f"{name} 1.47.4" in completed.stdout
