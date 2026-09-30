@@ -4301,6 +4301,10 @@ async fn handle_update_config_inner(
     };
     response_annotations = committed_annotations;
     state.sandbox_watch_bus.notify(&sandbox_id);
+    // The committed revision changed what pending proposals were evaluated
+    // against. Schedule the refresh here: the matching-revision check below
+    // returns before the end of this handler for every committed write.
+    spawn_pending_chunk_refresh(state, &workspace, &sandbox);
 
     if backfill_policy.is_some() {
         info!(
@@ -17023,6 +17027,80 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "background refresh did not finish"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn full_policy_update_refreshes_pending_proposals() {
+        let state = test_server_state().await;
+        let sandbox_id = "sb-policy-set-refresh";
+        let sandbox_name = "policy-set-refresh";
+        let baseline = test_policy_with_rule("baseline", "baseline.example.com");
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                baseline.clone(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_policy_revision(
+                "policy-set-refresh-v1",
+                sandbox_id,
+                "default",
+                1,
+                &baseline.encode_to_vec(),
+                &deterministic_policy_hash(&baseline),
+            )
+            .await
+            .unwrap();
+        let chunk_id = submit_host_proposals(&state, sandbox_name, &["pending.example.com".into()])
+            .await
+            .remove(0);
+        let before = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .review_token;
+
+        // `openshell policy set`: a full policy replacement through UpdateConfig.
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                policy: Some(test_policy_with_rule("replaced", "replaced.example.com")),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let token = state
+                .store
+                .get_draft_chunk(&chunk_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .review_token;
+            if token != before {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "full policy update did not refresh the pending proposal"
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
