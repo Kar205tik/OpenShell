@@ -198,7 +198,8 @@ fn handle_service_account_recursive(ctx: &MetadataContext) -> MetadataResponse {
     let email = ctx
         .credentials
         .current_non_secret_environment_value(ENV_GCP_SERVICE_ACCOUNT_EMAIL)
-        .unwrap_or_default();
+        .filter(|email| !email.is_empty())
+        .unwrap_or_else(|| "default".to_string());
 
     let scopes = "https://www.googleapis.com/auth/cloud-platform";
 
@@ -554,6 +555,30 @@ mod tests {
         }
         let other = format!("{PATH_SERVICE_ACCOUNTS}/other@project.iam.gserviceaccount.com/token");
         assert_eq!(route_request(&ctx, "GET", &other, &flavor_headers()).0, 404);
+    }
+
+    #[test]
+    fn missing_or_empty_email_keeps_a_usable_account_for_repeated_sdk_refresh() {
+        for email in [None, Some("")] {
+            let mut env = HashMap::from([("GCP_ADC_ACCESS_TOKEN".into(), "real-secret".into())]);
+            if let Some(email) = email {
+                env.insert(ENV_GCP_SERVICE_ACCOUNT_EMAIL.into(), email.into());
+            }
+            let ctx = make_context(env);
+            let mut account = "default".to_string();
+            for _ in 0..2 {
+                let path = format!("{PATH_SERVICE_ACCOUNTS}/{account}?recursive=true");
+                let (status, _, body) = route_request(&ctx, "GET", &path, &flavor_headers());
+                assert_eq!(status, 200);
+                let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+                account = info["email"].as_str().unwrap().to_string();
+                assert_eq!(account, "default");
+                assert_eq!(
+                    route_request(&ctx, "GET", PATH_TOKEN, &flavor_headers()).0,
+                    200
+                );
+            }
+        }
     }
 
     #[test]

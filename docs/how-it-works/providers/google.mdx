@@ -117,7 +117,10 @@ Set these with `--config key=value` during provider creation:
 |-----|-------------|---------|
 | `project_id` | GCP project ID | `my-project-123` |
 | `region` | GCP region | `us-central1` |
-| `service_account_email` | SA email for metadata endpoint | `sa@proj.iam.gserviceaccount.com` |
+| `service_account_email` | Optional SA email for metadata endpoint | `sa@proj.iam.gserviceaccount.com` |
+
+When `service_account_email` is omitted or empty, recursive metadata account
+discovery returns the `default` identifier so SDKs can refresh repeatedly.
 
 ## How It Works
 

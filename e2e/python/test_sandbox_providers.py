@@ -434,20 +434,31 @@ def test_endpointless_profile_credentials_use_explicit_policy_binding(
             )
 
 
+@pytest.mark.parametrize(
+    ("service_account_email", "provider_suffix"),
+    [
+        (None, "no-email"),
+        ("", "empty-email"),
+        ("sdk@metadata-test-project.iam.gserviceaccount.com", "configured-email"),
+    ],
+    ids=["no-email", "empty-email", "configured-email"],
+)
 def test_google_metadata_sdk_discovery(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
+    service_account_email: str | None,
+    provider_suffix: str,
 ) -> None:
     """Google's SDK discovers project/account metadata and refreshes a placeholder."""
+    config = {"project_id": "metadata-test-project"}
+    if service_account_email is not None:
+        config["service_account_email"] = service_account_email
     with provider(
         sandbox_client._stub,
-        name="e2e-google-metadata-sdk",
+        name=f"e2e-google-metadata-sdk-{provider_suffix}",
         provider_type="google-cloud",
         credentials={"GCP_ADC_ACCESS_TOKEN": "gcp-metadata-real-secret"},
-        config={
-            "project_id": "metadata-test-project",
-            "service_account_email": "sdk@metadata-test-project.iam.gserviceaccount.com",
-        },
+        config=config,
     ) as provider_name:
         policy = _default_policy()
         policy.network_policies["gcp_api"].CopyFrom(
@@ -509,9 +520,7 @@ def test_google_metadata_sdk_discovery(
             assert result.exit_code == 0, result.stderr
             data = json.loads(result.stdout)
             assert data["project"] == "metadata-test-project"
-            assert (
-                data["account"] == "sdk@metadata-test-project.iam.gserviceaccount.com"
-            )
+            assert data["account"] == (service_account_email or "default")
             assert data["metadata_host"] == data["metadata_ip"] == "127.0.0.1:8174"
             assert data["expiry_present"]
             assert _is_placeholder_for_env_key(data["token"], "GCP_ADC_ACCESS_TOKEN")
