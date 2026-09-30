@@ -199,7 +199,13 @@ async fn podman_uses_oci_identity_and_inspected_image_id() {
     std::fs::write(policy.path(), OCI_FALLBACK_POLICY).expect("write OCI fallback policy");
     let policy_path = policy.path().to_str().expect("policy path is UTF-8");
     let mut sandbox = SandboxGuard::create_keep_with_args(
-        &["--from", &image.tag, "--policy", policy_path, "--no-tty"],
+        &[
+            "--from",
+            &image.tag,
+            "--policy",
+            policy_path,
+            "--no-tty",
+        ],
         &[
             "sh",
             "-c",

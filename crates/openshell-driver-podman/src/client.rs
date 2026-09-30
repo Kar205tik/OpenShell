@@ -166,6 +166,8 @@ pub struct PortBinding {
 pub struct ContainerConfig {
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    #[serde(default)]
+    pub user: String,
 }
 
 /// Immutable image metadata needed to bind OCI identity inspection to launch.
@@ -189,6 +191,25 @@ pub struct ImageConfig {
     pub working_dir: String,
     #[serde(default)]
     pub volumes: Option<HashMap<String, Value>>,
+}
+
+/// Whether a driver-owned volume has exactly the options `OpenShell` creates it
+/// with: none, or `uid`/`gid` for `owner`. Podman records the parsed `UID` and
+/// `GID` next to the raw `o` option.
+pub fn volume_options_match_owner(
+    options: &HashMap<String, String>,
+    owner: Option<(u32, u32)>,
+) -> bool {
+    let Some((uid, gid)) = owner else {
+        return options.is_empty();
+    };
+    options.get("o").map(String::as_str) == Some(format!("uid={uid},gid={gid}").as_str())
+        && options.iter().all(|(key, value)| match key.as_str() {
+            "o" => true,
+            "UID" => *value == uid.to_string(),
+            "GID" => *value == gid.to_string(),
+            _ => false,
+        })
 }
 
 /// A container summary returned by the list API.
@@ -715,20 +736,8 @@ impl PodmanClient {
         workspace: &str,
         owner: Option<(u32, u32)>,
     ) -> Result<(), PodmanApiError> {
-        let mount_options = owner.map(|(uid, gid)| format!("uid={uid},gid={gid}"));
-        // Podman records the parsed `UID`/`GID` next to the raw `o` option.
-        let owned_as_requested = |options: &HashMap<String, String>| {
-            let Some((uid, gid)) = owner else {
-                return options.is_empty();
-            };
-            options.get("o") == mount_options.as_ref()
-                && options.iter().all(|(key, value)| match key.as_str() {
-                    "o" => true,
-                    "UID" => *value == uid.to_string(),
-                    "GID" => *value == gid.to_string(),
-                    _ => false,
-                })
-        };
+        let owned_as_requested =
+            |options: &HashMap<String, String>| volume_options_match_owner(options, owner);
         let labels = HashMap::from([
             (
                 openshell_core::driver_utils::LABEL_SANDBOX_ID.to_string(),
@@ -755,8 +764,8 @@ impl PodmanClient {
             Err(error) => return Err(error),
         }
         let mut body = serde_json::json!({"Name":name,"Driver":"local","Labels":labels});
-        if let Some(mount_options) = &mount_options {
-            body["Options"] = serde_json::json!({ "o": mount_options });
+        if let Some((uid, gid)) = owner {
+            body["Options"] = serde_json::json!({ "o": format!("uid={uid},gid={gid}") });
         }
         self.create_ignore_conflict("/libpod/volumes/create", &body)
             .await?;

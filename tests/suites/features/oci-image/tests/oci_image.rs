@@ -277,6 +277,51 @@ async fn file_transfer_uses_workspace(
             "downloaded file has unexpected content: {downloaded:?}"
         ));
     }
+
+    // A directory upload merges into an existing workspace directory.
+    let merge = local.path().join("merge-upload");
+    std::fs::create_dir(&merge).map_err(|error| format!("create merge dir: {error}"))?;
+    std::fs::write(merge.join("conflict.txt"), "local-conflict")
+        .and_then(|()| std::fs::write(merge.join("added.txt"), "local-added"))
+        .map_err(|error| format!("write merge files: {error}"))?;
+    let merge = merge.to_str().ok_or("merge path is not UTF-8")?;
+    let seed = "mkdir merge-upload && printf remote-conflict > merge-upload/conflict.txt \
+                && printf remote-preserved > merge-upload/unrelated.txt";
+    let verify = "test \"$(cat merge-upload/conflict.txt)\" = local-conflict \
+                  && test \"$(cat merge-upload/added.txt)\" = local-added \
+                  && test \"$(cat merge-upload/unrelated.txt)\" = remote-preserved";
+    for (step, description, args) in [
+        (
+            "named/merge-seed",
+            "seed an existing workspace directory",
+            [
+                "sandbox", "exec", "--name", sandbox, "--no-tty", "--", "sh", "-c", seed,
+            ]
+            .as_slice(),
+        ),
+        (
+            "named/merge-upload",
+            "directory upload merges into the existing directory",
+            ["sandbox", "upload", sandbox, merge, "--no-git-ignore"].as_slice(),
+        ),
+        (
+            "named/merged",
+            "upload overwrites conflicts and keeps unrelated files",
+            [
+                "sandbox", "exec", "--name", sandbox, "--no-tty", "--", "sh", "-c", verify,
+            ]
+            .as_slice(),
+        ),
+    ] {
+        runner
+            .step(step)
+            .description(description)
+            .with_timeout(COMMAND_TIMEOUT)
+            .run(args)
+            .await
+            .map_err(|error| error.to_string())?
+            .require_success()?;
+    }
     Ok(())
 }
 

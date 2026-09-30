@@ -973,10 +973,7 @@ fn podman_driver_config(
 
 fn validate_podman_mount_target(target: &str) -> Result<(), String> {
     driver_mounts::validate_container_mount_target(target)?;
-    for control_path in PODMAN_WORKLOAD_CONTROL_PATHS {
-        driver_mounts::validate_mount_control_path(target, control_path)?;
-    }
-    Ok(())
+    driver_mounts::validate_mount_control_path(target, "/.openshell")
 }
 
 fn validate_podman_driver_mounts(
@@ -1249,7 +1246,7 @@ fn build_base_spec(
     if image.uses_managed_workspace() {
         volumes.push(NamedVolume {
             name: vol,
-            dest: image.workspace_root.clone(),
+            dest: driver_mounts::DEFAULT_WORKSPACE_ROOT.into(),
             options: vec!["rw".into()],
         });
     }

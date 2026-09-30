@@ -110,8 +110,6 @@ impl From<PodmanApiError> for ComputeDriverError {
 pub struct PodmanComputeDriver {
     client: PodmanClient,
     config: PodmanComputeConfig,
-    /// Whether Podman's service is running without root privileges.
-    rootless: bool,
     gpu_selector: Arc<CdiGpuDefaultSelector>,
     gpu_inventory_refresh: Arc<dyn Fn() -> (CdiGpuInventory, bool) + Send + Sync>,
     lifecycle_event_fences: LifecycleEventFences,
@@ -123,7 +121,6 @@ impl std::fmt::Debug for PodmanComputeDriver {
             .field("socket_path", &self.config.socket_path)
             .field("default_image", &self.config.default_image)
             .field("network_name", &self.config.network_name)
-            .field("rootless", &self.rootless)
             .field("gpu_inventory", &self.gpu_selector.device_ids())
             .finish()
     }
@@ -143,6 +140,12 @@ fn validated_container_name(sandbox: &DriverSandbox) -> Result<String, ComputeDr
     crate::client::validate_name(&name)
         .map_err(|e| ComputeDriverError::Precondition(e.to_string()))?;
     Ok(name)
+}
+
+/// Parse a numeric `uid:gid` container user.
+fn numeric_user(user: &str) -> Option<(u32, u32)> {
+    let (uid, gid) = user.split_once(':')?;
+    Some((uid.parse().ok()?, gid.parse().ok()?))
 }
 
 fn podman_volume_is_bind_backed(volume: &VolumeInspect) -> bool {
@@ -468,7 +471,7 @@ impl PodmanComputeDriver {
         }
 
         // Verify cgroups v2, detect rootless mode, and log system info.
-        let rootless = match client.system_info().await {
+        match client.system_info().await {
             Ok(info) => {
                 if info.host.cgroup_version != "v2" {
                     return Err(PodmanApiError::Connection(format!(
@@ -490,14 +493,13 @@ impl PodmanComputeDriver {
                     apparmor_enabled = info.host.security.apparmor_enabled,
                     "Connected to Podman"
                 );
-                info.host.security.rootless
             }
             Err(e) => {
                 return Err(PodmanApiError::Connection(format!(
                     "failed to query Podman system info: {e}"
                 )));
             }
-        };
+        }
 
         // Rootless pre-flight: warn if subuid/subgid ranges look missing.
         // Not a hard error because some systems configure these via LDAP or
@@ -533,7 +535,6 @@ impl PodmanComputeDriver {
         let driver = Self {
             client,
             config,
-            rootless,
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 gpu_inventory,
                 allow_all_default_gpu,
@@ -779,14 +780,25 @@ impl PodmanComputeDriver {
                     if volume.name != name {
                         return Err(missing());
                     }
-                    if name == container::volume_name(sandbox_id)
-                        || name == crate::isolation::channel_volume_name(sandbox_id)
+                    let workspace_volume = name == container::volume_name(sandbox_id);
+                    if workspace_volume || name == crate::isolation::channel_volume_name(sandbox_id)
                     {
                         let owned = volume.labels.as_ref().is_some_and(|labels| {
                             labels.get(LABEL_SANDBOX_ID) == Some(sandbox_id)
                                 && labels.get(container::LABEL_SANDBOX_WORKSPACE) == Some(workspace)
                         });
-                        if !owned || volume.driver != "local" || !volume.options.is_empty() {
+                        // The channel volume has no options. The managed
+                        // workspace is owned by the container's final identity,
+                        // or has no options when an older gateway created it.
+                        let options_ok = volume.options.is_empty()
+                            || (workspace_volume
+                                && numeric_user(&inspect.config.user).is_some_and(|owner| {
+                                    crate::client::volume_options_match_owner(
+                                        &volume.options,
+                                        Some(owner),
+                                    )
+                                }));
+                        if !owned || volume.driver != "local" || !options_ok {
                             return Err(missing());
                         }
                     } else {
@@ -1814,7 +1826,6 @@ impl PodmanComputeDriver {
         Self {
             client,
             config,
-            rootless: false,
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 gpu_inventory,
                 allow_all_default_gpu,
@@ -3097,6 +3108,80 @@ mod tests {
                     .iter()
                     .all(|request| request.starts_with("GET "))
             );
+            let _ = fs::remove_file(socket);
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_accepts_workspace_volume_owned_by_workload_identity() {
+        let owned = serde_json::json!({"o":"uid=1234,gid=1235","UID":"1234","GID":"1235"});
+        for (workspace_options, channel_options, allowed) in [
+            (owned.clone(), serde_json::json!({}), true),
+            // Created by a gateway that did not set volume ownership.
+            (serde_json::json!({}), serde_json::json!({}), true),
+            (
+                serde_json::json!({"o":"uid=0,gid=0","UID":"0","GID":"0"}),
+                serde_json::json!({}),
+                false,
+            ),
+            (owned.clone(), owned.clone(), false),
+        ] {
+            let sandbox_id = "sandbox-owned";
+            let workspace_volume = container::volume_name(sandbox_id);
+            let channel_volume = crate::isolation::channel_volume_name(sandbox_id);
+            let volume = |name: &str, options: &serde_json::Value| {
+                StubResponse::new(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "Name": name, "Driver": "local", "Options": options,
+                        "Labels": {LABEL_SANDBOX_ID: sandbox_id, container::LABEL_SANDBOX_WORKSPACE: "team-a"}
+                    })
+                    .to_string(),
+                )
+            };
+            let container = serde_json::json!({
+                "Id": "workload", "Name": "workload", "State": {"Status": "created", "Running": false},
+                "Config": {
+                    "User": "1234:1235",
+                    "Labels": {
+                        LABEL_SANDBOX_ID: sandbox_id,
+                        container::LABEL_SANDBOX_WORKSPACE: "team-a",
+                        openshell_core::resource_admission::CONFIG_USED_LABEL: "false",
+                        openshell_core::resource_admission::IDENTITIES_LABEL: "{}",
+                    }
+                },
+                "Mounts": [
+                    {"Type": "volume", "Name": workspace_volume},
+                    {"Type": "volume", "Name": channel_volume},
+                ]
+            });
+            let (socket, _, handle) = spawn_podman_stub(
+                "admission-owned",
+                vec![
+                    StubResponse::new(StatusCode::OK, container.to_string()),
+                    volume(&workspace_volume, &workspace_options),
+                    volume(&channel_volume, &channel_options),
+                ],
+            );
+            let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+                socket_path: Some(socket.clone()),
+                resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            let result = driver.admit_container_resources("workload").await;
+            assert_eq!(
+                result.is_ok(),
+                allowed,
+                "workspace {workspace_options}, channel {channel_options}: {result:?}"
+            );
+            if allowed {
+                handle.await.unwrap();
+            } else {
+                handle.abort();
+            }
             let _ = fs::remove_file(socket);
         }
     }
