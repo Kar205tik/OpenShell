@@ -6147,7 +6147,7 @@ network_policies:
 
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_image_repair_before_report_refetches() {
-        assert_startup_repair_before_rejection_refetches(
+        Box::pin(assert_startup_repair_before_rejection_refetches(
             unset_policy_snapshot(),
             ImagePolicyDiscovery::Policy(Box::new(proto_tcp_policy_fixture())),
             proto_policy_fixture(),
@@ -6156,7 +6156,7 @@ network_policies:
                 UNATTACHED_PROVIDER_DIAGNOSTIC,
             ),
             "image policy",
-        )
+        ))
         .await;
     }
 
@@ -6164,7 +6164,7 @@ network_policies:
     async fn startup_policy_write_refusal_baseline_repair_before_report_refetches() {
         let mut repaired = proto_tcp_policy_fixture();
         assert!(enrich_proto_baseline_paths(&mut repaired));
-        assert_startup_repair_before_rejection_refetches(
+        Box::pin(assert_startup_repair_before_rejection_refetches(
             settings_poll_result(
                 Some(proto_tcp_policy_fixture()),
                 1,
@@ -6174,7 +6174,7 @@ network_policies:
             repaired,
             SyncRefusal::new(tonic::Code::InvalidArgument, INVALID_MIDDLEWARE_DIAGNOSTIC),
             "policy update that adds baseline filesystem paths",
-        )
+        ))
         .await;
     }
 
