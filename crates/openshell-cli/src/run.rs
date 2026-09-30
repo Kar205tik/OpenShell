@@ -2779,6 +2779,15 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
             "configuration_change_id": record.configuration_change_id,
             "configuration_change_time": record.configuration_change_time.as_ref().map(ToString::to_string),
             "first_rejection_time": record.first_rejection_time.as_ref().map(ToString::to_string),
+            "phase": if record.deadline.is_none() && record.timeout_time.is_none() {
+                "ready"
+            } else if record.preparation_deadline.is_some() && record.admission_start_time.is_none() {
+                "preparation"
+            } else {
+                "admission"
+            },
+            "preparation_deadline": record.preparation_deadline.as_ref().map(ToString::to_string),
+            "admission_start_time": record.admission_start_time.as_ref().map(ToString::to_string),
             "deadline": record.deadline.as_ref().map(ToString::to_string),
             "timeout_time": record.timeout_time.as_ref().map(ToString::to_string),
             "cleanup_completed_time": record.cleanup_completed_time.as_ref().map(ToString::to_string),
@@ -7759,6 +7768,38 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("pending")
+        );
+    }
+
+    #[test]
+    fn provisioning_json_distinguishes_preparation_and_admission() {
+        let mut sandbox = Sandbox::default();
+        sandbox.set_phase(SandboxPhase::Provisioning.into());
+        let ceiling = openshell_core::time::timestamp_from_millis(1_800_000).ok();
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(openshell_core::proto::SandboxProvisioning {
+                preparation_deadline: ceiling,
+                deadline: ceiling,
+                ..Default::default()
+            });
+        let json = super::sandbox_to_json(&sandbox);
+        assert_eq!(json["provisioning"]["phase"], "preparation");
+        assert_eq!(
+            json["provisioning"]["preparation_deadline"],
+            "1970-01-01T00:30:00Z"
+        );
+        assert!(json["provisioning"]["admission_start_time"].is_null());
+        sandbox
+            .status
+            .as_mut()
+            .unwrap()
+            .provisioning
+            .as_mut()
+            .unwrap()
+            .admission_start_time = openshell_core::time::timestamp_from_millis(600_000).ok();
+        assert_eq!(
+            super::sandbox_to_json(&sandbox)["provisioning"]["phase"],
+            "admission"
         );
     }
 

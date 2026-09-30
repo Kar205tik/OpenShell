@@ -126,10 +126,13 @@ mod tests {
     // inventories; the provider-environment file map is public-only. The
     // request has no provider-file capability field: older supervisors ignore
     // the additive file map while retaining the rest of the response.
+    // Preparation timing adds two optional timestamps to SandboxProvisioning.
+    // Existing rows decode with both absent and retain their active deadline;
+    // no stored attempt gains another phase or time budget on upgrade.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "2ed66dbc38c60eb96c7461c76d02813c177facfad93753b180534477270ad240";
+        "0213c2fafac2c280d5305016ba55409b5f15f7767e79e1dd138f9c074a5ce2ce";
     const DURABLE_SCHEMA_SHA256: &str =
-        "399737f2a367d2e3a9d78cf84e2a97eef041835554599790788e4bbf318116c3";
+        "3c1332c5cfd32b87d977ea1efa54f88397ec5452da9dfc42135079334d72a65c";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "d3c444ecdb42306af8a81791481fdfc147ddc54bf344e1c8e69bd06745c6cc3c";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
