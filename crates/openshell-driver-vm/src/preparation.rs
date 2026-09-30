@@ -238,6 +238,9 @@ impl Attempt {
         }
     }
 
+    // macOS may replace the staging lease when proving an exited process group
+    // has no remaining owner; other platforms only read the worker state.
+    #[cfg_attr(not(target_os = "macos"), allow(clippy::needless_pass_by_ref_mut))]
     fn kill_group(&mut self) -> io::Result<()> {
         if let Some(id) = self.child.as_ref().and_then(Child::id) {
             let pid = i32::try_from(id).map_err(io::Error::other)?;
