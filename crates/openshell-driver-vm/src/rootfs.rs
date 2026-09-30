@@ -1477,8 +1477,6 @@ fn remove_rootfs_path(rootfs: &Path, relative: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "linux")]
-    use std::os::unix::fs::PermissionsExt as _;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
