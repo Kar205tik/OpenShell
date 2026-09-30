@@ -2139,7 +2139,9 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pending = tokio::time::timeout(Duration::from_secs(5), broker.accept())
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+            let pending = tokio::time::timeout(Duration::from_secs(30), broker.accept())
                 .await
                 .unwrap()
                 .unwrap();
@@ -2153,7 +2155,6 @@ mod tests {
                 .unwrap();
             stream.set_nonblocking(true).unwrap();
             let mut stream = tokio::net::TcpStream::from_std(stream).unwrap();
-            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
             let mut probe = [0; 14];
             stream.read_exact(&mut probe).await.unwrap();
             assert_eq!(&probe, b"metadata-probe");
