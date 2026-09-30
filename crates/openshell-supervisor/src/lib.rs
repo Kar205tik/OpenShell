@@ -2707,16 +2707,38 @@ async fn reject_startup_configuration(
     error: &str,
     log_key: Option<&str>,
 ) -> Result<()> {
-    grpc_retry("Startup rejection report", || {
-        gateway.report(
-            sandbox_id,
-            instance_id,
-            Some(snapshot),
-            openshell_core::proto::ConfigurationAdmissionState::Rejected,
-            error,
-        )
+    let recorded = grpc_retry("Startup rejection report", || async {
+        match gateway
+            .report(
+                sandbox_id,
+                instance_id,
+                Some(snapshot),
+                openshell_core::proto::ConfigurationAdmissionState::Rejected,
+                error,
+            )
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<tonic::Status>()
+                        .is_some_and(|status| status.code() == tonic::Code::Aborted)
+                }) =>
+            {
+                // The desired generation changed while this report was in
+                // flight. Replaying the old snapshot cannot succeed; let the
+                // caller fetch the repair immediately without logging a stale
+                // rejection or delaying it as an unchanged configuration.
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     })
     .await?;
+    if !recorded {
+        return Ok(());
+    }
     // Keep reporting readiness on every retry, but log only changed rejections.
     // The log key is the diagnostic itself unless the caller passes a stable
     // `log_key` because its diagnostic text can vary between identical
@@ -5738,12 +5760,16 @@ network_policies:
     /// global, it refuses every write the way the gateway does. Otherwise,
     /// without a refusal, it stores the payload as the next policy revision and
     /// returns the new snapshot, as the gateway does for an accepted write.
-    /// Every call is recorded, including the generation each report names, so
-    /// a test can check what startup did after a refused write.
+    /// Every call is recorded, including the generation each report names.
+    /// Reports for obsolete generations fail with `ABORTED`, as the gateway
+    /// requires. Tests can install a repair before a refused write returns or
+    /// script rejection-report errors to exercise retries and fatal failures.
     #[derive(Clone)]
     struct WriteRefusingStartupGateway {
         desired: Arc<std::sync::Mutex<openshell_core::grpc_client::SettingsPollResult>>,
         refusals: Arc<std::sync::Mutex<std::collections::VecDeque<SyncRefusal>>>,
+        repair_after_refusal: Option<openshell_core::grpc_client::SettingsPollResult>,
+        rejection_report_errors: Arc<std::sync::Mutex<std::collections::VecDeque<tonic::Code>>>,
         calls: UnboundedSender<StartupCall>,
     }
 
@@ -5783,6 +5809,9 @@ network_policies:
                 self.refusals.lock().unwrap().pop_front()
             };
             if let Some(refusal) = refusal {
+                if let Some(repaired) = &self.repair_after_refusal {
+                    *desired = repaired.clone();
+                }
                 return Err(
                     openshell_core::grpc_client::grpc_status_error(tonic::Status::new(
                         refusal.code,
@@ -5814,6 +5843,29 @@ network_policies:
                     generation: snapshot.map(report_generation),
                 }))
                 .unwrap();
+            if state == openshell_core::proto::ConfigurationAdmissionState::Rejected
+                && let Some(code) = self.rejection_report_errors.lock().unwrap().pop_front()
+            {
+                return Err(
+                    openshell_core::grpc_client::grpc_status_error(tonic::Status::new(
+                        code,
+                        "rejection report failed",
+                    ))
+                    .wrap_err("failed to report sandbox configuration"),
+                );
+            }
+            if matches!(
+                state,
+                openshell_core::proto::ConfigurationAdmissionState::Rejected
+                    | openshell_core::proto::ConfigurationAdmissionState::Accepted
+            ) && snapshot.map(report_generation)
+                != Some(report_generation(&self.desired.lock().unwrap()))
+            {
+                return Err(openshell_core::grpc_client::grpc_status_error(
+                    tonic::Status::aborted("configuration generation has changed"),
+                )
+                .wrap_err("failed to report sandbox configuration"));
+            }
             Ok(())
         }
     }
@@ -5882,6 +5934,8 @@ network_policies:
             refusals: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
                 refusals,
             ))),
+            repair_after_refusal: None,
+            rejection_report_errors: Arc::default(),
             calls,
         };
         let startup_gateway = gateway.clone();
@@ -6000,6 +6054,232 @@ network_policies:
             repaired,
         )
         .await;
+    }
+
+    /// Install an operator's repair after the refused write but before its
+    /// rejection report. The obsolete report must lead straight to a new
+    /// snapshot, without resending the write or delaying the repaired launch.
+    async fn assert_startup_repair_before_rejection_refetches(
+        initial: openshell_core::grpc_client::SettingsPollResult,
+        discovery: ImagePolicyDiscovery,
+        repaired: openshell_core::proto::SandboxPolicy,
+        refusal: SyncRefusal,
+        write: &str,
+    ) {
+        use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
+        let initial_generation = report_generation(&initial);
+        let repaired_snapshot = settings_poll_result(
+            Some(repaired.clone()),
+            initial.version + 1,
+            PolicySource::Sandbox,
+        );
+        let repaired_generation = report_generation(&repaired_snapshot);
+        let diagnostic = format!("Gateway rejected the {write}: {}", refusal.message);
+        let (calls, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let gateway = WriteRefusingStartupGateway {
+            desired: Arc::new(std::sync::Mutex::new(initial)),
+            refusals: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+                refusal,
+            ]))),
+            repair_after_refusal: Some(repaired_snapshot),
+            rejection_report_errors: Arc::default(),
+            calls,
+        };
+        let started = tokio::time::Instant::now();
+        let bundle = timeout(
+            Duration::from_secs(30),
+            load_policy_with_gateway(
+                Some("sandbox-id".to_string()),
+                Some("sandbox".to_string()),
+                Some("http://unused.invalid".to_string()),
+                None,
+                None,
+                &openshell_extension_core::ExtensionCredentialStore::new(),
+                LocalPolicyIdentity::Required,
+                Some(discovery),
+                &gateway,
+            ),
+        )
+        .await
+        .expect("a superseded rejection must not stall startup")
+        .unwrap_or_else(|error| {
+            panic!(
+                "a repair that precedes its rejection report must resume startup: {}",
+                startup_error_chain(&error)
+            )
+        });
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "a superseded rejection must fetch the repaired generation immediately"
+        );
+        let mut trace = Vec::new();
+        while let Ok(call) = observed.try_recv() {
+            trace.push(call);
+        }
+        assert_eq!(
+            trace,
+            [
+                StartupCall::Snapshot,
+                StartupCall::Report(StartupReport {
+                    state: ConfigurationAdmissionState::Pending,
+                    error: String::new(),
+                    generation: Some(initial_generation.clone()),
+                }),
+                StartupCall::Snapshot,
+                StartupCall::Sync,
+                StartupCall::Report(StartupReport {
+                    state: ConfigurationAdmissionState::Rejected,
+                    error: diagnostic,
+                    generation: Some(initial_generation),
+                }),
+                StartupCall::Snapshot,
+                StartupCall::Report(StartupReport {
+                    state: ConfigurationAdmissionState::Accepted,
+                    error: String::new(),
+                    generation: Some(repaired_generation),
+                }),
+            ],
+            "startup must discard the obsolete rejection and validate the repair"
+        );
+        assert_eq!(bundle.2, Some(repaired));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_policy_write_refusal_image_repair_before_report_refetches() {
+        assert_startup_repair_before_rejection_refetches(
+            unset_policy_snapshot(),
+            ImagePolicyDiscovery::Policy(Box::new(proto_tcp_policy_fixture())),
+            proto_policy_fixture(),
+            SyncRefusal::new(
+                tonic::Code::FailedPrecondition,
+                UNATTACHED_PROVIDER_DIAGNOSTIC,
+            ),
+            "image policy",
+        )
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_policy_write_refusal_baseline_repair_before_report_refetches() {
+        let mut repaired = proto_tcp_policy_fixture();
+        assert!(enrich_proto_baseline_paths(&mut repaired));
+        assert_startup_repair_before_rejection_refetches(
+            settings_poll_result(
+                Some(proto_tcp_policy_fixture()),
+                1,
+                openshell_core::proto::PolicySource::Sandbox,
+            ),
+            ImagePolicyDiscovery::Missing,
+            repaired,
+            SyncRefusal::new(tonic::Code::InvalidArgument, INVALID_MIDDLEWARE_DIAGNOSTIC),
+            "policy update that adds baseline filesystem paths",
+        )
+        .await;
+    }
+
+    /// Exercise rejection reporting directly so transport and identity errors
+    /// cannot be mistaken for policy-write failures or registration failures.
+    async fn startup_rejection_report_with_errors(
+        errors: Vec<tonic::Code>,
+    ) -> (Result<()>, Vec<StartupCall>, Duration, StartupRejectionLog) {
+        let snapshot = unset_policy_snapshot();
+        let (calls, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let gateway = WriteRefusingStartupGateway {
+            desired: Arc::new(std::sync::Mutex::new(snapshot.clone())),
+            refusals: Arc::default(),
+            repair_after_refusal: None,
+            rejection_report_errors: Arc::new(std::sync::Mutex::new(errors.into())),
+            calls,
+        };
+        let mut log = StartupRejectionLog::default();
+        let started = tokio::time::Instant::now();
+        let result = reject_startup_configuration(
+            &gateway,
+            &mut log,
+            "sandbox-id",
+            "instance-id",
+            &snapshot,
+            "policy write refused",
+            None,
+        )
+        .await;
+        let mut trace = Vec::new();
+        while let Ok(call) = observed.try_recv() {
+            trace.push(call);
+        }
+        assert!(trace.iter().all(|call| matches!(
+            call,
+            StartupCall::Report(report)
+                if report.state == openshell_core::proto::ConfigurationAdmissionState::Rejected
+                    && report.generation == Some(report_generation(&snapshot))
+                    && report.error == "policy write refused"
+        )));
+        (result, trace, started.elapsed(), log)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_rejection_report_aborted_after_transient_failure_refetches() {
+        let (result, trace, elapsed, log) = startup_rejection_report_with_errors(vec![
+            tonic::Code::Unavailable,
+            tonic::Code::Aborted,
+        ])
+        .await;
+        result.expect("a superseded report must return to reconciliation");
+        assert_eq!(trace.len(), 2, "an obsolete report must not be resent");
+        assert_eq!(elapsed, Duration::from_secs(1));
+        assert!(log.0.is_none(), "an obsolete rejection must not be logged");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_rejection_report_transient_failure_retries_and_logs() {
+        let (result, trace, elapsed, log) =
+            startup_rejection_report_with_errors(vec![tonic::Code::Unavailable]).await;
+        result.expect("a transient report failure must retry");
+        assert_eq!(trace.len(), 2);
+        assert_eq!(elapsed, Duration::from_secs(3));
+        assert_eq!(
+            log.0,
+            Some((
+                LoadedPolicyRevision::from_snapshot(&unset_policy_snapshot()),
+                "policy write refused".to_string(),
+            )),
+            "a recorded rejection must retain its diagnostic for log suppression"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_rejection_report_transient_exhaustion_stays_fatal() {
+        let (result, trace, elapsed, log) =
+            startup_rejection_report_with_errors(vec![tonic::Code::Unavailable; 5]).await;
+        let error = result.expect_err("exhausted report retries must terminate startup");
+        assert!(error.to_string().contains("failed after 5 attempts"));
+        assert_eq!(trace.len(), 5);
+        assert_eq!(elapsed, Duration::from_secs(11));
+        assert!(log.0.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_rejection_report_permanent_failure_stays_fatal() {
+        for code in [
+            tonic::Code::FailedPrecondition,
+            tonic::Code::InvalidArgument,
+            tonic::Code::PermissionDenied,
+            tonic::Code::NotFound,
+            tonic::Code::Unauthenticated,
+        ] {
+            let (result, trace, elapsed, log) =
+                startup_rejection_report_with_errors(vec![code]).await;
+            let error = result.expect_err("a permanent report failure must terminate startup");
+            assert!(error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<tonic::Status>()
+                    .is_some_and(|status| status.code() == code)
+            }));
+            assert_eq!(trace.len(), 1, "{code:?} must not be retried");
+            assert_eq!(elapsed, Duration::ZERO);
+            assert!(log.0.is_none());
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -6127,6 +6407,8 @@ network_policies:
         let gateway = WriteRefusingStartupGateway {
             desired: Arc::new(std::sync::Mutex::new(global)),
             refusals: Arc::default(),
+            repair_after_refusal: None,
+            rejection_report_errors: Arc::default(),
             calls,
         };
         let bundle = timeout(
@@ -6219,6 +6501,8 @@ network_policies:
                     refusals: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
                         SyncRefusal::new(code, "sandbox caller cannot write this policy"),
                     ]))),
+                    repair_after_refusal: None,
+                    rejection_report_errors: Arc::default(),
                     calls,
                 };
                 let result = timeout(
