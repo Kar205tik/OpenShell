@@ -190,9 +190,10 @@ impl Attempt {
     }
 
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
-        // Called after worker stdout reaches EOF, but before reaping its PID.
-        // Stop any descendants while the process-group identity is still
-        // reserved by the unreaped leader, so a reused PID cannot be targeted.
+        // EOF can precede observable process exit. Let normal worker teardown
+        // finish before signaling, preserving its real status and reserving
+        // its PID until any remaining descendants have been stopped.
+        wait_for_worker_exit(self.child.as_ref().and_then(Child::id)).await?;
         self.kill_group()?;
         self.child
             .as_mut()
@@ -204,7 +205,20 @@ impl Attempt {
     /// Do not report successful cleanup while a formatter or other descendant
     /// still owns the lease. Preserve uncertain staging for the next reconcile.
     pub async fn cleanup(&mut self) -> Result<(), Status> {
-        self.kill_group()
+        let signal_result = self.kill_group();
+        #[cfg(target_os = "macos")]
+        let signal_result = match signal_result {
+            // Darwin can reject signaling an exiting process before waitid
+            // exposes its terminal status. Keep immediate cancellation first,
+            // then retry the same guarded signal only after observing exit.
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+                wait_for_worker_exit(self.child.as_ref().and_then(Child::id))
+                    .await
+                    .and_then(|()| self.kill_group())
+            }
+            result => result,
+        };
+        signal_result
             .map_err(|error| Status::internal(format!("terminate image preparation: {error}")))?;
         if let Some(child) = self.child.as_mut() {
             tokio::time::timeout(CLEANUP_TIMEOUT, child.wait())
@@ -260,24 +274,7 @@ impl Attempt {
     /// owns the inherited staging lease. Live or uncertain ownership still fails.
     #[cfg(target_os = "macos")]
     fn exited_worker_has_no_descendant_owner(&mut self, id: u32) -> io::Result<bool> {
-        // SAFETY: waitid writes into initialized storage. WNOWAIT observes the
-        // exit without reaping, so neither PID nor process group can be reused.
-        let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        if unsafe {
-            libc::waitid(
-                libc::P_PID,
-                id,
-                &raw mut status,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        if !matches!(
-            status.si_code,
-            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
-        ) {
+        if !worker_has_exited(id)? {
             return Ok(false);
         }
 
@@ -296,6 +293,51 @@ impl Attempt {
         self.lease = Some(lease);
         Ok(true)
     }
+}
+
+/// Observe termination without releasing the PID or process-group identity.
+fn worker_has_exited(id: u32) -> io::Result<bool> {
+    // SAFETY: waitid writes initialized storage. WNOWAIT leaves the owned
+    // child unreaped, so its PID cannot be reused before descendant signaling.
+    let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::waitid(
+            libc::P_PID,
+            id,
+            &raw mut status,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(matches!(
+        status.si_code,
+        libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+    ))
+}
+
+/// Bound EOF-to-exit observation without blocking the runtime or reaping.
+/// Dropping this future leaves the worker available to cancellation cleanup.
+async fn wait_for_worker_exit(id: Option<u32>) -> io::Result<()> {
+    let Some(id) = id else {
+        return Ok(());
+    };
+    tokio::time::timeout(CLEANUP_TIMEOUT, async {
+        loop {
+            if worker_has_exited(id)? {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "image preparation worker did not exit before cleanup deadline",
+        )
+    })?
 }
 
 impl Drop for Attempt {
@@ -556,6 +598,89 @@ mod tests {
         })
         .await
         .expect("worker must exit without being reaped");
+    }
+
+    async fn worker_at_stdout_eof(temp: &tempfile::TempDir, script: &str) -> Attempt {
+        let launcher = temp.path().join("worker");
+        fs::write(&launcher, script).unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+        let cache = super::super::image_cache_root_dir(temp.path());
+        let mut attempt = Attempt::create(&cache).unwrap();
+        let mut stdout = attempt.spawn(&launcher, request(temp.path())).unwrap();
+        let mut output = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut output),
+        )
+        .await
+        .expect("worker must close stdout")
+        .unwrap();
+        attempt
+    }
+
+    #[tokio::test]
+    async fn stdout_eof_keeps_successful_worker_exit_status() {
+        let temp = tempfile::tempdir().unwrap();
+        // stdout can close before the kernel exposes the final exit status.
+        // Keep that interval deterministic without requiring scheduler timing.
+        let mut attempt =
+            worker_at_stdout_eof(&temp, "#!/bin/sh\nexec 1>&-\nsleep 0.1\nexit 0\n").await;
+        let status = attempt.wait().await;
+        attempt.cleanup().await.expect("cleanup EOF worker");
+
+        let status = status.expect("wait after stdout EOF");
+        assert!(status.success(), "worker exit after stdout EOF: {status}");
+        assert!(!attempt.directory.exists());
+    }
+
+    #[tokio::test]
+    async fn stdout_eof_with_live_descendant_cleans_group_after_worker_exit() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut attempt = worker_at_stdout_eof(
+            &temp,
+            "#!/bin/sh\nsleep 300 >/dev/null &\nexec 1>&-\nsleep 0.1\nexit 0\n",
+        )
+        .await;
+        let status = attempt.wait().await;
+        attempt.cleanup().await.expect("stop inherited lease owner");
+
+        let status = status.expect("preserve leader status");
+        assert!(status.success(), "worker exit with descendant: {status}");
+        assert!(!attempt.directory.exists());
+        assert!(attempt.child.as_ref().unwrap().id().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_stdout_eof_wait_leaves_worker_for_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut attempt = worker_at_stdout_eof(&temp, "#!/bin/sh\nexec 1>&-\nsleep 300\n").await;
+        let result = tokio::time::timeout(Duration::from_millis(50), attempt.wait()).await;
+        attempt
+            .cleanup()
+            .await
+            .expect("cancelled wait cleans worker");
+
+        assert!(result.is_err(), "waiting for exit must remain cancellable");
+        assert!(!attempt.directory.exists());
+        assert!(attempt.child.as_ref().unwrap().id().is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn cleanup_after_stdout_eof_waits_for_exit_publication() {
+        // Repeated natural exits exercise Darwin's short interval between
+        // closing stdout and making terminal status observable to waitid.
+        for _ in 0..8 {
+            let temp = tempfile::tempdir().unwrap();
+            let mut attempt = worker_at_stdout_eof(&temp, "#!/bin/sh\nexit 0\n").await;
+            let result = attempt.cleanup().await;
+            if result.is_err() {
+                // Reap this owned worker even when checking faulty behavior.
+                attempt.cleanup().await.expect("retry owned test cleanup");
+            }
+            result.expect("natural EOF must not fail cancellation cleanup");
+            assert!(!attempt.directory.exists());
+        }
     }
 
     #[tokio::test]
