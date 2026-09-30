@@ -397,7 +397,8 @@ function Invoke-VsCargo {
     param(
         [Parameter(Mandatory = $true)] [string] $RustTarget,
         [Parameter(Mandatory = $true)] [string] $CargoArgs,
-        [Parameter(Mandatory = $true)] [string] $LogName
+        [Parameter(Mandatory = $true)] [string] $LogName,
+        [switch] $AllowNonZeroExit
     )
 
     & rustup target add $RustTarget
@@ -464,6 +465,10 @@ function Invoke-VsCargo {
             Get-Content $logPath
         }
         if ($exitCode -ne 0) {
+            if ($AllowNonZeroExit) {
+                Write-Warning "Command completed with exit code $exitCode. See $logPath"
+                return
+            }
             throw "Command failed with exit code $exitCode. See $logPath"
         }
     } finally {
@@ -564,13 +569,17 @@ function Invoke-ConformanceTest([string] $RustTarget) {
 
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo build --target $RustTarget --bin openshell --bin openshell-gateway --bin openshell-conformance $Z3GatewayFeatures" `
+        -CargoArgs "cargo build --target $RustTarget --bin openshell --bin openshell-gateway $Z3GatewayFeatures" `
         -LogName "build-$RustTarget-conformance.log"
+
+    Invoke-VsCargo `
+        -RustTarget $RustTarget `
+        -CargoArgs "cargo test --locked --manifest-path tests/suites/conformance/Cargo.toml --package openshell-test-conformance-cli --target $RustTarget --no-run" `
+        -LogName "build-$RustTarget-conformance-tests.log"
 
     $binaryDir = Join-Path $TargetDir "$RustTarget\debug"
     $gateway = Join-Path $binaryDir "openshell-gateway.exe"
     $cli = Join-Path $binaryDir "openshell.exe"
-    $conformance = Join-Path $binaryDir "openshell-conformance.exe"
 
     $buildRoot = Join-Path $binaryDir "build"
     $z3Candidates = @(
@@ -593,8 +602,6 @@ function Invoke-ConformanceTest([string] $RustTarget) {
     $gatewayConfig = Join-Path $testRoot "gateway.toml"
     $gatewayLog = Join-Path $LogDir "test-$RustTarget-conformance-gateway.log"
     $gatewayErrorLog = Join-Path $LogDir "test-$RustTarget-conformance-gateway.err.log"
-    $conformanceLog = Join-Path $LogDir "test-$RustTarget-conformance.log"
-    $conformanceErrorLog = Join-Path $LogDir "test-$RustTarget-conformance.err.log"
     New-Item -ItemType Directory -Force -Path $configRoot, $stateRoot | Out-Null
     @"
 [openshell]
@@ -641,16 +648,11 @@ backend = "process_container"
         & $cli gateway select windows-conformance
         if ($LASTEXITCODE -ne 0) { throw "Failed to select the conformance gateway." }
 
-        Write-Host "==> $conformance run --openshell-bin $cli"
-        Write-Host "    log:    $conformanceLog"
-        $conformanceProcess = Start-Process -FilePath $conformance `
-            -ArgumentList @("run", "--openshell-bin", "`"$cli`"") `
-            -PassThru -Wait -NoNewWindow `
-            -RedirectStandardOutput $conformanceLog -RedirectStandardError $conformanceErrorLog
-        Get-Content -LiteralPath $conformanceLog, $conformanceErrorLog -ErrorAction SilentlyContinue
-        if ($conformanceProcess.ExitCode -ne 0) {
-            throw "Conformance command failed with exit code $($conformanceProcess.ExitCode). See $conformanceLog"
-        }
+        Invoke-VsCargo `
+            -RustTarget $RustTarget `
+            -CargoArgs "cargo test --locked --manifest-path tests/suites/conformance/Cargo.toml --package openshell-test-conformance-cli --target $RustTarget --no-fail-fast -- --test-threads=1 --nocapture" `
+            -LogName "test-$RustTarget-conformance.log" `
+            -AllowNonZeroExit
     } catch {
         Get-Content -LiteralPath $gatewayLog, $gatewayErrorLog -ErrorAction SilentlyContinue
         throw

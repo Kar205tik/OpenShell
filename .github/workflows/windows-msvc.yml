@@ -99,7 +99,6 @@ jobs:
       - name: Test
         run: mise run --skip-tools windows:test:${{ matrix.arch }}
       - name: Full MXC conformance
-        continue-on-error: true
         run: mise run --skip-tools windows:test:conformance:${{ matrix.arch }}
       - name: Upload MXC conformance report
         if: always()
@@ -108,8 +107,8 @@ jobs:
           name: windows-mxc-conformance-${{ matrix.arch }}
           path: |
             build-${{ matrix.rust_target }}-conformance.log
+            build-${{ matrix.rust_target }}-conformance-tests.log
             test-${{ matrix.rust_target }}-conformance.log
-            test-${{ matrix.rust_target }}-conformance.err.log
             test-${{ matrix.rust_target }}-conformance-gateway.log
             test-${{ matrix.rust_target }}-conformance-gateway.err.log
           if-no-files-found: warn
@@ -186,7 +185,6 @@ jobs:
       - name: Test
         run: mise run --skip-tools windows:test:${{ matrix.arch }}
       - name: Full MXC conformance
-        continue-on-error: true
         run: mise run --skip-tools windows:test:conformance:${{ matrix.arch }}
       - name: Upload MXC conformance report
         if: always()
@@ -195,8 +193,8 @@ jobs:
           name: windows-mxc-conformance-${{ matrix.arch }}
           path: |
             build-${{ matrix.rust_target }}-conformance.log
+            build-${{ matrix.rust_target }}-conformance-tests.log
             test-${{ matrix.rust_target }}-conformance.log
-            test-${{ matrix.rust_target }}-conformance.err.log
             test-${{ matrix.rust_target }}-conformance-gateway.log
             test-${{ matrix.rust_target }}-conformance-gateway.err.log
           if-no-files-found: warn

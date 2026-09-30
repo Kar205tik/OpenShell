@@ -246,14 +246,14 @@ Windows validation separates source correctness from host capability:
   fail-closed loss handling without requiring MXC.
 - The architecture-specific `windows:*` tasks check, lint, build, and run
   workspace and unsupported-driver contract tests for x64 and ARM64.
-- Hosted Windows CI runs the complete archive conformance suite against the
-  in-process MXC mock through the standalone `openshell-conformance` runner.
-  Every atomic scenario runs so unsupported operations appear as explicit
-  failures in the archived report instead of being skipped. This report is
-  advisory while those capability gaps remain: its scenario failures do not
-  fail the surrounding Windows job, and CI always uploads the runner and
-  gateway logs. Portable fixtures supply Windows commands, paths, and policies
-  only to establish each scenario's prerequisites. They keep control-plane
+- Hosted Windows CI runs the complete CLI conformance Cargo test package
+  against the in-process MXC mock. Every atomic scenario runs serially so
+  unsupported operations appear as explicit failures in the archived report
+  instead of being skipped. Scenario failures remain advisory while those
+  capability gaps exist, but compilation, gateway startup, and gateway
+  selection failures still fail the surrounding Windows job. CI always uploads
+  the Cargo and gateway logs. Portable fixtures supply Windows commands, paths,
+  and policies only to establish each scenario's prerequisites. They keep control-plane
   lifecycle coverage independent from restart/exec coverage and ensure that
   file-transfer and policy failures identify the public unsupported operation
   rather than an invalid Unix workload definition.
