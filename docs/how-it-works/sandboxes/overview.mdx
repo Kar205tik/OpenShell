@@ -256,46 +256,6 @@ Override it with any image visible to the active compute driver:
 openshell sandbox create --from registry.example.com/agents/my-agent:1.0
 ```
 
-If you omit `--image`, the gateway applies its default sandbox image when a sandbox is created from the template. Use this when the template should only define resource, environment, or driver settings.
-
-Create a sandbox from a template:
-
-```shell
-openshell sandbox create --template gpu-kata --provider github -- claude
-```
-
-The `--template` flag cannot be combined with inline workload flags such as `--from`, `--cpu`, `--memory`, `--gpu`, `--env`, `--env-from`, or `--driver-config-json`. Put those values on the template instead. Create-time policy and provider attachments remain part of the sandbox request, so each sandbox can keep its own access boundary.
-
-Inspect and manage templates:
-
-```shell
-openshell sandbox template list
-openshell sandbox template list --label-selector team=runtime
-openshell sandbox template get gpu-kata
-openshell sandbox template delete gpu-kata
-```
-
-Use `--all-workspaces` with `sandbox template list` when you need an admin view across workspaces:
-
-```shell
-openshell sandbox template list --all-workspaces
-```
-
-For JSON or YAML, template list output contains `templates` and
-`next_page_token` fields. Pass the returned token to `--page-token` to
-continue.
-
-## Base Sandbox Container
-
-The `base` sandbox container is the default runtime image for standard OpenShell sandboxes unless the gateway overrides its default sandbox image. It is published as `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` and maintained in the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) repository.
-
-The base container includes common development tooling, supported agent CLIs, and the default sandbox policy. Use it when you want a general-purpose agent environment without a workflow-specific image:
-
-```shell
-openshell sandbox create --from base
-```
-
-For default policy coverage by agent, refer to [Default Policy](/reference/default-policy). For the supported agent list, refer to [Supported Agents](/about/supported-agents).
 Refer to [Default Policy](/how-it-works/policies/default-policy), [Run Your First Agent](/about/run-your-first-agent), and the [bring-your-own-container example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container).
 
 ## Connect to a Sandbox
@@ -417,17 +377,6 @@ openshell sandbox create --env API_KEY=sk-test --env DEBUG=1 -- my-agent
 
 Variables set with `--env` are available to all processes in the sandbox, including the initial command, interactive shells, and exec commands.
 
-Use `--env-from KEY[=ENVVAR]` when the value should come from the CLI process environment instead of appearing in the CLI process arguments. If `ENVVAR` is omitted, OpenShell reads `KEY`:
-
-```shell
-export SESSION_TOKEN="..."
-openshell sandbox create --env-from SESSION_TOKEN -- my-agent
-openshell sandbox create --env-from AGENT_TOKEN=SESSION_TOKEN -- my-agent
-```
-
-`--env-from` changes only how the CLI receives the value. The resulting variable is still available to processes in the sandbox, just like `--env`.
-
-When an `--env` key looks like a credential — a known provider variable, or a name whose underscore-separated segments include a credential word such as `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `API_KEY`, `ACCESS_KEY`, or `SECRET_KEY` (for example `DB_TOKEN` or `MY_ACCESS_KEY`) — `sandbox create` prints a non-blocking warning. Matching is on whole segments, so unrelated names like `TOKENIZERS_PARALLELISM` or `PASSWORDLESS_LOGIN` do not warn. The agent inside the sandbox can read plain environment values directly, so to hide a secret from the agent, attach it through a [profile-backed provider](/providers/profiles) with `--provider` instead. Suppress the warning with `--no-credential-warnings`. Detection uses the key name only; values are never inspected or printed.
 When an `--env` key looks like a credential — a known provider variable, or a name whose underscore-separated segments include a credential word such as `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `API_KEY`, `ACCESS_KEY`, or `SECRET_KEY` (for example `DB_TOKEN` or `MY_ACCESS_KEY`) — `sandbox create` prints a non-blocking warning. Matching is on whole segments, so unrelated names like `TOKENIZERS_PARALLELISM` or `PASSWORDLESS_LOGIN` do not warn. The agent inside the sandbox can read plain environment values directly, so to hide a secret from the agent, attach it through a [profile-backed provider](/how-it-works/providers/profiles) with `--provider` instead. Suppress the warning with `--no-credential-warnings`. Detection uses the key name only; values are never inspected or printed.
 
 You can also set per-command environment variables with `sandbox exec`:
@@ -878,20 +827,6 @@ openshell sandbox delete sandbox-a sandbox-b
 When a multi-sandbox delete fails for one entry, the CLI reports that sandbox's
 failure and continues with the remaining names. The command exits with an error
 after it attempts every requested deletion if any entry failed.
-
-Automation that already observed a sandbox's immutable identity can prevent a
-same-name replacement from being deleted:
-
-```shell
-openshell sandbox delete my-sandbox \
-  --expected-id <sandbox-id> \
-  --expected-resource-version <resource-version>
-```
-
-Identity preconditions require exactly one sandbox name, and a resource version
-may be supplied only with the immutable ID. The gateway returns an `ABORTED`
-error without changing the sandbox or calling its compute driver when either
-value no longer matches.
 
 ## Sandbox Lifecycle
 

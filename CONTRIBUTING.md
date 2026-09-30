@@ -2,11 +2,6 @@
 
 OpenShell is built agent-first. We use agents to design and implement systems, while humans manage product decisions and the project roadmap.
 
-Windows supervisor builds include `openshell-supervisor` and `openshell-supervisor-process`.
-The MXC workload helper is `openshell-mxc-isolation-backend`; driver and isolation
-composition live in `openshell-driver-registry` and `openshell-isolation-backends`.
-MXC confirmation is currently provisional; compile success is not runtime qualification.
-
 ## The Critical Rule
 
 **You must understand your code.** Using AI agents to write code is not just acceptable, it's how this project works. But you must be able to explain what your changes do and how they interact with the rest of the system. If you can't, don't submit it.
@@ -348,7 +343,7 @@ cargo build -p openshell-prover-cli --features bundled-z3
 For x86-64 and ARM64 Windows MSVC builds, use one of these Z3 paths:
 
 - Prebuilt Z3 (the default for `windows:*` tasks): `z3-sys` downloads the
-  pinned Z3 4.16.0 GitHub release for the target architecture on the first
+  pinned Z3 5.1.0 GitHub release for the target architecture on the first
   build. Cargo reuses the extracted archive from its target directory. Windows
   CI authenticates the GitHub API request with `READ_ONLY_GITHUB_TOKEN` and
   preserves the archive in the architecture-specific Cargo target cache. For
@@ -368,49 +363,14 @@ just this crate does not require `LIBCLANG_PATH`:
 cargo build -p openshell-prover --target x86_64-pc-windows-msvc --features bundled-z3
 ```
 
-### Windows build and validation
+### Windows full build
 
-Use the platform-native `windows:*` mise tasks for Windows MSVC development.
-The lane supports x64 and ARM64 and builds `openshell-gateway.exe`,
-`openshell.exe`, and `openshell-supervisor-relay.exe`. It does not enable
-Docker, Kubernetes, Podman, or VM-backed execution on Windows.
-
-Install Visual Studio C++ Build Tools, a compatible Windows SDK, Rust through
-rustup, mise, and the Visual Studio LLVM tools used by `bindgen`. Test-bearing
-tasks also require the pinned `cargo-nextest` tool. Install it once through
-mise:
-
-```powershell
-mise install --locked github:nextest-rs/nextest
-```
-
-Run every task with `--skip-tools`; mise orchestrates the commands but does not
-install the Windows compiler toolchain.
-
-| Task | Purpose |
-|---|---|
-| `windows:lint:<x64\|arm64>` | Run Clippy for the Windows-supported workspace on the selected target architecture. |
-| `windows:build:<x64\|arm64>` | Build the three Windows release executables. |
-| `windows:test:<x64\|arm64>` | Run the workspace suite natively; the target must match the host architecture. |
-| `windows:test:unsupported:<x64\|arm64>` | Run the focused unsupported-driver contracts. |
-| `windows:test:mxc-real:<x64\|arm64>` | Run the probe-gated real-`wxc-exec` integration suite on the matching host. |
-| `windows:artifacts` | Report sizes and SHA256 hashes for release artifacts. |
-| `windows:ci` | Run the aggregate x64-host check, build, test, contract, and artifact workflow. |
-
-The task definitions in [`tasks/windows.toml`](tasks/windows.toml), the
-PowerShell implementation in
-[`tasks/scripts/windows-msvc.ps1`](tasks/scripts/windows-msvc.ps1), and the
-hosted workflow in
-[`.github/workflows/windows-msvc.yml`](.github/workflows/windows-msvc.yml) are
-the executable sources of truth. See
-[`architecture/windows.md`](architecture/windows.md) for the stable Windows/MXC
-runtime and enforcement boundaries.
-
-To build x64 locally, use `windows:build:x64` instead of a single-crate Cargo
-build. It downloads the pinned prebuilt Z3 release by default. A full build also
-compiles crates that use `bindgen`, including the MXC driver, so it requires
-`libclang.dll`. If LLVM is not on the default search path, set `LIBCLANG_PATH`
-to the directory containing `libclang.dll`:
+To build the full set of Windows binaries, including `openshell-gateway.exe`
+and `openshell.exe`, use the `windows:build:x64` mise task instead of a
+single-crate `cargo build`. It downloads the pinned prebuilt Z3 release by default. A
+full build also compiles crates that use `bindgen` (e.g. the MXC driver on
+Windows), so it requires `libclang.dll`; if LLVM is not on the default search
+path, set `LIBCLANG_PATH` to the directory containing `libclang.dll`:
 
 ```powershell
 $env:LIBCLANG_PATH='C:\Program Files\Microsoft Visual Studio\2022\<Edition>\VC\Tools\Llvm\x64\bin'

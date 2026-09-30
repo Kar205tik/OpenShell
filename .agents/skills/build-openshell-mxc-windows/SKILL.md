@@ -1,6 +1,6 @@
 ---
 name: build-openshell-mxc-windows
-description: Maintain and validate OpenShell's Windows MSVC lane for x64 and ARM64. Use when working on Windows compilation, `windows:*` mise tasks, unsupported Windows compute-driver contracts, MXC example wiring checks, or Windows build reports. This skill does not implement Docker, Kubernetes, Podman, VM, MXC driver, policy translation, MSI, service, or supervisor runtime support on Windows.
+description: Maintain and validate OpenShell's build-only Windows MSVC lane for x64 and ARM64. Use when working on Windows compilation, `windows:*` mise tasks, unsupported Windows compute-driver contracts, or Windows build reports. This skill does not implement Docker, Kubernetes, Podman, VM, MXC driver, policy translation, MSI, service, or supervisor runtime support on Windows.
 metadata:
   internal: true
 ---
@@ -12,21 +12,14 @@ OpenShell repository. The Windows lane is already present in `main`; do not
 treat this skill as a first-time porting recipe unless the user explicitly asks
 for a new fork or a from-scratch bring-up.
 
-The lane validates that OpenShell can compile and test on Windows MSVC for the
-supported deliverables:
+The lane is build-only. It validates that OpenShell can compile and test on
+Windows MSVC for the supported deliverables:
 
 - `openshell-gateway.exe`
 - `openshell.exe`
-- `openshell-supervisor.exe` (standard supervisor)
-- `openshell-mxc-isolation-backend.exe` (MXC native boundary)
-- `openshell-supervisor-relay.exe` (compatibility tool owned by the MXC driver)
 
 It intentionally does not make Windows a Docker, Kubernetes, Podman, or VM
 runtime host.
-
-The supervisor and process-supervisor crates are included in compilation checks.
-Do not exclude them to make a Windows check pass. MXC confirmation currently has
-explicit unverified-success TODOs; compilation is not enforcement qualification.
 
 ## Current Repository Shape
 
@@ -37,9 +30,7 @@ The Windows build lane is implemented by these tracked files:
 | `tasks/windows.toml` | Mise task entry points for `windows:*` commands. |
 | `tasks/rust.toml`, `tasks/test.toml`, and `tasks/markdown.toml` | Windows routing for compiler-bearing checks, explicit Unix-only test skips, and Markdown dependency setup. |
 | `tasks/scripts/windows-msvc.ps1` | PowerShell wrapper that enters the Visual Studio developer environment and invokes Cargo. |
-| `.github/workflows/windows-msvc.yml` | Opt-in PR lint and test plus advisory main/manual cache seeding and dependent binary builds on native x64 and ARM64 runners. |
-| `CONTRIBUTING.md` | Human-facing Windows build prerequisites and command summary. |
-| `architecture/windows.md` | Stable Windows/MXC runtime and cross-architecture boundaries. |
+| `.github/workflows/windows-msvc.yml` | Opt-in PR lint and test plus advisory `windows` branch cache seeding and dependent binary builds on native x64 and ARM64 runners. |
 | `.agents/skills/build-openshell-mxc-windows/` | This skill and companion reference material. |
 
 Use the code that is already in the repo. Do not generate a parallel Windows
@@ -57,10 +48,6 @@ In scope:
   `openshell`.
 - Running workspace tests on a native x64 or ARM64 host.
 - Running focused unsupported-driver contract tests.
-- Running the shipped Ollama and cloud-inference MXC examples against the
-  in-process `wxc` mock and a local API stub.
-- Running the shipped provider-credential, OCSF audit, and aggregate MXC
-  examples against the in-process `wxc` mock.
 - Reporting test counts, skipped/gated areas, warnings, artifacts, and logs.
 - Keeping Linux and macOS build paths unchanged.
 - Keeping unsupported Windows compute drivers explicit and testable.
@@ -131,7 +118,6 @@ The lane targets a Windows host with Visual Studio Build Tools and rustup.
 | Windows SDK | `where.exe rc.exe` from a Developer PowerShell | Install an SDK containing target libraries and ARM64 tools. |
 | Rust via rustup | `rustc --version` | Add each target being validated: `x86_64-pc-windows-msvc` and/or `aarch64-pc-windows-msvc`. The wrapper also adds the selected target. |
 | mise | `mise --version` | Used as a task runner only. |
-| cargo-nextest | `cargo nextest --version` | Required by `windows:test:*` and `windows:ci`. Install the pinned version with `mise install --locked github:nextest-rs/nextest` before running tasks with `--skip-tools`. |
 | Git | `git --version` | Needed for checkout and sync work. |
 | PowerShell | `$PSVersionTable.PSVersion` | Windows PowerShell 5.1 works; PowerShell 7 is quieter with mise shell hooks. |
 
@@ -148,7 +134,7 @@ from this skill.
 | `CARGO_TARGET_DIR` | `target` under repo root | Override Cargo output location. Use a short absolute path when x64-to-ARM64 builds approach Windows path-length limits. |
 | `Z3_LIBRARY_PATH_OVERRIDE` | unset | Directory containing an x64 system `libz3.lib`; not valid for ARM64. |
 | `Z3_SYS_Z3_HEADER` | unset | Full `z3.h` path required with a system Z3 library. |
-| `Z3_SYS_Z3_VERSION` | `4.16.0` | Pinned official prebuilt Z3 release selected by the wrapper. |
+| `Z3_SYS_Z3_VERSION` | `5.1.0` | Pinned official prebuilt Z3 release selected by the wrapper. |
 | `READ_ONLY_GITHUB_TOKEN` | unset | Optional token for the Z3 release lookup; GitHub Actions supplies `github.token`. |
 | `RUSTC_WRAPPER` | inherited | The wrapper resolves an available command to an absolute path. If it is unavailable, the wrapper warns and continues without compiler caching. |
 
@@ -168,46 +154,7 @@ mise run --skip-tools windows:build:x64
 mise run --skip-tools windows:build:arm64
 mise run --skip-tools windows:test:x64
 mise run --skip-tools windows:test:unsupported:x64
-mise run --skip-tools windows:e2e:mxc:inference-mock:x64
-mise run --skip-tools windows:e2e:mxc:provider-mock
-mise run --skip-tools windows:e2e:mxc:ocsf-mock
-mise run --skip-tools windows:e2e:mxc:aggregate-mock
 ```
-
-Use the `arm64` form of the inference task on a native ARM64 host. It exercises
-the real gateway, CLI, and shipped PowerShell runners with an in-process `wxc`
-mock and local HTTP responses. It proves example wiring, request execution, and
-sandbox-scoped credential propagation; it does not prove MXC, AppContainer,
-filesystem, or network enforcement.
-
-The provider mock proves provider/profile/policy attachment and placeholder
-propagation without exposing the synthetic credential. The OCSF mock proves
-the durable zero-provider-events diagnostic path. The aggregate mock exercises
-the read-write, read-only, default-deny, and unsupported-network-policy
-scenarios, including a staging path containing spaces. These remain wiring
-checks; native MXC qualification is required for enforcement evidence.
-
-The two `windows:test:mxc-real:*` tasks are host-specific and mutually
-exclusive on a single host (each rejects the other architecture -- see the
-table below): run `windows:test:mxc-real:x64` on an x64 host, or
-`windows:test:mxc-real:arm64` on an ARM64 host, as part of validating this
-subsystem -- run the one matching your host architecture, not both, and not
-neither. Both print a SKIP reason and exit 0 when `wxc-exec` or the matching
-backend is unavailable. Once the host proves that ProcessContainer is live,
-however, required capabilities are authoritative: rejection of
-`network.proxy` or another enforcement failure fails the task. Running the
-architecture-appropriate task is therefore safe without real MXC hardware but
-must not be described as wholly skip-safe on supported hardware. Neither task
-is part of `windows:ci`'s ordered contract, so invoke it explicitly.
-
-For GB300 Windows ARM64 qualification, do not use the skip-safe developer task
-as release evidence. `windows:test:mxc-gb300:arm64` runs the required
-ProcessContainer subset and fails on any required `SKIP`.
-`windows:qualify:mxc:gb300:contract` validates the static coverage matrix, and
-`windows:qualify:mxc:gb300` runs the complete source, host, build/test, policy
-E2E, and OpenClaw gate. Its inputs and evidence contract are documented in
-`crates/openshell-driver-mxc/qualification/README.md`. Native-x64 NemoClaw and
-x64 Windows results never satisfy this ARM64 contract.
 
 For full validation, detect the Windows host architecture first and choose the
 native lane dynamically:
@@ -217,14 +164,12 @@ $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
 switch ($arch.ToString()) {
     "X64" {
         mise run --skip-tools windows:ci
-        mise run --skip-tools windows:test:mxc-real:x64
     }
     "Arm64" {
         mise run --skip-tools windows:check:arm64
         mise run --skip-tools windows:build:arm64
         mise run --skip-tools windows:test:arm64
         mise run --skip-tools windows:test:unsupported:arm64
-        mise run --skip-tools windows:test:mxc-real:arm64
         mise run --skip-tools windows:artifacts
     }
     default {
@@ -247,18 +192,16 @@ order:
 The GitHub Actions jobs layer architecture-specific `Swatinem/rust-cache`
 entries for Cargo registry and dependency target artifacts with sccache's GHA
 backend for cacheable Rust compiler outputs. Failed runs also save their usable
-dependency artifacts. Pull-request mirrors labeled `test:windows` run Clippy
-for the Windows-supported workspace and e2e crates plus Rust tests, build
-release binaries, and run the inference, provider-credential, OCSF audit, and
-aggregate shipped examples through their mock tasks. Pushes to `main` and
-manual dispatches run the same lint and test commands in a cache-seed job,
-followed by a dependent release-binary build and mock-example job. The seed and
-PR jobs use the same cache namespaces. Merge
-queues do not run this workflow. Main/manual seed and build jobs use job-level
-`continue-on-error: true`; opt-in PR jobs report failures normally. Applying
-the label alone does not start a run: re-run all jobs in the current mirror
-push run, or push a new mirrored commit. The binaries are not uploaded or
-published.
+dependency artifacts. Pull-request mirrors labeled `test:windows` run Clippy for the
+Windows-supported workspace and e2e crates plus Rust tests. Pushes to `windows` and
+manual dispatches on that branch run the same lint and test commands in a cache-seed job,
+followed by a dependent release-binary build job. The seed and PR jobs use the
+same cache namespaces, but pull-request mirrors cannot restore the
+`windows` branch cache because GitHub scopes caches by branch. Merge queues do
+not run this workflow. Release-branch seed
+and build jobs use job-level `continue-on-error: true`; opt-in PR jobs report
+failures normally. Applying the label alone does not start a run: re-run all
+jobs in the current mirror push run, or push a new mirrored commit. The binaries are not uploaded or published.
 
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
@@ -298,22 +241,12 @@ crypto dependency builds.
 |---|---|
 | `windows:check:x64` | `cargo check --workspace` for `x86_64-pc-windows-msvc`, excluding unsupported Windows packages as top-level workspace targets. |
 | `windows:check:arm64` | `cargo check --workspace` for `aarch64-pc-windows-msvc`, with the same top-level exclusions. |
-| `windows:build:x64` | Release-builds `openshell-gateway.exe`, `openshell.exe`, `openshell-supervisor.exe`, `openshell-mxc-isolation-backend.exe`, and the compatibility relay for x64. |
-| `windows:build:arm64` | Release-builds `openshell-gateway.exe`, `openshell.exe`, `openshell-supervisor.exe`, `openshell-mxc-isolation-backend.exe`, and the compatibility relay for ARM64. |
+| `windows:build:x64` | Release-builds `openshell-gateway.exe` and `openshell.exe` for x64. |
+| `windows:build:arm64` | Release-builds `openshell-gateway.exe` and `openshell.exe` for ARM64. |
 | `windows:test:x64` | Runs native x64 workspace tests with `--no-fail-fast`, excluding unsupported Windows packages as top-level workspace targets. |
 | `windows:test:arm64` | Runs native ARM64 workspace tests with `--no-fail-fast` and the same package exclusions. Rejects non-ARM64 hosts. |
 | `windows:test:unsupported:x64` | Re-runs focused `openshell-gateway` tests for unsupported Windows driver behavior. |
 | `windows:test:unsupported:arm64` | Re-runs the same focused contracts natively on ARM64. Rejects non-ARM64 hosts. |
-| `windows:test:mxc-real:x64` | Runs the serial, ignored real-`wxc-exec` integration suite natively on x64 through the MSVC wrapper. Rejects non-x64 hosts. |
-| `windows:test:mxc-real:arm64` | Runs the same real-`wxc-exec` suite natively on ARM64. Rejects non-ARM64 hosts. |
-| `windows:test:mxc-gb300:arm64` | Runs the required native ARM64 ProcessContainer subset and fails when a test skips. |
-| `windows:e2e:mxc:inference-mock:x64` | Runs the shipped Ollama and cloud-inference demos on native x64 through the real gateway and CLI, in-process `wxc` mock, and local API stub. This is wiring evidence, not MXC enforcement evidence. |
-| `windows:e2e:mxc:inference-mock:arm64` | Runs the same mock-wiring checks on native ARM64 with ARM64 release binaries. |
-| `windows:e2e:mxc:provider-mock` | Runs the shipped provider-credential demo with a synthetic credential and verifies placeholder propagation without leaking the credential. |
-| `windows:e2e:mxc:ocsf-mock` | Runs the shipped OCSF audit demo and verifies the durable zero-provider-events finding. |
-| `windows:e2e:mxc:aggregate-mock` | Runs the four aggregate MXC scenarios through the mock, including a staging path containing spaces. |
-| `windows:qualify:mxc:gb300:contract` | Validates the required/optional/unsupported/architecture-constrained GB300 matrix. |
-| `windows:qualify:mxc:gb300` | Runs the fail-closed GB300 ARM64 gate and validates hash-bound evidence. |
 | `windows:artifacts` | Reports size and SHA256 for release artifacts that exist. |
 | `windows:ci` | Runs the full ordered x64-host Windows CI lane, plus ARM64 check/build when not skipped. |
 
@@ -364,8 +297,6 @@ When reporting `windows:ci`, distinguish these categories:
 - Passed tests from the full ARM64 workspace test log when run on a native
   ARM64 host.
 - The focused unsupported-contract re-run.
-- The architecture-matched MXC inference, provider-credential, OCSF audit, and
-  aggregate mock tasks and their explicit wiring-only limitation.
 - Explicit Cargo ignored tests, usually ignored doc examples.
 - Tests hidden by `#[cfg(not(target_os = "windows"))]`; these often appear as
   `running 0 tests`, not as ignored tests.
@@ -385,8 +316,6 @@ Useful log files:
 | `test-aarch64-pc-windows-msvc.log` | Full native ARM64 workspace test output. |
 | `test-x86_64-pc-windows-msvc-unsupported-*.log` | Focused unsupported-driver contract output. |
 | `test-aarch64-pc-windows-msvc-unsupported-*.log` | Focused native ARM64 contract output. |
-| `test-x86_64-pc-windows-msvc-mxc-real.log` | Native x64 real-MXC integration output. |
-| `test-aarch64-pc-windows-msvc-mxc-real.log` | Native ARM64 real-MXC integration output. |
 
 The first check downloads the pinned official Z3 archive for the target
 architecture through `z3-sys`. GitHub Actions authenticates the lookup with its
@@ -427,7 +356,6 @@ Every substantial Windows build run should report:
 | ARM64 check/build | Pass/fail/skipped and log path. |
 | Native tests | Passed/failed/ignored/filtered counts and log path for the host architecture. |
 | Unsupported contracts | Which focused tests ran and their result. |
-| MXC example mock E2E | Architecture, result, artifact directory on failure, and the wiring-only limitation. |
 | Artifacts | Binary paths, size, and SHA256 when available. |
 | Skips | Explicitly explain tests not run for a non-native architecture, unsupported driver package exclusions, and Windows cfg-gated tests. |
 | Follow-ups | Only concrete follow-ups tied to failures or requested scope. |

@@ -52,7 +52,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-otel-test-support/` | OpenTelemetry test support | Shared loopback OTLP collector fixture for tracing tests |
 | `crates/openshell-core/` | Shared core | Common types, configuration, error handling |
 | `crates/openshell-extension-core/` | Extension core | Shared extension identity, JWT claims, bearer-token rotation, and TLS transport primitives |
-| `crates/openshell-gateway/` | Gateway binary composition | Portable gateway entrypoint using the compute driver registry |
+| `crates/openshell-gateway/` | Gateway binary composition | Links selected first-party compute drivers into the backend-agnostic server registry |
 | `crates/openshell-sdk/` | Shared client SDK | Async Rust gateway client (gRPC transport, TLS, OIDC refresh, edge tunnel); consumed by CLI, TUI, and `@openshell/sdk` |
 | `crates/openshell-providers/` | Provider management | Credential provider backends |
 | `crates/openshell-tui/` | Terminal UI | Ratatui-based dashboard for monitoring |
@@ -64,10 +64,6 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-driver-podman/` | Podman compute driver | In-process `ComputeDriver` backend for local Podman sandbox containers |
 | `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
 | `crates/openshell-driver-mxc/` | Microsoft MXC compute driver | In-process Windows AppContainer and isolation-session compute backend |
-| `crates/openshell-mxc-isolation-backend/` | MXC isolation backend | Native Windows boundary, identity, confirmation and proxy ingress |
-| `crates/openshell-isolation-backends/` | Isolation composition | First-party Sandbox Protocol adapter registration |
-| `crates/openshell-driver-registry/` | Compute driver composition | Platform selection and registration outside gateway service code |
-| `crates/openshell-supervisor-relay/` | MXC supervisor relay | **Windows-only** standalone binary the MXC driver spawns inside a ProcessContainer/isolation session in place of `agent_command`; launches the real target process, exposes a JSON control channel (launch/shutdown/forward) over its own inherited stdin/stdout, and bridges dynamic TCP forwards (`openshell forward service`) to it |
 | `crates/openshell-prover/` | Policy prover | Policy verification and proof generation |
 | `crates/openshell-prover-cli/` | Policy prover CLI | Standalone local policy boundary checks |
 | `crates/openshell-server-macros/` | Server macros | Compile-time helpers for gateway RPC authorization |

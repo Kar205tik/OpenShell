@@ -1009,11 +1009,3 @@ probes. Arguments after `--` validate the effective daemon invocation,
 including its command-line overrides. Preflight preserves every failed file. Do
 not advise users to delete or rewrite it automatically; back it up and follow the
 manual schema-v2 migration in the Gateway Configuration reference.
-
-## Windows MXC supervisor diagnostics
-
-MXC now starts the standard supervisor plus `openshell-mxc-isolation-backend.exe`.
-Check both configured executable paths and the driver's private state directory.
-Readiness depends on the authenticated supervisor session. The old relay-spawner
-settings no longer select the runtime. An `unverified_enforcement` confirmation
-is a documented prototype TODO and does not establish native enforcement.

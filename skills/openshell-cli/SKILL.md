@@ -271,7 +271,7 @@ Key flags:
 - `--provider`: Attach configured credential providers for API keys, tokens, and other secrets (repeatable)
 - `--policy`: Custom policy YAML (otherwise uses built-in default or `OPENSHELL_SANDBOX_POLICY` env var)
 - `--gpu [COUNT]`: Request the driver's default GPU selection or a specific GPU count
-- `--cpu`, `--memory`: Set per-sandbox compute sizing. Docker/Podman apply limits; Kubernetes applies matching requests and limits; VM currently accepts but ignores them; MXC rejects them because its current backends cannot enforce them.
+- `--cpu`, `--memory`: Set per-sandbox compute sizing. Docker/Podman apply limits; Kubernetes applies matching requests and limits.
 - `--driver-config-json`: Pass experimental driver-specific sandbox configuration
 - `--template NAME`: Create from a named sandbox workload template. Conflicts with inline workload flags such as `--from`, `--gpu`, `--cpu`, `--memory`, `--env`, and `--driver-config-json`.
 - `--label KEY=VALUE`: Add labels for later selection (repeatable)
@@ -461,16 +461,8 @@ openshell logs my-sandbox --since 5m
 openshell sandbox delete my-sandbox
 openshell sandbox delete sandbox-1 sandbox-2 sandbox-3   # Multiple at once
 openshell sandbox delete --all
-
-# Fail closed if the observed sandbox was replaced or changed
-openshell sandbox delete my-sandbox \
-  --expected-id <sandbox-id> \
-  --expected-resource-version <resource-version>
 ```
 
-Identity preconditions are valid only for one named sandbox, and a resource
-version requires the immutable ID. A mismatch returns `ABORTED` before
-OpenShell mutates gateway state or calls the compute driver.
 `deletion accepted` means cleanup is still pending. Inspect the sandbox until
 it disappears before assuming completion. An already-absent sandbox succeeds;
 missing workspaces and authorization failures remain errors. Do not blindly
@@ -500,7 +492,6 @@ the operation that removes retained state.
 
 This is the most important multi-step workflow. It enables a tight feedback cycle where sandbox policy is refined based on observed activity.
 
-**Key concept**: Policies have static fields (immutable after creation: `filesystem_policy`, `landlock`, `process`, `ui`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. MXC rejects every operation that would change a running sandbox's effective policy: direct replacement or merge, global policy changes, policy-advisor approval or undo, provider attach or detach, and updates to an attached provider's profile. The gateway rejects these operations before saving anything; delete and recreate the MXC sandbox instead. UI capabilities are enforced only by a configured driver/backend advertising complete UI-policy support. Today that is the MXC driver's OpenShell `process_container` backend, which emits MXC's `processcontainer` containment value. `isolation_session` and non-Windows drivers reject any explicit UI section before provisioning; omit it to preserve their existing behavior.
 **Key concept**: Policies have static fields (immutable after activation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. Drivers without the standard supervisor fetch revisions through the sandbox configuration API and report whether they loaded them.
 
 If startup reports `ConfigurationInvalid`, inspect `openshell sandbox get` and
@@ -588,7 +579,7 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 - Binary matching patterns
 - Ordered `network_middlewares`, host selection, HTTP request/response and WebSocket bindings, and `fail_open` or `fail_closed` behavior
 
-`network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. Use `--wait` to verify that the active runtime loaded the revision; do not infer enforcement from the gateway accepting the update. MXC rejects every operation that would change a running sandbox's effective policy: direct replacement or merge, global policy changes, policy-advisor approval or undo, provider attach or detach, and updates to an attached provider's profile. The gateway rejects these operations before saving anything; delete and recreate the MXC sandbox instead. If `filesystem_policy`, `landlock`, `process`, or `ui` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
+`network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. Use `--wait` to verify that the active runtime loaded the revision; do not infer enforcement from the gateway accepting the update. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
 
 Middleware can inspect HTTP requests, HTTP responses, or client WebSocket text
 messages when the implementation advertises the matching binding. The built-in

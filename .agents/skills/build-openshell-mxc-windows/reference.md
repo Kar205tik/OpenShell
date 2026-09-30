@@ -9,17 +9,9 @@ maintaining the existing build-only Windows MSVC lane.
 |---|---|
 | `tasks/windows.toml` | Mise task definitions for `windows:*`. |
 | `tasks/scripts/windows-msvc.ps1` | Visual Studio environment discovery, rustup target setup, Cargo invocation, logs, artifact report. |
-| `.github/workflows/windows-msvc.yml` | Opt-in PR lint and test plus advisory main/manual cache seeding and dependent binary builds on native x64 and ARM64 runners. |
-| `CONTRIBUTING.md` | Human-readable Windows build prerequisites and commands. |
-| `architecture/windows.md` | Stable Windows/MXC runtime and cross-architecture boundaries. |
+| `.github/workflows/windows-msvc.yml` | Opt-in PR lint and test plus `windows` branch cache seeding and dependent binary builds on native x64 and ARM64 runners. |
 
 ## Commands
-
-Install the pinned test runner once before using test-bearing tasks:
-
-```powershell
-mise install --locked github:nextest-rs/nextest
-```
 
 Use `--skip-tools` for all Windows mise tasks:
 
@@ -75,11 +67,11 @@ file.
 For ARM64, verify the Visual Studio instance contains the ARM64 MSVC tools,
 ARM64 Spectre-mitigated libraries, Clang tools, CMake tools, and a Windows SDK.
 Clang supplies host-native `libclang.dll` for `bindgen` and `clang-cl.exe` for
-ARM64 crypto dependencies such as `aws-lc-sys`. Native and x64-to-ARM64 builds
-use the official prebuilt Z3 4.16.0 static library for the target architecture.
-An x64-to-ARM64 check/build discovers and adds host-native Ninja to `PATH`,
-while the crypto crates select `clang-cl`. Use a short `CARGO_TARGET_DIR` if
-Windows path-length limits are reached.
+ARM64 crypto dependencies such as `aws-lc-sys`. Native and
+x64-to-ARM64 builds use the official prebuilt Z3 5.1.0 static library for the
+target architecture. An x64-to-ARM64 check/build discovers and adds host-native
+Ninja to `PATH`, while the crypto crates select `clang-cl`. Use a short
+`CARGO_TARGET_DIR` if Windows path-length limits are reached.
 
 ## Unsupported Driver Rules
 
@@ -119,6 +111,8 @@ top-level workspace targets for check/test:
 --exclude openshell-driver-vault
 --exclude openshell-driver-vm
 --exclude openshell-sandbox
+--exclude openshell-supervisor
+--exclude openshell-supervisor-process
 --exclude openshell-vfio
 ```
 
@@ -187,7 +181,7 @@ blocked dependency.
 ### Focused tests report many filtered-out tests
 
 This is expected for `windows:test:unsupported:x64`. Cargo runs one named test
-and filters the other `openshell-driver-registry` tests. Report these as filtered, not
+and filters the other `openshell-gateway` tests. Report these as filtered, not
 ignored.
 
 ## Reporting Counts
