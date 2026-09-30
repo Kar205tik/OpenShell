@@ -182,12 +182,13 @@ Suites:
 
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
 - CLI conformance (`tests/suites/conformance`) - installed-artifact tests of
-  portable public CLI behavior. Smoke coverage is split into independent
-  control-plane and exec tests so each driver runs only the capabilities it
-  implements. Scenario implementations live in `openshell-conformance`; the
-  standalone `openshell-conformance` binary remains a compatibility runner for
-  driver E2E wrappers. See the [suite README](tests/suites/conformance/README.md)
-  for scope and selection guidance.
+  portable public CLI behavior. Coverage is split into independent capability
+  tests so each driver runs only the contracts it implements and failures remain
+  isolated. Scenario implementations live in `openshell-conformance`; the
+  standalone `openshell-conformance` binary supports exact leaf and family-
+  prefix selection for manual runs and driver E2E wrappers. See the
+  [suite README](tests/suites/conformance/README.md) for scope and selection
+  guidance.
 - Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or
   `e2e-vm`) - CLI conformance plus the common and driver-specific coverage for
   the selected deployment.
@@ -230,11 +231,16 @@ machine-readable status, creates a uniquely named detached sandbox, verifies it
 is `Ready` through get and paginated list output, deletes it, and verifies its
 name no longer appears. The exec test creates its own sandbox and checks
 `sandbox exec` with a run-specific marker. Drivers without exec support run the
-control-plane test alone. Runtimes that require an explicit workload set
-`OPENSHELL_CONFORMANCE_SMOKE_COMMAND` to a JSON string array; additional create
-options can be supplied through `OPENSHELL_CONFORMANCE_SMOKE_CREATE_ARGS`.
-Sandbox lifecycle, label matrices, VM overlay, and TLS-key permission assertions
-remain regular E2E coverage.
+control-plane test alone. Smoke sandboxes use the runtime's default workload and
+create configuration. Lifecycle coverage follows the same split: its
+control-plane test covers stop and stopped deletion without requiring exec,
+while its restart-persistence test uses exec to verify workspace state across
+stop and start. Future environment or canonical-main coverage should use
+separate leaves when it has distinct runtime requirements. The standalone runner
+expands a family selector into independent leaf runs, while installed-artifact
+CI uses the leaf tests directly as its selection and failure-isolation boundary.
+Label matrices, VM overlay, and TLS-key permission assertions remain regular E2E
+coverage.
 
 Each invocation prints a ten-character run ID before creating resources.
 Conformance sandboxes use names such as `ct-<run-id>-cp` and

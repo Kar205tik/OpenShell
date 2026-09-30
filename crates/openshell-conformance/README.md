@@ -16,14 +16,15 @@ The crate is a scenario library, not the primary CI entrypoint:
 |---|---|
 | [`tests/suites/conformance/cli`](../../tests/suites/conformance/README.md) | Wrap exported scenarios as Cargo tests and select them according to runtime capabilities. New installed-artifact CI should use this workspace. |
 | `openshell-conformance` | Define portable scenarios and the shared `OpenShellRunner`. |
-| [`openshell-conformance-cli`](../openshell-conformance-cli) | Run registered scenarios manually or for compatibility with existing E2E tooling. |
+| [`openshell-conformance-cli`](../openshell-conformance-cli) | Run registered leaf scenarios manually or from existing E2E tooling. |
 
-Cargo tests can invoke any exported `Scenario`. The standalone CLI invokes the
-scenarios returned by `scenarios()`. A scenario does not need to be registered
-with the CLI when it exists only as an independently selectable test capability.
-For example, the Cargo suite invokes `SMOKE_CONTROL_PLANE_SCENARIO` and
-`SMOKE_EXEC_SCENARIO` separately, while the compatibility CLI retains the
-registered aggregate `SMOKE_SCENARIO` under the stable name `smoke`.
+Each leaf Cargo test is both a selection boundary and a failure-isolation
+boundary. It creates a fresh `OpenShellRunner`, invokes one exported `Scenario`,
+and finishes cleanup independently. The standalone CLI registers the same
+leaves. An exact selector such as `smoke/exec` runs one leaf, while a family
+selector such as `smoke` runs every registered `smoke/...` leaf. Each selected
+leaf receives its own runner and cleanup lifecycle, so one failure does not hide
+results for later capabilities.
 
 Scenarios must exercise public CLI behavior, own only resources created for
 their run ID, and remain independent of unrelated gateway state. Split coverage
@@ -32,6 +33,9 @@ the largest supported subset without weakening assertions. Driver internals,
 platform enforcement, and hardware qualification belong in driver-specific
 tests rather than this crate.
 
-When adding a scenario, export it from the library and add the appropriate Cargo
-test wrapper under `tests/suites/conformance/cli`. Add it to the standalone CLI
-registry only when existing E2E or manual workflows also need that entrypoint.
+When adding or splitting a scenario, create one leaf per independently
+selectable runtime capability, export each leaf from the library, and add a
+separate Cargo test wrapper under `tests/suites/conformance/cli`. Register every
+leaf with the standalone CLI and name it `<family>/<capability>`. Family-prefix
+selection provides the grouped manual and E2E entrypoint without introducing an
+aggregate scenario that can stop at its first failed child.

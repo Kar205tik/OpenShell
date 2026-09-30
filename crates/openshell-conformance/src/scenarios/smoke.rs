@@ -3,7 +3,6 @@
 
 //! Portable smoke conformance scenarios.
 
-use std::ffi::OsString;
 use std::time::{Duration, Instant};
 
 use crate::{OpenShellRunner, STATUS_TIMEOUT, Scenario, ScenarioFuture};
@@ -29,33 +28,19 @@ struct SandboxListPage {
     next_page_token: String,
 }
 
-/// Certify status -> create -> list Ready -> exec -> delete -> list empty.
-pub const SMOKE_SCENARIO: Scenario = Scenario {
-    name: "smoke",
-    description: "Run the control-plane and exec smoke scenarios.",
-    run: run_smoke,
-};
-
 /// Certify status -> create -> get/list Ready -> delete -> list empty.
 pub const SMOKE_CONTROL_PLANE_SCENARIO: Scenario = Scenario {
-    name: "smoke-control-plane",
+    name: "smoke/control-plane",
     description: "Create, inspect, and delete a sandbox without using sandbox exec.",
     run: run_smoke_control_plane,
 };
 
 /// Certify create -> exec -> delete for drivers that support interactive exec.
 pub const SMOKE_EXEC_SCENARIO: Scenario = Scenario {
-    name: "smoke-exec",
+    name: "smoke/exec",
     description: "Create a sandbox, execute a command in it, and delete it.",
     run: run_smoke_exec,
 };
-
-fn run_smoke(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
-    Box::pin(async move {
-        run_smoke_control_plane_inner(runner).await?;
-        run_smoke_exec_inner(runner).await
-    })
-}
 
 fn run_smoke_control_plane(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
     Box::pin(async move { run_smoke_control_plane_inner(runner).await })
@@ -120,61 +105,14 @@ async fn create_sandbox(
     step: &str,
 ) -> Result<(), String> {
     runner.track_sandbox(sandbox_name);
-    let mut args = vec![
-        "sandbox".to_string(),
-        "create".to_string(),
-        "--name".to_string(),
-        sandbox_name.to_string(),
-        "--detach".to_string(),
-    ];
-    if let Some(extra_args) = json_string_array_env("OPENSHELL_CONFORMANCE_SMOKE_CREATE_ARGS")? {
-        args.extend(extra_args);
-    }
-    if let Some(command) = smoke_command()? {
-        args.push("--".to_string());
-        args.extend(command);
-    }
-    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
     let create = runner
         .step(step)
         .description("sandbox creation succeeds")
         .with_timeout(CREATE_TIMEOUT)
-        .run(&args)
+        .run(&["sandbox", "create", "--name", sandbox_name, "--detach"])
         .await
         .map_err(|error| error.to_string())?;
     create.require_success()
-}
-
-fn smoke_command() -> Result<Option<Vec<String>>, String> {
-    parse_smoke_command(std::env::var_os("OPENSHELL_CONFORMANCE_SMOKE_COMMAND"))
-}
-
-fn parse_smoke_command(value: Option<OsString>) -> Result<Option<Vec<String>>, String> {
-    let Some(command) = json_string_array("OPENSHELL_CONFORMANCE_SMOKE_COMMAND", value)? else {
-        return Ok(None);
-    };
-    if command.first().is_none_or(String::is_empty) {
-        return Err(
-            "OPENSHELL_CONFORMANCE_SMOKE_COMMAND must contain a non-empty executable".to_string(),
-        );
-    }
-    Ok(Some(command))
-}
-
-fn json_string_array_env(name: &str) -> Result<Option<Vec<String>>, String> {
-    json_string_array(name, std::env::var_os(name))
-}
-
-fn json_string_array(name: &str, value: Option<OsString>) -> Result<Option<Vec<String>>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let value = value
-        .into_string()
-        .map_err(|_| format!("{name} must contain valid Unicode JSON"))?;
-    serde_json::from_str::<Vec<String>>(&value)
-        .map(Some)
-        .map_err(|error| format!("{name} must be a JSON string array: {error}"))
 }
 
 async fn delete_sandbox(
@@ -302,46 +240,5 @@ async fn find_sandbox(
         page = page
             .checked_add(1)
             .ok_or_else(|| "sandbox list page counter overflowed".to_string())?;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn smoke_command_is_optional() {
-        assert_eq!(parse_smoke_command(None).unwrap(), None);
-    }
-
-    #[test]
-    fn smoke_command_parses_a_json_string_array() {
-        assert_eq!(
-            parse_smoke_command(Some(OsString::from(r#"["cmd.exe","/c","exit","0"]"#))).unwrap(),
-            Some(vec![
-                "cmd.exe".into(),
-                "/c".into(),
-                "exit".into(),
-                "0".into()
-            ])
-        );
-    }
-
-    #[test]
-    fn smoke_command_rejects_an_empty_executable() {
-        let error = parse_smoke_command(Some(OsString::from(r#"[""]"#))).unwrap_err();
-        assert!(error.contains("non-empty executable"));
-    }
-
-    #[test]
-    fn smoke_create_args_parse_a_json_string_array() {
-        assert_eq!(
-            json_string_array(
-                "OPENSHELL_CONFORMANCE_SMOKE_CREATE_ARGS",
-                Some(OsString::from(r#"["--policy","policy.yaml"]"#)),
-            )
-            .unwrap(),
-            Some(vec!["--policy".into(), "policy.yaml".into()])
-        );
     }
 }
