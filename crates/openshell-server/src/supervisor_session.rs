@@ -336,7 +336,7 @@ struct PendingRelay {
     sandbox_id: String,
     relay_open: RelayOpen,
     created_at: Instant,
-    /// Last session whose outbound queue received this RelayOpen.
+    /// Last session whose outbound queue received this `RelayOpen`.
     delivered_session_id: Option<String>,
 }
 
@@ -820,12 +820,10 @@ impl SupervisorSessionRegistry {
                 .map_err(|_| Status::unavailable("supervisor session disconnected"))?;
             let sent = {
                 let sessions = self.sessions.lock().unwrap();
-                if !sessions
+                if sessions
                     .get(sandbox_id)
                     .is_some_and(|session| session.session_id == session_id)
                 {
-                    false
-                } else {
                     let mut pending = self.pending_relays.lock().unwrap();
                     if pending.len() >= MAX_PENDING_RELAYS {
                         return Err(Status::resource_exhausted(format!(
@@ -857,6 +855,8 @@ impl SupervisorSessionRegistry {
                         payload: Some(gateway_message::Payload::RelayOpen(relay_open.clone())),
                     });
                     true
+                } else {
+                    false
                 }
             };
             if sent {
@@ -962,9 +962,9 @@ impl SupervisorSessionRegistry {
                 break;
             };
             let sessions = self.sessions.lock().unwrap();
-            if !sessions
+            if sessions
                 .get(sandbox_id)
-                .is_some_and(|session| session.session_id == session_id)
+                .is_none_or(|session| session.session_id != session_id)
             {
                 break;
             }
