@@ -277,8 +277,7 @@ async fn run_version_probe(
             }
         }
         (Ok(None), status) | (Err(_), status @ Err(_)) => status,
-        (Err(error), Ok(_)) => Err(error),
-        (Ok(Some(_)), Err(error)) => Err(error),
+        (Err(error), Ok(_)) | (Ok(Some(_)), Err(error)) => Err(error),
     };
     match (output, status) {
         (Ok((stdout, stderr)), Ok(status)) => Ok(std::process::Output {

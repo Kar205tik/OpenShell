@@ -102,6 +102,15 @@ fn combined(output: &Output) -> String {
     )
 }
 
+fn normalized_diagnostic(output: &Output) -> String {
+    // Terminal line wrapping can split an error sentence after a long path.
+    combined(output)
+        .split_whitespace()
+        .filter(|word| *word != "│")
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[tokio::test]
 async fn local_vm_reports_tools_without_starting_driver_or_creating_state() {
     let fixture = Fixture::new();
@@ -155,21 +164,13 @@ async fn local_vm_rejects_nonexecutable_and_unsupported_tools() {
     .unwrap();
     let output = fixture.run(&[]).await;
     assert!(!output.status.success());
-    assert!(
-        combined(&output).contains("not an executable file"),
-        "{}",
-        combined(&output)
-    );
+    let report = normalized_diagnostic(&output);
+    assert!(report.contains("not an executable file"), "{report}");
 
     fixture.tool("mke2fs", "echo 'mke2fs 1.42.13' >&2");
     let output = fixture.run(&[]).await;
     assert!(!output.status.success());
-    // The diagnostic renderer wraps long selected paths and error text.
-    let report = combined(&output)
-        .split_whitespace()
-        .filter(|word| *word != "│")
-        .collect::<Vec<_>>()
-        .join(" ");
+    let report = normalized_diagnostic(&output);
     assert!(report.contains("not a supported mke2fs"), "{report}");
 }
 
