@@ -38,9 +38,11 @@ impl Fixture {
     fn write_config(&self, driver: Option<&str>) {
         let selector =
             driver.map_or_else(String::new, |name| format!("compute_driver = {name:?}\n"));
+        // TOML serialization preserves quotes and escapes in the fixture path.
+        let state_dir = toml::Value::try_from(self.root.path().join("vm-state"))
+            .expect("serialize VM state directory");
         fs::write(&self.config, format!(
-            "[openshell]\nversion = 2\n[openshell.gateway]\ndisable_tls = true\n{selector}[openshell.drivers.vm]\nbootstrap_image = 'unreachable.invalid/vm:must-not-pull'\nstate_dir = {:?}\n",
-            self.root.path().join("vm-state")
+            "[openshell]\nversion = 2\n[openshell.gateway]\ndisable_tls = true\n{selector}[openshell.drivers.vm]\nbootstrap_image = 'unreachable.invalid/vm:must-not-pull'\nstate_dir = {state_dir}\n"
         )).expect("gateway configuration");
     }
 
