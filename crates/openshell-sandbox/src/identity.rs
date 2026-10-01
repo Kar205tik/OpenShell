@@ -22,6 +22,8 @@ const MAX_ACCOUNT_FIELD_SIZE: usize = 1024;
 pub enum DriverIdentity {
     /// Platform-selected identity used by Kubernetes and `OpenShift`.
     Resolved { uid: u32, gid: u32 },
+    /// VM overlay owner. Explicit policy selectors must agree with this pair.
+    Vm { uid: u32, gid: u32 },
     /// Raw OCI `Config.User` selected by Docker and Podman.
     OciUser { declaration: String },
     /// Drivers with no authoritative identity metadata.
@@ -94,6 +96,18 @@ pub fn resolve_process_identity(
     driver_identity: &DriverIdentity,
 ) -> Result<ResolvedProcessIdentity> {
     match driver_identity {
+        DriverIdentity::Vm { uid, gid } => {
+            validate_vm_process_identity_at(
+                policy,
+                *uid,
+                *gid,
+                Path::new(PASSWD_PATH),
+                Path::new(GROUP_PATH),
+            )?;
+            policy.process.run_as_user = Some(uid.to_string());
+            policy.process.run_as_group = Some(gid.to_string());
+            Ok(ResolvedProcessIdentity::default())
+        }
         DriverIdentity::Resolved { uid, gid } => {
             policy.process.run_as_user = Some(uid.to_string());
             policy.process.run_as_group = Some(gid.to_string());
@@ -130,6 +144,57 @@ pub fn resolve_process_identity(
             Ok(ResolvedProcessIdentity::default())
         }
     }
+}
+
+/// Check selectors before replacing them with the immutable overlay owner.
+/// Names are resolved inside the workload's filesystem, never through host NSS.
+/// The user and group are independent; an omitted selector accepts the driver
+/// default even when the other selector is explicit.
+fn validate_vm_process_identity_at(
+    policy: &SandboxPolicy,
+    uid: u32,
+    gid: u32,
+    passwd_path: &Path,
+    group_path: &Path,
+) -> Result<()> {
+    for (field, selector, expected, account_path) in [
+        (
+            "run_as_user",
+            policy.process.run_as_user.as_deref(),
+            uid,
+            passwd_path,
+        ),
+        (
+            "run_as_group",
+            policy.process.run_as_group.as_deref(),
+            gid,
+            group_path,
+        ),
+    ] {
+        let Some(selector) = selector.filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        validate_component(selector, field)?;
+        let resolved = match selector.parse::<u32>() {
+            Ok(value) => value,
+            Err(_) if field == "run_as_user" => find_passwd_by_name(account_path, selector)?
+                .map(|entry| entry.uid)
+                .ok_or_else(|| {
+                    miette::miette!("VM {field} '{selector}' was not found in /etc/passwd")
+                })?,
+            Err(_) => find_group_by_name(account_path, selector)?
+                .map(|entry| entry.gid)
+                .ok_or_else(|| {
+                    miette::miette!("VM {field} '{selector}' was not found in /etc/group")
+                })?,
+        };
+        if resolved != expected {
+            return Err(miette::miette!(
+                "VM {field} '{selector}' resolves to {resolved}, but the workload identity is {uid}:{gid}; omit the selector or request the driver-owned identity"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::similar_names)]
@@ -546,6 +611,81 @@ mod tests {
         policy.process.run_as_user = user.map(str::to_string);
         policy.process.run_as_group = group.map(str::to_string);
         policy
+    }
+
+    #[test]
+    fn vm_identity_checks_each_selector_before_replacing_policy() {
+        for (user, group) in [
+            (None, None),
+            (Some("1000"), None),
+            (None, Some("1001")),
+            (Some(""), Some("")),
+        ] {
+            let mut requested = policy(user, group);
+            resolve_process_identity(
+                &mut requested,
+                &DriverIdentity::Vm {
+                    uid: 1000,
+                    gid: 1001,
+                },
+            )
+            .unwrap();
+            assert_eq!(requested.process.run_as_user.as_deref(), Some("1000"));
+            assert_eq!(requested.process.run_as_group.as_deref(), Some("1001"));
+        }
+        for (user, group, field) in [
+            (Some("10000"), Some("10001"), "run_as_user"),
+            (Some("10000"), None, "run_as_user"),
+            (None, Some("10001"), "run_as_group"),
+            (Some("1000"), Some("10001"), "run_as_group"),
+        ] {
+            let mut requested = policy(user, group);
+            let before = requested.clone();
+            let error = resolve_process_identity(
+                &mut requested,
+                &DriverIdentity::Vm {
+                    uid: 1000,
+                    gid: 1001,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(field), "{error}");
+            assert!(error.contains("1000:1001"), "{error}");
+            assert_eq!(requested.process.run_as_user, before.process.run_as_user);
+            assert_eq!(requested.process.run_as_group, before.process.run_as_group);
+        }
+    }
+
+    #[test]
+    fn vm_symbolic_identity_uses_workload_accounts_independently() {
+        let (_dir, passwd, group) = account_files(
+            "sandbox:x:2000:3000::/sandbox:/bin/sh\n",
+            "sandbox:x:2001:\n",
+        );
+        let requested = policy(Some("sandbox"), Some("sandbox"));
+        // The group selector uses /etc/group, not the user's primary group.
+        validate_vm_process_identity_at(&requested, 2000, 2001, &passwd, &group).unwrap();
+        for (uid, gid, field) in [(2002, 2001, "run_as_user"), (2000, 2002, "run_as_group")] {
+            let error = validate_vm_process_identity_at(&requested, uid, gid, &passwd, &group)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(field), "{error}");
+        }
+        fs::write(&group, "other:x:2001:\n").unwrap();
+        assert!(
+            validate_vm_process_identity_at(&requested, 2000, 2001, &passwd, &group)
+                .unwrap_err()
+                .to_string()
+                .contains("not found")
+        );
+        fs::write(&group, "sandbox:x:2001:\nsandbox:x:2001:\n").unwrap();
+        assert!(
+            validate_vm_process_identity_at(&requested, 2000, 2001, &passwd, &group)
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
     }
 
     #[test]

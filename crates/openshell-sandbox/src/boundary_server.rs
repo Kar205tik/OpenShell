@@ -2247,7 +2247,29 @@ mod linux {
             })
         }
 
+        fn driver_identity(&self) -> DriverIdentity {
+            let identity = &self.config.workload_identity;
+            if self.config.resource_claims.contains_key("vm.generation") {
+                DriverIdentity::Vm {
+                    uid: identity.uid,
+                    gid: identity.gid,
+                }
+            } else {
+                DriverIdentity::Resolved {
+                    uid: identity.uid,
+                    gid: identity.gid,
+                }
+            }
+        }
+
         fn attach(&self, policy: SandboxPolicyWire) -> Response {
+            // Validate before acknowledging policy activation. The protected
+            // VM identity remains fixed across reconnects and later execs.
+            if let Err(error) =
+                resolve_process_identity(&mut policy.clone().into(), &self.driver_identity())
+            {
+                return guest_error(BoundaryErrorKind::Denied, error.to_string());
+            }
             let mut state = lock(&self.state);
             let accepted = match &*state {
                 RuntimeState::AwaitingAttach => {
@@ -2498,10 +2520,7 @@ mod linux {
                         .build()
                 );
             }
-            let driver_identity = DriverIdentity::Resolved {
-                uid: self.config.workload_identity.uid,
-                gid: self.config.workload_identity.gid,
-            };
+            let driver_identity = self.driver_identity();
             if let Err(error) = resolve_process_identity(&mut policy, &driver_identity) {
                 return guest_error(BoundaryErrorKind::Process, error.to_string());
             }
