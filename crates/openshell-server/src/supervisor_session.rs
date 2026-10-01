@@ -336,6 +336,8 @@ struct PendingRelay {
     sandbox_id: String,
     relay_open: RelayOpen,
     created_at: Instant,
+    /// Last session whose outbound queue received this RelayOpen.
+    delivered_session_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -474,13 +476,19 @@ impl SupervisorSessionRegistry {
         &self,
         sandbox_id: &str,
         timeout: Duration,
-    ) -> Result<mpsc::Sender<GatewayMessage>, Status> {
+    ) -> Result<(String, mpsc::Sender<GatewayMessage>), Status> {
         let deadline = Instant::now() + timeout;
         let mut backoff = SESSION_WAIT_INITIAL_BACKOFF;
 
         loop {
-            if let Some(tx) = self.lookup_session(sandbox_id) {
-                return Ok(tx);
+            let session = self
+                .sessions
+                .lock()
+                .unwrap()
+                .get(sandbox_id)
+                .map(|session| (session.session_id.clone(), session.tx.clone()));
+            if let Some(session) = session {
+                return Ok(session);
             }
             if Instant::now() + backoff > deadline {
                 return Err(Status::unavailable("supervisor session not connected"));
@@ -490,6 +498,7 @@ impl SupervisorSessionRegistry {
         }
     }
 
+    #[cfg(test)]
     fn lookup_session(&self, sandbox_id: &str) -> Option<mpsc::Sender<GatewayMessage>> {
         self.sessions
             .lock()
@@ -791,10 +800,6 @@ impl SupervisorSessionRegistry {
         if relay_open.channel_id.is_empty() {
             return Err(Status::invalid_argument("relay channel_id is required"));
         }
-        let tx = self
-            .wait_for_session(sandbox_id, session_wait_timeout)
-            .await?;
-
         let channel_id = relay_open.channel_id.clone();
 
         // Register the pending relay before sending RelayOpen to avoid a race.
@@ -802,44 +807,62 @@ impl SupervisorSessionRegistry {
         // so two concurrent calls can't both observe "under the cap" and then
         // both insert past it.
         let (relay_tx, relay_rx) = oneshot::channel();
-        {
-            let mut pending = self.pending_relays.lock().unwrap();
-            if pending.len() >= MAX_PENDING_RELAYS {
-                return Err(Status::resource_exhausted(format!(
-                    "gateway relay capacity reached ({MAX_PENDING_RELAYS} in flight)"
-                )));
+        let mut relay_tx = Some(relay_tx);
+        loop {
+            let (session_id, tx) = self
+                .wait_for_session(sandbox_id, session_wait_timeout)
+                .await?;
+            // Reserve capacity before taking synchronous locks. The session
+            // may change while waiting; validate it again before insertion.
+            let permit = tx
+                .reserve()
+                .await
+                .map_err(|_| Status::unavailable("supervisor session disconnected"))?;
+            let sent = {
+                let sessions = self.sessions.lock().unwrap();
+                if !sessions
+                    .get(sandbox_id)
+                    .is_some_and(|session| session.session_id == session_id)
+                {
+                    false
+                } else {
+                    let mut pending = self.pending_relays.lock().unwrap();
+                    if pending.len() >= MAX_PENDING_RELAYS {
+                        return Err(Status::resource_exhausted(format!(
+                            "gateway relay capacity reached ({MAX_PENDING_RELAYS} in flight)"
+                        )));
+                    }
+                    let per_sandbox = pending
+                        .values()
+                        .filter(|p| p.sandbox_id == sandbox_id)
+                        .count();
+                    if per_sandbox >= MAX_PENDING_RELAYS_PER_SANDBOX {
+                        return Err(Status::resource_exhausted(format!(
+                            "per-sandbox relay limit reached ({MAX_PENDING_RELAYS_PER_SANDBOX} in flight for {sandbox_id})"
+                        )));
+                    }
+                    pending.insert(
+                        channel_id.clone(),
+                        PendingRelay {
+                            sender: relay_tx.take().unwrap(),
+                            sandbox_id: sandbox_id.to_string(),
+                            relay_open: relay_open.clone(),
+                            created_at: Instant::now(),
+                            delivered_session_id: Some(session_id),
+                        },
+                    );
+                    // Insertion, delivery selection, and enqueueing are atomic with
+                    // respect to registration and replay. No await holds these locks.
+                    permit.send(GatewayMessage {
+                        payload: Some(gateway_message::Payload::RelayOpen(relay_open.clone())),
+                    });
+                    true
+                }
+            };
+            if sent {
+                return Ok((channel_id, relay_rx));
             }
-            let per_sandbox = pending
-                .values()
-                .filter(|p| p.sandbox_id == sandbox_id)
-                .count();
-            if per_sandbox >= MAX_PENDING_RELAYS_PER_SANDBOX {
-                return Err(Status::resource_exhausted(format!(
-                    "per-sandbox relay limit reached ({MAX_PENDING_RELAYS_PER_SANDBOX} in flight for {sandbox_id})"
-                )));
-            }
-            pending.insert(
-                channel_id.clone(),
-                PendingRelay {
-                    sender: relay_tx,
-                    sandbox_id: sandbox_id.to_string(),
-                    relay_open: relay_open.clone(),
-                    created_at: Instant::now(),
-                },
-            );
         }
-
-        let msg = GatewayMessage {
-            payload: Some(gateway_message::Payload::RelayOpen(relay_open)),
-        };
-
-        if tx.send(msg).await.is_err() {
-            // Session dropped between our lookup and send.
-            self.pending_relays.lock().unwrap().remove(&channel_id);
-            return Err(Status::unavailable("supervisor session disconnected"));
-        }
-
-        Ok((channel_id, relay_rx))
     }
 
     pub fn fail_pending_relay(&self, channel_id: &str, error: String) -> bool {
@@ -918,23 +941,43 @@ impl SupervisorSessionRegistry {
         self.remove(sandbox_id);
     }
 
-    pub async fn replay_pending_relays(&self, sandbox_id: &str, tx: &mpsc::Sender<GatewayMessage>) {
+    pub async fn replay_pending_relays(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        tx: &mpsc::Sender<GatewayMessage>,
+    ) {
         for channel_id in self.pending_channel_ids(sandbox_id) {
-            let relay_open = {
+            let needs_replay = {
                 let pending = self.pending_relays.lock().unwrap();
-                pending
-                    .get(&channel_id)
-                    .map(|pending| pending.relay_open.clone())
+                pending.get(&channel_id).is_some_and(|pending| {
+                    pending.delivered_session_id.as_deref() != Some(session_id)
+                })
             };
-            let Some(relay_open) = relay_open else {
+            if !needs_replay {
                 continue;
-            };
-            let msg = GatewayMessage {
-                payload: Some(gateway_message::Payload::RelayOpen(relay_open)),
-            };
-            if tx.send(msg).await.is_err() {
+            }
+            let Ok(permit) = tx.reserve().await else {
                 warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "supervisor session: failed to replay pending relay to connected session");
                 break;
+            };
+            let sessions = self.sessions.lock().unwrap();
+            if !sessions
+                .get(sandbox_id)
+                .is_some_and(|session| session.session_id == session_id)
+            {
+                break;
+            }
+            let mut pending = self.pending_relays.lock().unwrap();
+            if let Some(pending) = pending.get_mut(&channel_id)
+                && pending.delivered_session_id.as_deref() != Some(session_id)
+            {
+                pending.delivered_session_id = Some(session_id.to_string());
+                permit.send(GatewayMessage {
+                    payload: Some(gateway_message::Payload::RelayOpen(
+                        pending.relay_open.clone(),
+                    )),
+                });
             }
         }
     }
@@ -1965,7 +2008,7 @@ async fn establish_supervisor_session(
     // including reconnects that did not supersede a live registration.
     state
         .supervisor_sessions
-        .replay_pending_relays(&sandbox_id, &tx)
+        .replay_pending_relays(&sandbox_id, &session_id, &tx)
         .await;
 
     // Step 4: Spawn the session loop that reads inbound messages.
@@ -2497,6 +2540,7 @@ mod tests {
                 service_id: String::new(),
             },
             created_at,
+            delivered_session_id: None,
         }
     }
 
@@ -2922,6 +2966,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_pending_relays_does_not_duplicate_forward_opened_after_registration() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx_old, mut rx_old) = mpsc::channel(4);
+        registry.register("sbx".into(), "old".into(), tx_old, make_shutdown());
+        let (old_channel, _old_relay_rx) = registry
+            .open_relay("sbx", Duration::from_secs(1))
+            .await
+            .unwrap();
+        rx_old.recv().await.unwrap();
+        registry.remove_if_current("sbx", "old");
+
+        // Session establishment is paused between registration and replay.
+        let (tx_new, mut rx_new) = mpsc::channel(4);
+        registry.register("sbx".into(), "new".into(), tx_new.clone(), make_shutdown());
+        let (new_channel, new_relay_rx) = registry
+            .open_relay("sbx", Duration::from_secs(1))
+            .await
+            .unwrap();
+        registry.replay_pending_relays("sbx", "new", &tx_new).await;
+        registry.replay_pending_relays("sbx", "new", &tx_new).await;
+
+        for expected in [new_channel.clone(), old_channel] {
+            let Some(gateway_message::Payload::RelayOpen(open)) =
+                rx_new.recv().await.unwrap().payload
+            else {
+                panic!("expected RelayOpen");
+            };
+            assert_eq!(open.channel_id, expected);
+        }
+        assert!(matches!(
+            rx_new.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let principal = sandbox_principal("sbx");
+        let _claimed = registry
+            .claim_relay(&new_channel, Some(&principal))
+            .unwrap();
+        assert!(new_relay_rx.await.unwrap().is_ok());
+        assert_eq!(
+            registry
+                .claim_relay(&new_channel, Some(&principal))
+                .unwrap_err()
+                .code(),
+            tonic::Code::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn open_relay_rechecks_session_after_waiting_for_queue_capacity() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx_old, mut rx_old) = mpsc::channel(1);
+        registry.register("sbx".into(), "old".into(), tx_old.clone(), make_shutdown());
+        tx_old.send(GatewayMessage::default()).await.unwrap();
+        let open = registry.open_relay("sbx", Duration::from_secs(1));
+        tokio::pin!(open);
+        assert!(futures_util::poll!(&mut open).is_pending());
+
+        let (tx_new, mut rx_new) = mpsc::channel(4);
+        registry.register("sbx".into(), "new".into(), tx_new.clone(), make_shutdown());
+        registry.replay_pending_relays("sbx", "new", &tx_new).await;
+        rx_old.recv().await.unwrap();
+        let (channel_id, _relay_rx) = open.await.unwrap();
+        registry.replay_pending_relays("sbx", "new", &tx_new).await;
+        let Some(gateway_message::Payload::RelayOpen(message)) =
+            rx_new.recv().await.unwrap().payload
+        else {
+            panic!("expected RelayOpen on replacement session");
+        };
+        assert_eq!(message.channel_id, channel_id);
+        assert!(rx_old.try_recv().is_err());
+        assert!(matches!(
+            rx_new.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
     async fn replay_pending_relays_after_disconnected_session_was_removed() {
         let registry = SupervisorSessionRegistry::new();
         let (tx_old, mut rx_old) = mpsc::channel(4);
@@ -2935,7 +3056,7 @@ mod tests {
 
         let (tx_new, mut rx_new) = mpsc::channel(4);
         assert!(!registry.register("sbx".into(), "new".into(), tx_new.clone(), make_shutdown()));
-        registry.replay_pending_relays("sbx", &tx_new).await;
+        registry.replay_pending_relays("sbx", "new", &tx_new).await;
         let replayed = rx_new.recv().await.unwrap();
         let Some(gateway_message::Payload::RelayOpen(open)) = replayed.payload else {
             panic!("expected replayed RelayOpen");
@@ -2983,7 +3104,7 @@ mod tests {
         assert!(superseded);
 
         registry
-            .replay_pending_relays("sbx", &registry.lookup_session("sbx").unwrap())
+            .replay_pending_relays("sbx", "s-new", &registry.lookup_session("sbx").unwrap())
             .await;
 
         let replayed = rx_new
