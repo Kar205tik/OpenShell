@@ -241,6 +241,7 @@ pub struct RestartMetadata {
 
 /// The shared volume contains only sandbox credentials. Supervisor credentials,
 /// gateway authorization, and the restart copy never enter that volume.
+#[allow(clippy::too_many_arguments)]
 pub fn bootstrap_archives(
     sandbox_id: &str,
     container_id: &str,

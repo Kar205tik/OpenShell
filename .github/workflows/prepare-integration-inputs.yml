@@ -16,11 +16,6 @@ on:
         required: false
         type: string
         default: ""
-      rpm-artifact-name:
-        description: RPM package artifact to include in the tmachine inputs
-        required: false
-        type: string
-        default: ""
       include-deb-upgrade-source:
         description: Include the latest retained prerelease DEB and runtime images as upgrade inputs
         required: false
@@ -100,30 +95,6 @@ jobs:
           set -euo pipefail
           mv artifacts/packages/download/*.deb artifacts/packages/openshell.deb
           rmdir artifacts/packages/download
-
-      - name: Download RPM package artifact
-        if: inputs['rpm-artifact-name'] != ''
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: ${{ inputs['rpm-artifact-name'] }}
-          path: artifacts/packages/rpm/download
-          github-token: ${{ github.token }}
-          run-id: ${{ inputs['artifact-run-id'] || github.run_id }}
-
-      - name: Stage RPM package inputs
-        if: inputs['rpm-artifact-name'] != ''
-        run: |
-          set -euo pipefail
-          download_dir=artifacts/packages/rpm/download
-          cli_rpm=$(find "$download_dir" -maxdepth 1 -type f -name 'openshell-[0-9]*.x86_64.rpm' -print -quit)
-          gateway_rpm=$(find "$download_dir" -maxdepth 1 -type f -name 'openshell-gateway-[0-9]*.x86_64.rpm' -print -quit)
-          if [[ -z "$cli_rpm" || -z "$gateway_rpm" ]]; then
-            echo "candidate artifact did not contain the expected x86_64 CLI and gateway RPMs" >&2
-            exit 1
-          fi
-          mv "$cli_rpm" artifacts/packages/rpm/openshell.rpm
-          mv "$gateway_rpm" artifacts/packages/rpm/openshell-gateway.rpm
-          rm -rf "$download_dir"
 
       - name: Resolve prerelease upgrade source
         if: inputs['include-deb-upgrade-source'] || inputs['include-rpm-upgrade-source']

@@ -152,7 +152,7 @@ jobs:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   prepare-integration:
-    needs: [compute-versions, build-binaries, build-deb, build-images, build-rpm]
+    needs: [compute-versions, build-binaries, build-deb, build-images]
     permissions:
       actions: read
       contents: read
@@ -160,7 +160,6 @@ jobs:
     uses: ./.github/workflows/prepare-integration-inputs.yml
     with:
       deb-artifact-name: deb-linux-amd64
-      rpm-artifact-name: rpm-linux-x86_64
       include-deb-upgrade-source: true
       include-rpm-upgrade-source: true
 

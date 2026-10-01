@@ -102,7 +102,7 @@ jobs:
       checkout-ref: ${{ github.sha }}
 
   prepare-integration:
-    needs: [build-binaries, build-deb, build-images, build-rpm]
+    needs: [build-binaries, build-deb, build-images]
     permissions:
       actions: read
       contents: read
@@ -110,7 +110,6 @@ jobs:
     uses: ./.github/workflows/prepare-integration-inputs.yml
     with:
       deb-artifact-name: deb-linux-amd64
-      rpm-artifact-name: rpm-linux-x86_64
       include-deb-upgrade-source: true
       include-rpm-upgrade-source: true
 

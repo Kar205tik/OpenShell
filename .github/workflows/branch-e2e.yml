@@ -95,8 +95,6 @@ jobs:
     outputs:
       cargo: ${{ steps.version.outputs.cargo }}
       deb: ${{ steps.version.outputs.deb }}
-      rpm_version: ${{ steps.version.outputs.rpm_version }}
-      rpm_release: ${{ steps.version.outputs.rpm_release }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -108,13 +106,9 @@ jobs:
         run: |
           cargo="$(python3 tasks/scripts/release.py get-version --cargo)"
           deb="$(python3 tasks/scripts/release.py get-version --dev --deb)"
-          rpm_version="$(python3 tasks/scripts/release.py get-version --dev --rpm-version)"
-          rpm_release="$(python3 tasks/scripts/release.py get-version --dev --rpm-release)"
           {
             echo "cargo=$cargo"
             echo "deb=$deb"
-            echo "rpm_version=$rpm_version"
-            echo "rpm_release=$rpm_release"
           } >> "$GITHUB_OUTPUT"
 
   build-binaries:
@@ -239,20 +233,6 @@ jobs:
     with:
       deb-version: ${{ needs.version.outputs.deb }}
       checkout-ref: ${{ github.sha }}
-
-  build-rpm:
-    name: Build RPM packages
-    needs: [pr_metadata, version, build-binaries]
-    if: needs.pr_metadata.outputs.should_run == 'true'
-    permissions:
-      actions: read
-      contents: read
-    uses: ./.github/workflows/rpm-package.yml
-    with:
-      checkout-ref: ${{ github.sha }}
-      rpm-version: ${{ needs.version.outputs.rpm_version }}
-      rpm-release: ${{ needs.version.outputs.rpm_release }}
-      cargo-version: ${{ needs.version.outputs.cargo }}
 
   prepare-integration-upgrades:
     name: Prepare upgrade qualification inputs
