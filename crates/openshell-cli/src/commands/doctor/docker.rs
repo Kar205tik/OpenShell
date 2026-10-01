@@ -1,62 +1,60 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Docker prerequisites, including Docker Desktop's container-to-host route.
+//! Docker prerequisite checks.
 
+use super::{PrerequisiteCheck, command_output};
+use futures::future::BoxFuture;
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use std::io::Write;
 use std::path::Path;
-use std::process::Output;
 use std::time::Duration;
-use tokio::process::Command;
 
-const PROBE_IMAGE: &str = "alpine:3.23";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Check Docker and, for a local Docker Desktop daemon, host networking.
-pub async fn doctor_check() -> Result<()> {
-    // Do not hold a stdout lock across asynchronous commands.
-    let docker_host = if std::env::var("DOCKER_CONTEXT").is_ok_and(|context| !context.is_empty()) {
-        None
-    } else {
-        std::env::var("DOCKER_HOST").ok()
-    };
-    check_docker(
-        Path::new("docker"),
-        &mut std::io::stdout(),
-        COMMAND_TIMEOUT,
-        docker_host.as_deref(),
-    )
-    .await
+pub(super) struct DockerCheck {
+    docker: std::path::PathBuf,
+    timeout: Duration,
+    docker_host: Option<String>,
 }
 
-async fn docker_output(docker: &Path, args: &[&str], timeout: Duration) -> Result<Output> {
-    tokio::time::timeout(
-        timeout,
-        Command::new(docker).args(args).kill_on_drop(true).output(),
-    )
-    .await
-    .map_err(|_| {
-        miette!(
-            "Docker prerequisite check timed out after {} seconds",
-            timeout.as_secs()
-        )
-    })?
-    .into_diagnostic()
-    .wrap_err("failed to execute Docker prerequisite check")
+impl DockerCheck {
+    pub(super) fn new() -> Self {
+        let docker_host =
+            if std::env::var("DOCKER_CONTEXT").is_ok_and(|context| !context.is_empty()) {
+                None
+            } else {
+                std::env::var("DOCKER_HOST").ok()
+            };
+        Self {
+            docker: "docker".into(),
+            timeout: COMMAND_TIMEOUT,
+            docker_host,
+        }
+    }
+}
+
+impl PrerequisiteCheck for DockerCheck {
+    fn run<'a>(&'a self, out: &'a mut (dyn Write + Send)) -> BoxFuture<'a, Result<()>> {
+        Box::pin(check_docker(
+            &self.docker,
+            out,
+            self.timeout,
+            self.docker_host.as_deref(),
+        ))
+    }
 }
 
 async fn check_docker(
     docker: &Path,
-    out: &mut impl Write,
+    out: &mut (dyn Write + Send),
     timeout: Duration,
     docker_host: Option<&str>,
 ) -> Result<()> {
-    writeln!(out, "Checking system prerequisites...\n").into_diagnostic()?;
     write!(out, "  Docker ............. ").into_diagnostic()?;
     out.flush().into_diagnostic()?;
 
-    let output = docker_output(docker, &["info", "--format", "{{json .}}"], timeout).await?;
+    let output = command_output(docker, &["info", "--format", "{{json .}}"], timeout).await?;
     if !output.status.success() {
         writeln!(out, "FAILED").into_diagnostic()?;
         return Err(miette!(
@@ -88,7 +86,7 @@ async fn check_docker(
         let endpoint = if let Some(host) = docker_host {
             host.to_string()
         } else {
-            let context = docker_output(
+            let context = command_output(
                 docker,
                 &[
                     "context",
@@ -114,25 +112,29 @@ async fn check_docker(
                 .into_diagnostic()?;
         }
     }
-    writeln!(out, "\nAll checks passed.").into_diagnostic()?;
     Ok(())
 }
 
-async fn check_host_network(docker: &Path, out: &mut impl Write, timeout: Duration) -> Result<()> {
+async fn check_host_network(
+    docker: &Path,
+    out: &mut (dyn Write + Send),
+    timeout: Duration,
+) -> Result<()> {
+    let probe_image = openshell_core::image::default_sandbox_image();
     writeln!(
         out,
-        "  Host networking .... checking (may pull {PROBE_IMAGE})"
+        "  Host networking .... checking (may pull {probe_image})"
     )
     .into_diagnostic()?;
     out.flush().into_diagnostic()?;
     // No running gateway is needed. Keep the listener alive throughout the
-    // probe; connect-only nc succeeds without sending application traffic.
+    // probe; Bash opens a TCP socket without sending application traffic.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .into_diagnostic()?;
     let port = listener.local_addr().into_diagnostic()?.port().to_string();
     let name = format!("openshell-doctor-{}-{port}", std::process::id());
-    let result = docker_output(
+    let result = command_output(
         docker,
         &[
             "run",
@@ -145,12 +147,14 @@ async fn check_host_network(docker: &Path, out: &mut impl Write, timeout: Durati
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges:true",
             "--read-only",
-            PROBE_IMAGE,
-            "nc",
-            "-z",
-            "-w",
+            "--entrypoint",
+            "/usr/bin/timeout",
+            &probe_image,
             "3",
-            "127.0.0.1",
+            "/bin/bash",
+            "-c",
+            "exec 3<>/dev/tcp/127.0.0.1/$1",
+            "openshell-doctor",
             &port,
         ],
         timeout,
@@ -159,7 +163,7 @@ async fn check_host_network(docker: &Path, out: &mut impl Write, timeout: Durati
     if !result.as_ref().is_ok_and(|output| output.status.success()) {
         // Killing the CLI does not stop a daemon-side container. Clean up only
         // this probe, with its own bounded deadline.
-        let _ = docker_output(docker, &["rm", "--force", &name], Duration::from_secs(5)).await;
+        let _ = command_output(docker, &["rm", "--force", &name], Duration::from_secs(5)).await;
     }
     let output = result.wrap_err("could not complete the Docker Desktop host-network probe; check Docker and registry access, then rerun doctor")?;
     if output.status.success() {
@@ -171,7 +175,7 @@ async fn check_host_network(docker: &Path, out: &mut impl Write, timeout: Durati
         return Ok(());
     }
     writeln!(out, "  Host networking .... FAILED").into_diagnostic()?;
-    if output.status.code() == Some(1) {
+    if matches!(output.status.code(), Some(1 | 124)) {
         return Err(miette!(
             "Docker Desktop host networking could not reach this machine's loopback listener. Enable host networking in Docker Desktop Settings > Resources > Network, ensure Enhanced Container Isolation is disabled, then Apply and restart Docker Desktop. Rerun `openshell doctor check` before creating a sandbox."
         ));
@@ -185,6 +189,7 @@ async fn check_host_network(docker: &Path, out: &mut impl Write, timeout: Durati
 
 #[cfg(all(test, unix))]
 mod tests {
+    use super::super::run_checks;
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
@@ -198,7 +203,12 @@ mod tests {
         std::fs::write(&docker, format!("#!/bin/sh\n{script}\n")).unwrap();
         std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut out = Vec::new();
-        let result = check_docker(&docker, &mut out, timeout, docker_host).await;
+        let check = DockerCheck {
+            docker,
+            timeout,
+            docker_host: docker_host.map(str::to_string),
+        };
+        let result = run_checks(&[&check], &mut out).await;
         (result, String::from_utf8(out).unwrap())
     }
 
@@ -216,12 +226,19 @@ esac"#
 
     #[tokio::test]
     async fn desktop_connectivity_failure_is_actionable() {
-        let (result, out) = check_script(&desktop_script("exit 1"), COMMAND_TIMEOUT, None).await;
-        let error = result.unwrap_err().to_string();
-        assert!(error.contains("Settings > Resources > Network"));
-        assert!(error.contains("Enhanced Container Isolation"));
-        assert!(out.contains("FAILED"));
-        assert!(!out.contains("All checks passed"));
+        for code in [1, 124] {
+            let (result, out) = check_script(
+                &desktop_script(&format!("exit {code}")),
+                COMMAND_TIMEOUT,
+                None,
+            )
+            .await;
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("Settings > Resources > Network"));
+            assert!(error.contains("Enhanced Container Isolation"));
+            assert!(out.contains("FAILED"));
+            assert!(!out.contains("All checks passed"));
+        }
     }
 
     #[tokio::test]
@@ -241,8 +258,16 @@ esac"#
 
     #[tokio::test]
     async fn successful_desktop_probe_passes() {
-        let (result, out) = check_script(&desktop_script("exit 0"), COMMAND_TIMEOUT, None).await;
+        let image = openshell_core::image::default_sandbox_image();
+        let probe = format!(
+            r#"case "$*" in
+*'--network host'*'--entrypoint /usr/bin/timeout {image} 3 /bin/bash -c exec 3<>/dev/tcp/127.0.0.1/$1 openshell-doctor '*) exit 0;;
+*) exit 99;;
+esac"#
+        );
+        let (result, out) = check_script(&desktop_script(&probe), COMMAND_TIMEOUT, None).await;
         result.unwrap();
+        assert!(out.contains(&image));
         assert!(out.contains("container reached host loopback"));
         assert!(out.contains("All checks passed"));
     }

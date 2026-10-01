@@ -289,7 +289,7 @@ Common findings:
 - On Docker Desktop, repeated `Policy fetch failed after 5 attempts` messages
   can mean host networking is disabled. Run `openshell doctor check` on the
   gateway host to test container-to-host loopback connectivity. This starts a
-  temporary probe container and may pull an Alpine image; an image-pull or
+  temporary probe container and may pull the default sandbox image; an image-pull or
   container-start error leaves connectivity unverified. Enable host networking in Docker
   Desktop, ensure Enhanced Container Isolation is disabled, and verify the
   gateway's primary endpoint is reachable from a host-networked container.

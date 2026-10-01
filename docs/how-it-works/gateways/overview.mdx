@@ -167,15 +167,6 @@ openshell doctor check
 openshell gateway list
 ```
 
-On a local Docker Desktop installation, `openshell doctor check` also tests
-whether a host-networked container can reach host loopback. The check starts a
-temporary container and pulls `alpine:3.23` if needed. If connectivity fails,
-enable host networking in Docker Desktop Settings > Resources > Network,
-disable Enhanced Container Isolation, and apply the changes before rerunning
-the check. Image-pull and container-start failures mean the check could not
-verify connectivity. Remote Docker endpoints skip this test; run it on the
-gateway host.
-
 For Kubernetes gateways, inspect the gateway workload and cluster events:
 
 ```shell
